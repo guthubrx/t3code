@@ -36,7 +36,18 @@ export const ProviderInstanceIcon = memo(function ProviderInstanceIcon(props: {
       data-provider-accent-color={props.accentColor}
     >
       {Icon ? (
-        <Icon className={cn("size-5 shrink-0", props.iconClassName)} aria-hidden />
+        <Icon
+          className={cn(
+            "size-5 shrink-0",
+            props.iconClassName,
+            // An accented instance shows its color on the icon itself: the fill
+            // (brand icons set it by class), the text color (icons drawn with
+            // currentColor), and no grayscale or dimming on top.
+            props.accentColor &&
+              "fill-[var(--provider-accent)] text-[var(--provider-accent)] grayscale-0 opacity-100 dark:fill-[var(--provider-accent)]",
+          )}
+          aria-hidden
+        />
       ) : (
         <span className={cn("text-3xs font-semibold leading-none", props.iconClassName)}>
           {providerInstanceInitials(props.displayName)}

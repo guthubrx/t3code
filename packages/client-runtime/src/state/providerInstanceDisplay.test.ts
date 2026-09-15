@@ -89,15 +89,15 @@ describe("normalizeProviderAccentColor", () => {
 });
 
 describe("shouldShowInstanceBadge", () => {
-  it("shows the badge when the entry has an accent color", () => {
+  it("hides the badge when the entry has an accent color", () => {
     const entry = { driverKind: codex, accentColor: "#ff8800" };
-    expect(shouldShowInstanceBadge(entry, [entry])).toBe(true);
+    expect(shouldShowInstanceBadge(entry, [entry])).toBe(false);
   });
 
-  it("shows the badge when two entries share a driver, even without an accent", () => {
+  it("hides the badge when two entries share a driver", () => {
     const first = { driverKind: codex, accentColor: undefined };
     const second = { driverKind: codex, accentColor: undefined };
-    expect(shouldShowInstanceBadge(first, [first, second])).toBe(true);
+    expect(shouldShowInstanceBadge(first, [first, second])).toBe(false);
   });
 
   it("hides the badge for a single instance of a driver with no accent", () => {
