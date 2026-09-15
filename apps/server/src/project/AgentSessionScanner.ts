@@ -101,7 +101,7 @@ const CODEX_SQLITE_MESSAGE_TYPES = "'userMessage','agentMessage'";
  * those payloads. Raw I/O and selected history have separate budgets.
  */
 const MAX_IMPORTED_TRANSCRIPT_BYTES = 4 * 1024 * 1024 * 1024;
-const MAX_IMPORTED_MESSAGES = 200;
+const MAX_IMPORTED_MESSAGES = 400;
 const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORT_TRANSCRIPTS = 100;

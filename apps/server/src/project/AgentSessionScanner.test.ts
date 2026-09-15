@@ -2982,7 +2982,7 @@ describe("parseAgentSessionTranscript", () => {
   it("keeps the canonical first prompt after long Codex transcripts are capped", () => {
     const canonicalPrompt = "\n  Keep the canonical prompt  \n";
     const canonicalTimestamp = "2026-08-24T10:01:00.000Z";
-    const laterAssistantMessages = Array.from({ length: 200 }, (_, index) =>
+    const laterAssistantMessages = Array.from({ length: 400 }, (_, index) =>
       encodeTranscriptRecord({
         type: "response_item",
         timestamp: `2026-08-24T11:${String(index % 60).padStart(2, "0")}:00.000Z`,
@@ -3018,7 +3018,7 @@ describe("parseAgentSessionTranscript", () => {
       lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
     });
 
-    expect(thread?.messages).toHaveLength(200);
+    expect(thread?.messages).toHaveLength(400);
     expect(thread?.messages[0]).toMatchObject({
       role: "user",
       text: canonicalPrompt,
@@ -3029,7 +3029,7 @@ describe("parseAgentSessionTranscript", () => {
   it("restores the canonical first prompt when a later user message remains", () => {
     const canonicalPrompt = "\n  Keep the canonical prompt  \n";
     const canonicalTimestamp = "2026-08-24T10:01:00.000Z";
-    const assistantMessages = Array.from({ length: 198 }, (_, index) =>
+    const assistantMessages = Array.from({ length: 398 }, (_, index) =>
       encodeTranscriptRecord({
         type: "response_item",
         timestamp: `2026-08-24T11:${String(index % 60).padStart(2, "0")}:00.000Z`,
@@ -3080,7 +3080,7 @@ describe("parseAgentSessionTranscript", () => {
       lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
     });
 
-    expect(thread?.messages).toHaveLength(200);
+    expect(thread?.messages).toHaveLength(400);
     expect(thread?.messages[0]).toMatchObject({
       role: "user",
       text: canonicalPrompt,
@@ -3432,7 +3432,7 @@ describe("parseAgentSessionTranscript", () => {
         sessionId: "claude-session",
         message: { role: "user", content: "Keep this prompt" },
       }),
-      ...Array.from({ length: 250 }, (_, index) =>
+      ...Array.from({ length: 450 }, (_, index) =>
         encodeTranscriptRecord({
           type: "assistant",
           message: { role: "assistant", content: `Assistant update ${index}` },
@@ -3448,8 +3448,8 @@ describe("parseAgentSessionTranscript", () => {
       lastActiveAtMs: Date.parse("2026-08-24T12:00:00.000Z"),
     });
 
-    expect(thread?.messages).toHaveLength(200);
+    expect(thread?.messages).toHaveLength(400);
     expect(thread?.messages[0]?.text).toBe("Keep this prompt");
-    expect(thread?.messages.at(-1)?.text).toBe("Assistant update 249");
+    expect(thread?.messages.at(-1)?.text).toBe("Assistant update 449");
   });
 });
