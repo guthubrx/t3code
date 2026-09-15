@@ -862,17 +862,23 @@ export const make = Effect.gen(function* () {
     path.join(homeDir, "Documents", "Codex"),
   ];
 
-  const isExcludedProjectPath = (candidatePath: string) =>
+  const isNonProjectPath = (candidatePath: string) =>
     excludedProjectRoots.has(normalizeProjectPathForComparison(candidatePath)) ||
     excludedProjectAncestors.some((ancestor) =>
       normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
         normalizeForWorktreeMatch(ancestor, foldWorktreeCase),
       ),
-    ) ||
+    );
+  const isT3InternalPath = (candidatePath: string) =>
     normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
       normalizeForWorktreeMatch(baseDir, foldWorktreeCase),
-    ) ||
-    isT3ManagedWorktree(candidatePath, worktreesDir, foldWorktreeCase);
+    ) || isT3ManagedWorktree(candidatePath, worktreesDir, foldWorktreeCase);
+  // A root the user registered as a project is a project wherever it lives,
+  // home directory included; only T3's own directories stay out.
+  const isExcludedProjectPath = (candidatePath: string, registeredRoots?: ReadonlySet<string>) =>
+    isT3InternalPath(candidatePath) ||
+    (isNonProjectPath(candidatePath) &&
+      !registeredRoots?.has(normalizeProjectPathForComparison(candidatePath)));
 
   const listDirectory = (directory: string) =>
     fileSystem.readDirectory(directory).pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
@@ -1519,6 +1525,18 @@ export const make = Effect.gen(function* () {
         git: AgentSessionProjectGit | null;
       }
     >();
+    const shellSnapshot = yield* projectionSnapshotQuery
+      .getShellSnapshot()
+      .pipe(
+        Effect.mapError(
+          (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
+        ),
+      );
+    const registeredRoots = new Set(
+      shellSnapshot.projects.map((project) =>
+        normalizeProjectPathForComparison(path.resolve(expandHomePath(project.workspaceRoot))),
+      ),
+    );
     const directoryKeys = new Map<string, string>();
     const gitIdentities = new Map<string, AgentSessionProjectGit | null>();
 
@@ -1526,7 +1544,7 @@ export const make = Effect.gen(function* () {
       const expanded = expandHomePath(candidate.cwd.trim());
       if (!path.isAbsolute(expanded)) continue;
       const resolved = path.resolve(expanded);
-      if (isExcludedProjectPath(resolved)) continue;
+      if (isExcludedProjectPath(resolved, registeredRoots)) continue;
       let key = directoryKeys.get(resolved);
       if (key === undefined) {
         const stats = yield* statOption(resolved);
@@ -1540,7 +1558,7 @@ export const make = Effect.gen(function* () {
           .pipe(Effect.orElseSucceed(() => resolved));
         // A symlink can point into the worktrees directory even when its own
         // spelling doesn't; check again with links resolved.
-        if (isExcludedProjectPath(realPath)) {
+        if (isExcludedProjectPath(realPath, registeredRoots)) {
           key = "";
         } else {
           const gitIdentity = yield* readGitIdentity(resolved);
@@ -1578,13 +1596,6 @@ export const make = Effect.gen(function* () {
 
     // Resolve persisted roots too. A project and a transcript can name
     // different symlinks to the same directory.
-    const shellSnapshot = yield* projectionSnapshotQuery
-      .getShellSnapshot()
-      .pipe(
-        Effect.mapError(
-          (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
-        ),
-      );
     const importedProjectsByRoot = new Map<string, (typeof shellSnapshot.projects)[number]>();
     for (const project of shellSnapshot.projects) {
       const projectRoot = path.resolve(expandHomePath(project.workspaceRoot));
@@ -1636,7 +1647,9 @@ export const make = Effect.gen(function* () {
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
-    if (isExcludedProjectPath(root) || isExcludedProjectPath(realRoot)) return Stream.empty;
+    // Imports always target a registered project: only T3's own directories
+    // are refused here.
+    if (isT3InternalPath(root) || isT3InternalPath(realRoot)) return Stream.empty;
     const rootIdentity = yield* directoryIdentity(root);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const cutoffMs = nowMs - RECENT_THREAD_WINDOW_MS;

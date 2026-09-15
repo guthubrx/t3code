@@ -1078,6 +1078,50 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect("keeps the home directory when it is a registered project", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const configBaseDir = yield* makeTempDir("t3code-scanner-base-");
+        const home = NodeOS.homedir();
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "-home", "home-session.jsonl"),
+          contents: [
+            encodeTranscriptRecord({
+              type: "user",
+              cwd: home,
+              sessionId: "home-session",
+              timestamp: "2026-08-23T12:00:00.000Z",
+              message: { role: "user", content: "Sort my home directory" },
+            }),
+            encodeTranscriptRecord({
+              type: "assistant",
+              sessionId: "home-session",
+              timestamp: "2026-08-23T12:01:00.000Z",
+              message: { role: "assistant", content: [{ type: "text", text: "Done" }] },
+            }),
+          ].join("\n"),
+          mtimeMs: nowMs - 60 * 60 * 1000,
+        });
+
+        const input = {
+          claudeHomePath,
+          codexHomePath,
+          configBaseDir,
+          importedWorkspaceRoots: [home],
+        };
+        const result = yield* runScan(input);
+        expect(result.candidates.map((candidate) => candidate.path)).toEqual([home]);
+
+        const threads = yield* runRecentThreads({ ...input, workspaceRoot: home });
+        expect(threads).toHaveLength(1);
+      }),
+    );
+
     it.effect("excludes T3-managed worktree sandboxes", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
