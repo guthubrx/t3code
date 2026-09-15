@@ -14,6 +14,7 @@
  * @module project/AgentSessionScanner
  */
 import * as NodeOS from "node:os";
+import * as NodeSqlite from "node:sqlite";
 
 import {
   AgentSessionScanError,
@@ -83,6 +84,17 @@ const MAX_METADATA_OPERATIONS_PER_SOURCE = MAX_TRANSCRIPTS_PER_SOURCE * 4;
 const MAX_METADATA_RECORDS_PER_SOURCE = 100_000;
 const MAX_METADATA_RECORDS_PER_TRANSCRIPT = 1_000;
 const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * Codex 0.15+ no longer writes `rollout-*.jsonl`; sessions live in two SQLite
+ * files under the Codex home. Each SQLite thread is presented to the rest of
+ * this module as a virtual transcript whose path is
+ * `<home>/thread_history_1.sqlite#<threadId>`, so discovery, budgeting,
+ * identity checks and the record parser stay unchanged. The synthetic records
+ * mirror the legacy rollout shapes the parser already understands.
+ */
+const CODEX_HISTORY_DB = "thread_history_1.sqlite";
+const CODEX_STATE_DB = "state_5.sqlite";
+const CODEX_SQLITE_MESSAGE_TYPES = "'userMessage','agentMessage'";
 /**
  * Large tool results (especially screenshots) can make an otherwise ordinary
  * Codex transcript several GiB. Streaming field selection avoids allocating
@@ -535,6 +547,210 @@ function shouldRetainDecodedRecord(
   );
 }
 
+interface CodexSqliteTarget {
+  readonly historyDbPath: string;
+  readonly stateDbPath: string;
+  readonly threadId: string;
+}
+
+interface CodexSqliteThreadSummary {
+  readonly threadId: string;
+  readonly cwd: string;
+  readonly messageCount: number;
+  readonly firstMs: number;
+  readonly lastMs: number;
+}
+
+function codexSqliteFilePath(historyDbPath: string, threadId: string): string {
+  return `${historyDbPath}#${threadId}`;
+}
+
+/** Parse a virtual SQLite transcript path; `null` for ordinary files. */
+function codexSqliteTarget(filePath: string): CodexSqliteTarget | null {
+  const marker = `${CODEX_HISTORY_DB}#`;
+  const index = filePath.lastIndexOf(marker);
+  if (index <= 0) return null;
+  const separator = filePath[index - 1];
+  if (separator !== "/" && separator !== "\\") return null;
+  const threadId = filePath.slice(index + marker.length);
+  if (threadId.length === 0) return null;
+  const homePath = filePath.slice(0, index - 1);
+  return {
+    historyDbPath: filePath.slice(0, index + CODEX_HISTORY_DB.length),
+    stateDbPath: `${homePath}${separator}${CODEX_STATE_DB}`,
+    threadId,
+  };
+}
+
+function openCodexSqlite(dbPath: string): NodeSqlite.DatabaseSync {
+  return new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
+}
+
+function codexSqliteIdentity(
+  filePath: string,
+  summary: CodexSqliteThreadSummary,
+): ReturnType<typeof transcriptIdentity> {
+  // Message count and message timestamps stand in for size and mtimes: they
+  // change exactly when the importable content changes.
+  return {
+    filePath,
+    size: summary.messageCount,
+    mtimeMs: summary.lastMs,
+    device: 0,
+    inode: null,
+    birthtimeMs: summary.firstMs,
+  };
+}
+
+/**
+ * Threads with at least one message, excluding archived ones. Throws when a
+ * database is missing or unreadable; callers treat that as "no SQLite home".
+ */
+function listCodexSqliteThreads(dbs: {
+  readonly historyDbPath: string;
+  readonly stateDbPath: string;
+}): ReadonlyArray<CodexSqliteThreadSummary> {
+  const history = openCodexSqlite(dbs.historyDbPath);
+  try {
+    const state = openCodexSqlite(dbs.stateDbPath);
+    try {
+      const counts = history
+        .prepare(
+          `select thread_id, count(*) as n, min(created_at_ms) as first_ms, max(created_at_ms) as last_ms
+           from thread_items where item_type in (${CODEX_SQLITE_MESSAGE_TYPES}) group by thread_id`,
+        )
+        .all() as unknown as ReadonlyArray<{
+        readonly thread_id: string;
+        readonly n: number;
+        readonly first_ms: number | null;
+        readonly last_ms: number | null;
+      }>;
+      const meta = state.prepare("select cwd, archived from threads where id = ?");
+      const summaries: Array<CodexSqliteThreadSummary> = [];
+      for (const row of counts) {
+        const thread = meta.get(row.thread_id) as
+          | { readonly cwd: string; readonly archived: number }
+          | undefined;
+        if (thread === undefined || thread.archived !== 0) continue;
+        if (typeof thread.cwd !== "string" || thread.cwd.trim().length === 0) continue;
+        if (row.last_ms === null || row.first_ms === null) continue;
+        summaries.push({
+          threadId: row.thread_id,
+          cwd: thread.cwd,
+          messageCount: Number(row.n),
+          firstMs: Number(row.first_ms),
+          lastMs: Number(row.last_ms),
+        });
+      }
+      return summaries;
+    } finally {
+      state.close();
+    }
+  } finally {
+    history.close();
+  }
+}
+
+function codexSqliteThreadSummary(target: CodexSqliteTarget): CodexSqliteThreadSummary | null {
+  return (
+    listCodexSqliteThreads(target).find((summary) => summary.threadId === target.threadId) ?? null
+  );
+}
+
+function codexSqliteItemText(itemType: string, itemJson: string): string {
+  let item: unknown;
+  try {
+    item = JSON.parse(itemJson);
+  } catch {
+    return "";
+  }
+  if (typeof item !== "object" || item === null) return "";
+  const record = item as { readonly text?: unknown; readonly content?: unknown };
+  if (itemType === "agentMessage") return typeof record.text === "string" ? record.text : "";
+  if (!Array.isArray(record.content)) return "";
+  return record.content
+    .flatMap((block: unknown) =>
+      typeof block === "object" &&
+      block !== null &&
+      typeof (block as { readonly text?: unknown }).text === "string"
+        ? [(block as { readonly text: string }).text]
+        : [],
+    )
+    .join("\n");
+}
+
+/**
+ * Read one SQLite thread as decoded transcript records in legacy rollout
+ * shapes: a `session_meta` carrying the resumable thread id and cwd, then one
+ * `event_msg`/`response_item` per message. Returns `null` when the record or
+ * history budgets would be exceeded, like the file reader does.
+ */
+function readCodexSqliteRecords(
+  target: CodexSqliteTarget,
+  summary: CodexSqliteThreadSummary,
+  recordLimit: number,
+): { readonly records: Array<DecodedTranscriptRecord>; readonly recordCount: number } | null {
+  const history = openCodexSqlite(target.historyDbPath);
+  try {
+    const rows = history
+      .prepare(
+        `select item_type, item_json, created_at_ms from thread_items
+         where thread_id = ? and item_type in (${CODEX_SQLITE_MESSAGE_TYPES}) order by rollout_ordinal`,
+      )
+      .all(target.threadId) as unknown as ReadonlyArray<{
+      readonly item_type: string;
+      readonly item_json: string;
+      readonly created_at_ms: number;
+    }>;
+    const records: Array<DecodedTranscriptRecord> = [];
+    let recordCount = 0;
+    let historyBytes = 0;
+    const retain = (value: unknown, bytes: number) => {
+      recordCount += 1;
+      if (recordCount > recordLimit) return false;
+      historyBytes += bytes;
+      if (historyBytes > MAX_IMPORT_HISTORY_BYTES) return false;
+      const decoded = decodeTranscriptValue(value);
+      if (Option.isSome(decoded)) records.push(decoded.value);
+      return true;
+    };
+    const iso = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(ms));
+    if (
+      !retain(
+        {
+          type: "session_meta",
+          timestamp: iso(summary.firstMs),
+          payload: { id: target.threadId, cwd: summary.cwd },
+        },
+        summary.cwd.length + target.threadId.length,
+      )
+    ) {
+      return null;
+    }
+    for (const row of rows) {
+      const text = codexSqliteItemText(row.item_type, row.item_json);
+      if (text.trim().length === 0) continue;
+      const timestamp = iso(Number(row.created_at_ms));
+      const value =
+        row.item_type === "userMessage"
+          ? { type: "event_msg", timestamp, payload: { type: "user_message", message: text } }
+          : {
+              type: "response_item",
+              timestamp,
+              payload: {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text }],
+              },
+            };
+      if (!retain(value, text.length)) return null;
+    }
+    return { records, recordCount };
+  } finally {
+    history.close();
+  }
+}
+
 /**
  * T3 Code runs its own agent sessions inside disposable worktrees. Their
  * transcripts look exactly like user sessions, but re-importing the app's own
@@ -664,6 +880,42 @@ export const make = Effect.gen(function* () {
   const statOption = (target: string) =>
     fileSystem.stat(target).pipe(Effect.asSome, Effect.orElseSucceed(Option.none));
 
+  // cwd of each virtual SQLite transcript seen during discovery: `readCwd` must
+  // not reopen a database per thread.
+  const codexSqliteCwds = new Map<string, string>();
+
+  const codexSqliteThreads = (dbs: {
+    readonly historyDbPath: string;
+    readonly stateDbPath: string;
+  }) =>
+    Effect.try(() => listCodexSqliteThreads(dbs)).pipe(
+      // A home without SQLite databases is the normal pre-0.15 case, not a warning.
+      Effect.orElseSucceed((): ReadonlyArray<CodexSqliteThreadSummary> => []),
+    );
+
+  const codexSqliteIdentityOption = (filePath: string, target: CodexSqliteTarget) =>
+    Effect.try(() => codexSqliteThreadSummary(target)).pipe(
+      Effect.map((summary) =>
+        summary === null
+          ? Option.none<ReturnType<typeof transcriptIdentity>>()
+          : Option.some(codexSqliteIdentity(filePath, summary)),
+      ),
+      Effect.orElseSucceed(() => Option.none<ReturnType<typeof transcriptIdentity>>()),
+    );
+
+  /** File identity for ordinary transcripts, database identity for SQLite ones. */
+  const transcriptIdentityOption = Effect.fn("AgentSessionScanner.transcriptIdentityOption")(
+    function* (filePath: string) {
+      const target = codexSqliteTarget(filePath);
+      if (target !== null) return yield* codexSqliteIdentityOption(filePath, target);
+      const stats = yield* statOption(filePath);
+      if (Option.isNone(stats) || stats.value.type !== "File") {
+        return Option.none<ReturnType<typeof transcriptIdentity>>();
+      }
+      return Option.some(transcriptIdentity(filePath, stats.value));
+    },
+  );
+
   /** Match directory aliases without assuming the host volume is case-insensitive. */
   const directoryIdentity = Effect.fn("AgentSessionScanner.directoryIdentity")(function* (
     target: string,
@@ -733,6 +985,14 @@ export const make = Effect.gen(function* () {
     transcript: TranscriptCandidate,
     budget: MetadataReadBudget,
   ) {
+    const sqliteTarget = codexSqliteTarget(transcript.filePath);
+    if (sqliteTarget !== null) {
+      const cached = codexSqliteCwds.get(transcript.filePath);
+      if (cached !== undefined) return cached;
+      return yield* Effect.try(() => codexSqliteThreadSummary(sqliteTarget)?.cwd ?? null).pipe(
+        Effect.orElseSucceed(() => null),
+      );
+    }
     if (transcript.size === 0) return null;
     if (
       budget.bytesRemaining === 0 ||
@@ -820,6 +1080,33 @@ export const make = Effect.gen(function* () {
     recordLimit: number,
     source: AgentSessionSource,
   ) {
+    const sqliteTarget = codexSqliteTarget(filePath);
+    if (sqliteTarget !== null) {
+      // Identity is checked on both sides of the read, like the file path does.
+      return yield* Effect.try(() => {
+        const before = codexSqliteThreadSummary(sqliteTarget);
+        if (
+          before === null ||
+          !sameTranscriptIdentity(expected, codexSqliteIdentity(filePath, before))
+        ) {
+          return null;
+        }
+        const snapshot = readCodexSqliteRecords(sqliteTarget, before, recordLimit);
+        if (snapshot === null) return null;
+        const after = codexSqliteThreadSummary(sqliteTarget);
+        return after !== null &&
+          sameTranscriptIdentity(expected, codexSqliteIdentity(filePath, after))
+          ? snapshot
+          : null;
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Could not read imported Codex SQLite thread", {
+            filePath,
+            cause,
+          }).pipe(Effect.as(null)),
+        ),
+      );
+    }
     if (expected.size > MAX_IMPORTED_TRANSCRIPT_BYTES) return null;
 
     return yield* Effect.scoped(
@@ -1033,6 +1320,24 @@ export const make = Effect.gen(function* () {
               }
             }
           }
+        }
+      }
+      // Codex 0.15+ keeps sessions in SQLite next to (or instead of) rollouts.
+      if (operationsRemaining <= 0) {
+        truncated = true;
+      } else {
+        operationsRemaining -= 1;
+        const historyDbPath = path.join(homePath, CODEX_HISTORY_DB);
+        const stateDbPath = path.join(homePath, CODEX_STATE_DB);
+        for (const thread of yield* codexSqliteThreads({ historyDbPath, stateDbPath })) {
+          const filePath = codexSqliteFilePath(historyDbPath, thread.threadId);
+          codexSqliteCwds.set(filePath, thread.cwd);
+          transcripts.push({
+            filePath,
+            mtimeMs: thread.lastMs,
+            providerInstanceId,
+            size: thread.messageCount,
+          });
         }
       }
       return { transcripts, truncated };
@@ -1391,11 +1696,11 @@ export const make = Effect.gen(function* () {
           ) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
-          const stats = yield* statOption(transcript.filePath);
-          if (Option.isNone(stats) || stats.value.type !== "File") {
+          const identityOption = yield* transcriptIdentityOption(transcript.filePath);
+          if (Option.isNone(identityOption)) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
-          const identity = transcriptIdentity(transcript.filePath, stats.value);
+          const identity = identityOption.value;
           const completedSource = completed?.find(
             (source) =>
               source.provider === candidate.source && sameTranscriptIdentity(source, identity),

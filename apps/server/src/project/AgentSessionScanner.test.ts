@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";
+import * as NodeSqlite from "node:sqlite";
 import { describe, expect, it } from "@effect/vitest";
 import {
   type OrchestrationProjectShell,
@@ -9,6 +10,7 @@ import {
   type ServerSettings as ContractServerSettings,
 } from "@t3tools/contracts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -155,6 +157,79 @@ const codexRolloutLine = (cwd: string) =>
 
 const encodeTranscriptRecord = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
+interface CodexSqliteMessage {
+  readonly role: "user" | "assistant";
+  readonly text: string;
+  readonly createdAtMs: number;
+}
+
+/**
+ * Codex 0.15+ home: sessions in SQLite, no rollout files. Only the columns the
+ * scanner reads are created, so the fixture documents the contract it relies on.
+ */
+const writeCodexSqliteThread = Effect.fn("AgentSessionScanner.test.writeCodexSqliteThread")(
+  function* (input: {
+    readonly homePath: string;
+    readonly threadId: string;
+    readonly cwd: string;
+    readonly messages: ReadonlyArray<CodexSqliteMessage>;
+    readonly archived?: boolean;
+  }) {
+    const path = yield* Path.Path;
+    yield* Effect.sync(() => {
+      const state = new NodeSqlite.DatabaseSync(path.join(input.homePath, "state_5.sqlite"));
+      try {
+        state.exec(
+          "create table if not exists threads (id text primary key, cwd text not null, archived integer not null default 0)",
+        );
+        state
+          .prepare("insert or replace into threads (id, cwd, archived) values (?, ?, ?)")
+          .run(input.threadId, input.cwd, input.archived ? 1 : 0);
+      } finally {
+        state.close();
+      }
+      const history = new NodeSqlite.DatabaseSync(
+        path.join(input.homePath, "thread_history_1.sqlite"),
+      );
+      try {
+        history.exec(
+          "create table if not exists thread_items (thread_id text not null, turn_id text not null, item_id text not null, rollout_ordinal integer not null, created_at_ms integer not null, item_json text not null, item_type text not null default '', primary key (thread_id, turn_id, item_id))",
+        );
+        const insert = history.prepare(
+          "insert or replace into thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_json, item_type) values (?, ?, ?, ?, ?, ?, ?)",
+        );
+        const existing = history
+          .prepare("select count(*) as n from thread_items where thread_id = ?")
+          .get(input.threadId) as { readonly n: number };
+        let ordinal = Number(existing.n);
+        for (const message of input.messages) {
+          ordinal += 1;
+          const itemType = message.role === "user" ? "userMessage" : "agentMessage";
+          const itemJson =
+            message.role === "user"
+              ? encodeTranscriptRecord({
+                  type: itemType,
+                  id: `u-${ordinal}`,
+                  content: [{ type: "text", text: message.text }],
+                })
+              : encodeTranscriptRecord({ type: itemType, id: `a-${ordinal}`, text: message.text });
+          insert.run(
+            input.threadId,
+            `turn-${ordinal}`,
+            `item-${ordinal}`,
+            ordinal,
+            message.createdAtMs,
+            itemJson,
+            itemType,
+          );
+        }
+      } finally {
+        history.close();
+      }
+    });
+  },
+);
+
 function makeRecordLimitTranscript(cwd: string, overflow: boolean): string {
   const records =
     [
@@ -181,6 +256,163 @@ function makeRecordLimitTranscript(cwd: string, overflow: boolean): string {
 }
 
 it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
+  describe("codex sqlite sessions", () => {
+    it.effect("discovers SQLite threads next to rollout files and skips archived ones", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const sqliteWorkspace = yield* makeTempDir("t3code-workspace-sqlite-");
+        const rolloutWorkspace = yield* makeTempDir("t3code-workspace-rollout-");
+        const archivedWorkspace = yield* makeTempDir("t3code-workspace-archived-");
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const lastMs = nowMs - 60_000;
+
+        yield* writeCodexSqliteThread({
+          homePath: codexHomePath,
+          threadId: "thread-sqlite",
+          cwd: sqliteWorkspace,
+          messages: [
+            { role: "user", text: "Bonjour", createdAtMs: lastMs - 5_000 },
+            { role: "assistant", text: "Salut", createdAtMs: lastMs },
+          ],
+        });
+        yield* writeCodexSqliteThread({
+          homePath: codexHomePath,
+          threadId: "thread-archived",
+          cwd: archivedWorkspace,
+          archived: true,
+          messages: [{ role: "user", text: "Ancien", createdAtMs: lastMs }],
+        });
+        yield* writeTranscript({
+          filePath: path.join(
+            codexHomePath,
+            "sessions",
+            "2026",
+            "01",
+            "05",
+            "rollout-2026-01-05T10-00-00-aaa.jsonl",
+          ),
+          contents: codexRolloutLine(rolloutWorkspace),
+          mtimeMs: Date.parse("2026-01-05T10:00:00.000Z"),
+        });
+
+        const result = yield* runScan({ claudeHomePath, codexHomePath });
+
+        expect(result.candidates).toEqual([
+          {
+            path: sqliteWorkspace,
+            title: path.basename(sqliteWorkspace),
+            sources: ["codex"],
+            threadCount: 1,
+            lastActiveAt: DateTime.formatIso(DateTime.makeUnsafe(lastMs)),
+            alreadyImported: false,
+            git: null,
+          },
+          {
+            path: rolloutWorkspace,
+            title: path.basename(rolloutWorkspace),
+            sources: ["codex"],
+            threadCount: 1,
+            lastActiveAt: "2026-01-05T10:00:00.000Z",
+            alreadyImported: false,
+            git: null,
+          },
+        ]);
+      }),
+    );
+
+    it.effect("imports a SQLite thread with its messages and resumable thread id", () =>
+      Effect.gen(function* () {
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const lastMs = nowMs - 60_000;
+
+        yield* writeCodexSqliteThread({
+          homePath: codexHomePath,
+          threadId: "01a0755e-317d-7723-baae-1050e16316f8",
+          cwd: workspace,
+          messages: [
+            { role: "user", text: "Regarde ce dépôt", createdAtMs: lastMs - 10_000 },
+            { role: "assistant", text: "C'est un lanceur.", createdAtMs: lastMs - 5_000 },
+            { role: "user", text: "Explique", createdAtMs: lastMs - 2_000 },
+            { role: "assistant", text: "Voilà.", createdAtMs: lastMs },
+          ],
+        });
+
+        const threads = yield* runRecentThreads({
+          claudeHomePath,
+          codexHomePath,
+          workspaceRoot: workspace,
+        });
+
+        expect(threads).toHaveLength(1);
+        const thread = threads[0]!;
+        expect(thread.source).toBe("codex");
+        expect(thread.providerSessionId).toBe("01a0755e-317d-7723-baae-1050e16316f8");
+        expect(thread.title).toBe("Regarde ce dépôt");
+        expect(thread.messages.map((message) => [message.role, message.text])).toEqual([
+          ["user", "Regarde ce dépôt"],
+          ["assistant", "C'est un lanceur."],
+          ["user", "Explique"],
+          ["assistant", "Voilà."],
+        ]);
+        expect(thread.messages[3]!.createdAt).toBe(DateTime.formatIso(DateTime.makeUnsafe(lastMs)));
+      }),
+    );
+
+    it.effect("sees a SQLite thread again once a message was appended", () =>
+      Effect.gen(function* () {
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const lastMs = nowMs - 60_000;
+        const write = (messages: ReadonlyArray<CodexSqliteMessage>) =>
+          writeCodexSqliteThread({
+            homePath: codexHomePath,
+            threadId: "thread-refresh",
+            cwd: workspace,
+            messages,
+          });
+        yield* write([{ role: "user", text: "Un", createdAtMs: lastMs - 1_000 }]);
+
+        const first = yield* runRecentThreadOutcomes({
+          claudeHomePath,
+          codexHomePath,
+          workspaceRoot: workspace,
+        });
+        expect(first.map((outcome) => outcome._tag)).toEqual(["Importable"]);
+        const source = first[0]!._tag === "Importable" ? first[0]!.source : null;
+        expect(source?.size).toBe(1);
+
+        const unchanged = yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          return yield* scanner.recentThreads(workspace, source ? [source] : []).pipe(
+            Stream.runCollect,
+            Effect.map((outcomes) => Array.from(outcomes)),
+          );
+        }).pipe(Effect.provide(makeScannerTestLayer({ claudeHomePath, codexHomePath })));
+        expect(unchanged.map((outcome) => outcome._tag)).toEqual(["AlreadyImported"]);
+
+        yield* write([{ role: "assistant", text: "Deux", createdAtMs: lastMs }]);
+        const changed = yield* Effect.gen(function* () {
+          const scanner = yield* AgentSessionScanner.AgentSessionScanner;
+          return yield* scanner.recentThreads(workspace, source ? [source] : []).pipe(
+            Stream.runCollect,
+            Effect.map((outcomes) => Array.from(outcomes)),
+          );
+        }).pipe(Effect.provide(makeScannerTestLayer({ claudeHomePath, codexHomePath })));
+        expect(changed.map((outcome) => outcome._tag)).toEqual(["Importable"]);
+      }),
+    );
+  });
+
   describe("scan", () => {
     it.effect("reads Claude project cwds from transcripts, newest first", () =>
       Effect.gen(function* () {
