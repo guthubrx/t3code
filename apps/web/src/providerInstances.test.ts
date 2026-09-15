@@ -10,6 +10,8 @@ import {
   resolveDefaultProviderModelSelection,
   resolveSelectableProviderInstance,
   resolveProviderDriverKindForInstanceSelection,
+  shouldShowInstanceBadge,
+  type ProviderInstanceEntry,
 } from "./providerInstances";
 
 function provider(input: {
@@ -578,5 +580,24 @@ describe("resolveDefaultProviderModelSelection", () => {
         null,
       ),
     ).toBeNull();
+  });
+});
+
+describe("shouldShowInstanceBadge", () => {
+  const codex = ProviderDriverKind.make("codex");
+  const entry = (instanceId: string, accentColor?: string) =>
+    ({
+      instanceId: ProviderInstanceId.make(instanceId),
+      driverKind: codex,
+      displayName: instanceId,
+      accentColor,
+      enabled: true,
+    }) as ProviderInstanceEntry;
+
+  it("never shows an initials badge, even when instances share a driver", () => {
+    const builtIn = entry("codex");
+    const custom = entry("cx-pro", "#7c3aed");
+    expect(shouldShowInstanceBadge(builtIn, [builtIn, custom])).toBe(false);
+    expect(shouldShowInstanceBadge(custom, [builtIn, custom])).toBe(false);
   });
 });

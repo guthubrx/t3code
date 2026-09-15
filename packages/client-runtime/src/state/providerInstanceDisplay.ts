@@ -70,19 +70,12 @@ export function normalizeProviderAccentColor(value: string | undefined): string 
   return /^#[0-9a-fA-F]{6}$/u.test(trimmed) ? trimmed : undefined;
 }
 
-/**
- * Whether an instance's icon carries the account badge: accent color set, or
- * several instances sharing a driver so the brand glyph alone is ambiguous.
- * Shared by the composer trigger, the picker rail, and sidebar/thread rows.
- */
+/** Instance icons use their accent color directly instead of an initials badge. */
 export function shouldShowInstanceBadge(
   entry: { readonly driverKind: ProviderDriverKind; readonly accentColor?: string | undefined },
   entries: Iterable<{ readonly driverKind: ProviderDriverKind }>,
 ): boolean {
-  if (entry.accentColor) return true;
-  let sharedDriverCount = 0;
-  for (const candidate of entries) {
-    if (candidate.driverKind === entry.driverKind && ++sharedDriverCount > 1) return true;
-  }
+  void entry;
+  void entries;
   return false;
 }
