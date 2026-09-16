@@ -50,6 +50,21 @@ export const DiffLayout = Schema.Literals(["stacked", "split"]);
 export type DiffLayout = typeof DiffLayout.Type;
 const DEFAULT_DIFF_LAYOUT: DiffLayout = "stacked";
 
+export const ConversationWidth = Schema.Literals(["standard", "large", "fluid"]);
+export type ConversationWidth = typeof ConversationWidth.Type;
+export const DEFAULT_CONVERSATION_WIDTH: ConversationWidth = "standard";
+const isConversationWidth = Schema.is(ConversationWidth);
+const StoredConversationWidth = Schema.Unknown.pipe(
+  Schema.decodeTo(
+    ConversationWidth,
+    SchemaTransformation.transform<ConversationWidth, unknown>({
+      decode: (value) => (isConversationWidth(value) ? value : DEFAULT_CONVERSATION_WIDTH),
+      encode: (value) => value,
+    }),
+  ),
+  Schema.withDecodingDefault(Effect.succeed(DEFAULT_CONVERSATION_WIDTH)),
+);
+
 export const SidebarProjectSortOrder = Schema.Literals(["updated_at", "created_at", "manual"]);
 export type SidebarProjectSortOrder = typeof SidebarProjectSortOrder.Type;
 export const DEFAULT_SIDEBAR_PROJECT_SORT_ORDER: SidebarProjectSortOrder = "updated_at";
@@ -295,6 +310,7 @@ export const ClientSettingsSchema = Schema.Struct({
   diffColorScheme: DiffColorScheme.pipe(
     Schema.withDecodingDefault(Effect.succeed("red-green" as const)),
   ),
+  conversationWidth: StoredConversationWidth,
   loadBalancingEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   loadBalancingWeights: LoadBalancingWeights.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   appearanceContrast: AppearanceContrast.pipe(
@@ -1444,6 +1460,7 @@ export const ClientSettingsPatch = Schema.Struct({
   notificationMode: Schema.optionalKey(NotificationMode),
   inAppNotificationsEnabled: Schema.optionalKey(Schema.Boolean),
   diffColorScheme: Schema.optionalKey(DiffColorScheme),
+  conversationWidth: Schema.optionalKey(ConversationWidth),
   loadBalancingEnabled: Schema.optionalKey(Schema.Boolean),
   loadBalancingWeights: Schema.optionalKey(LoadBalancingWeights),
   appearanceContrast: Schema.optionalKey(AppearanceContrast),

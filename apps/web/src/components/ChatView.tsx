@@ -83,6 +83,7 @@ import {
 import { Debouncer } from "@tanstack/react-pacer";
 import { useAtomValue } from "@effect/atom-react";
 import {
+  type CSSProperties,
   lazy,
   memo,
   Suspense,
@@ -441,6 +442,7 @@ import {
   rememberCheckoutIsRepo,
   resolveBackgroundDraftWorkspaceOptions,
   resolveComposerInteractionMode,
+  resolveConversationMaxWidth,
   resolveComposerProviderSelection,
   resolveDraftHeroState,
   findRecordedWorktreeSetup,
@@ -9350,6 +9352,11 @@ export default function ChatView(props: ChatViewProps) {
           rightPanelMaximized ? "w-0 flex-none" : "flex-1",
         )}
         data-chat-column-maximized-away={rightPanelMaximized ? "true" : "false"}
+        style={
+          {
+            "--chat-content-max-width": resolveConversationMaxWidth(settings.conversationWidth),
+          } as CSSProperties
+        }
       >
         {/* Top bar */}
         <WorkspacePageHeader
@@ -9564,7 +9571,7 @@ export default function ChatView(props: ChatViewProps) {
               >
                 <div
                   data-chat-composer-stack="true"
-                  className="group/composer-stack pointer-events-auto relative z-10 mx-auto w-full max-w-3xl"
+                  className="group/composer-stack pointer-events-auto relative z-10 mx-auto w-full min-w-0 max-w-[var(--chat-content-max-width,48rem)]"
                 >
                   {isDraftHeroState ? (
                     <div className="absolute inset-x-0 bottom-full z-0">

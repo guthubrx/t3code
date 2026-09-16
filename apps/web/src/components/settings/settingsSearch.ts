@@ -144,6 +144,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["colors borders interface"],
   },
   {
+    id: "conversation-width",
+    title: "Conversation width",
+    to: "/settings/appearance",
+    searchTerms: ["chat messages composer center panel standard large fluid wide"],
+  },
+  {
     // Prefixed because the slider control already owns the `glass-opacity` id.
     id: "setting-glass-opacity",
     title: "Glass opacity",

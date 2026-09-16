@@ -360,6 +360,30 @@ describe("ClientSettings window capture", () => {
   });
 });
 
+describe("ClientSettings conversation width", () => {
+  it("defaults missing and obsolete stored values to standard", () => {
+    expect(decodeClientSettings({}).conversationWidth).toBe("standard");
+    expect(decodeClientSettings({ conversationWidth: "obsolete" }).conversationWidth).toBe(
+      "standard",
+    );
+  });
+
+  it.each(["standard", "large", "fluid"] as const)(
+    "round-trips the %s conversation width",
+    (conversationWidth) => {
+      const settings = decodeClientSettings({ conversationWidth });
+      expect(encodeClientSettings(settings).conversationWidth).toBe(conversationWidth);
+      expect(decodeClientSettingsPatch({ conversationWidth }).conversationWidth).toBe(
+        conversationWidth,
+      );
+    },
+  );
+
+  it("rejects an unsupported conversation width in a settings patch", () => {
+    expect(() => decodeClientSettingsPatch({ conversationWidth: "unsupported" })).toThrow();
+  });
+});
+
 describe("ClientSettings proactive panels", () => {
   it("is opt-in and accepts client-local updates", () => {
     expect(decodeClientSettings({}).proactivePanelsEnabled).toBe(false);

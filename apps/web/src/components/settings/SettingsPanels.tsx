@@ -21,6 +21,7 @@ import {
 import {
   DEFAULT_ENVIRONMENT_IDENTIFICATION_MODE,
   DEFAULT_UNIFIED_SETTINGS,
+  type ConversationWidth,
   type DiffLayout,
   type EnvironmentIdentificationMode,
   MAX_APPEARANCE_CONTRAST,
@@ -187,6 +188,12 @@ const RESPONSE_STREAMING_MODE_DESCRIPTIONS: Record<ResponseStreamingMode, string
   turn: "Text appears once the agent finishes its turn.",
   paragraph: "Each paragraph or code block appears as soon as it is complete.",
   token: "Every token repaints the message as it arrives. Slower and harder to read.",
+};
+
+const CONVERSATION_WIDTH_LABELS: Record<ConversationWidth, string> = {
+  standard: "Standard",
+  large: "Large",
+  fluid: "Fluid",
 };
 
 const TIMESTAMP_FORMAT_LABELS = {
@@ -526,6 +533,9 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.appearanceContrast !== DEFAULT_UNIFIED_SETTINGS.appearanceContrast
         ? ["Contrast"]
         : []),
+      ...(settings.conversationWidth !== DEFAULT_UNIFIED_SETTINGS.conversationWidth
+        ? ["Conversation width"]
+        : []),
       ...(settings.glassOpacity !== DEFAULT_UNIFIED_SETTINGS.glassOpacity ? ["Glass opacity"] : []),
       ...(settings.diffColorScheme !== DEFAULT_UNIFIED_SETTINGS.diffColorScheme
         ? ["Diff colors"]
@@ -633,6 +643,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.browserAutoShowFloatingPreview,
       settings.appearanceContrast,
       settings.diffColorScheme,
+      settings.conversationWidth,
       settings.enableAgentBrowserAccess,
       settings.confirmQuit,
       settings.confirmThreadArchive,
@@ -742,6 +753,7 @@ export function useSettingsRestore(onRestored?: () => void) {
     updateSettings({
       appearanceContrast: DEFAULT_UNIFIED_SETTINGS.appearanceContrast,
       diffColorScheme: DEFAULT_UNIFIED_SETTINGS.diffColorScheme,
+      conversationWidth: DEFAULT_UNIFIED_SETTINGS.conversationWidth,
       timestampFormat: DEFAULT_UNIFIED_SETTINGS.timestampFormat,
       notificationMode: DEFAULT_UNIFIED_SETTINGS.notificationMode,
       inAppNotificationsEnabled: DEFAULT_UNIFIED_SETTINGS.inAppNotificationsEnabled,
@@ -1184,6 +1196,44 @@ export function AppearanceSettingsPanel() {
       </SettingsSection>
 
       <SettingsSection id="appearance-interface" title="Interface">
+        <SettingsRow
+          {...searchableSetting("conversation-width")}
+          description="Choose how much of the center panel the conversation uses."
+          resetAction={
+            settings.conversationWidth !== DEFAULT_UNIFIED_SETTINGS.conversationWidth ? (
+              <SettingResetButton
+                label="conversation width"
+                onClick={() =>
+                  updateSettings({
+                    conversationWidth: DEFAULT_UNIFIED_SETTINGS.conversationWidth,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Select
+              value={settings.conversationWidth}
+              onValueChange={(value) => {
+                if (value === "standard" || value === "large" || value === "fluid") {
+                  updateSettings({ conversationWidth: value });
+                }
+              }}
+            >
+              <SelectTrigger size="sm" className="w-full sm:w-40" aria-label="Conversation width">
+                <SelectValue>{CONVERSATION_WIDTH_LABELS[settings.conversationWidth]}</SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                {Object.entries(CONVERSATION_WIDTH_LABELS).map(([value, label]) => (
+                  <SelectItem hideIndicator key={value} value={value}>
+                    {label}
+                  </SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+          }
+        />
+
         <SettingsRow
           {...searchableSetting("setting-appearance-contrast")}
           description="Adjust the contrast of colors and borders across the interface."

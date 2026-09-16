@@ -57,6 +57,7 @@ import {
   resolveBackgroundDraftWorkspaceOptions,
   resolveComposerInteractionMode,
   restorePlanFollowUpComposer,
+  resolveConversationMaxWidth,
   resolveComposerProviderSelection,
   resolveDraftPromotionNavigationTarget,
   findRecordedWorktreeSetup,
@@ -91,6 +92,16 @@ import {
   waitForRevertedMessage,
   prepareRevertedMessageAttachments,
 } from "./ChatView.logic";
+
+describe("conversation width", () => {
+  it.each([
+    ["standard", "48rem"],
+    ["large", "64rem"],
+    ["fluid", "calc(100% - 2rem)"],
+  ] as const)("resolves %s to %s", (conversationWidth, expected) => {
+    expect(resolveConversationMaxWidth(conversationWidth)).toBe(expected);
+  });
+});
 
 describe("agent browser close confirmation", () => {
   const surfaces = [

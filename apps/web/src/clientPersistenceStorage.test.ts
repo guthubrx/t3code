@@ -52,6 +52,26 @@ describe("clientPersistenceStorage", () => {
     expect(readBrowserClientSettings()).toEqual(settings);
   });
 
+  it("persists conversation width and safely replaces an obsolete stored value", async () => {
+    const testWindow = getTestWindow();
+    const { readBrowserClientSettings, writeBrowserClientSettings } =
+      await import("./clientPersistenceStorage");
+
+    writeBrowserClientSettings({ ...DEFAULT_CLIENT_SETTINGS, conversationWidth: "large" });
+    expect(readBrowserClientSettings()?.conversationWidth).toBe("large");
+
+    testWindow.localStorage.setItem(
+      "t3code:client-settings:v1",
+      JSON.stringify({ conversationWidth: "obsolete", timestampFormat: "24-hour" }),
+    );
+    expect(readBrowserClientSettings()).toEqual(
+      expect.objectContaining({
+        conversationWidth: "standard",
+        timestampFormat: "24-hour",
+      }),
+    );
+  });
+
   it.each(["not-json", '{"wordWrap":"invalid"}'])(
     "does not treat invalid saved settings as absent: %s",
     async (value) => {

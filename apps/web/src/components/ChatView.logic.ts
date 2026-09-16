@@ -3,6 +3,7 @@ import {
   type AssetCreateUrlInput,
   type AssetCreateUrlResult,
   type ChatFileAttachment,
+  type ConversationWidth,
   type EnvironmentId,
   isProviderDriverKind,
   ProjectId,
@@ -65,6 +66,17 @@ export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "t3code:last-invoked-script-by
 export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 export const MAX_HIDDEN_MOUNTED_PREVIEW_THREADS = 3;
 export const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;
+
+export function resolveConversationMaxWidth(conversationWidth: ConversationWidth): string {
+  switch (conversationWidth) {
+    case "standard":
+      return "48rem";
+    case "large":
+      return "64rem";
+    case "fluid":
+      return "calc(100% - 2rem)";
+  }
+}
 
 export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.String);
 
