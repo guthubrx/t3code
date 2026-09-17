@@ -12,6 +12,7 @@ import {
   createThreadJumpHintVisibilityController,
   deleteSelectedThreadEntries,
   filterSidebarProjectScopeItems,
+  formatSidebarThreadAccessibleStatus,
   getSidebarThreadIdsToPrewarm,
   resolveAdjacentThreadId,
   reduceSidebarProjectScopeMenuState,
@@ -97,6 +98,32 @@ describe("resolveSidebarRowAccessibility", () => {
   ])("leads with the title without folding row actions into its name: %j", (input) => {
     const { expected, ...state } = input;
     expect(resolveSidebarRowAccessibility(state)).toEqual(expected);
+  });
+});
+
+describe("formatSidebarThreadAccessibleStatus", () => {
+  it("summarizes every active state for the card description", () => {
+    expect(
+      formatSidebarThreadAccessibleStatus({
+        hasUnsentDraft: true,
+        isPinned: true,
+        isRegeneratingTitle: true,
+        statusLabel: "Working",
+        terminalLabel: "2 terminal processes running",
+      }),
+    ).toBe("Unsent draft, Pinned, Regenerating title, Working, 2 terminal processes running");
+  });
+
+  it("omits the description when the card has no active state", () => {
+    expect(
+      formatSidebarThreadAccessibleStatus({
+        hasUnsentDraft: false,
+        isPinned: false,
+        isRegeneratingTitle: false,
+        statusLabel: null,
+        terminalLabel: null,
+      }),
+    ).toBeNull();
   });
 });
 
