@@ -118,7 +118,7 @@ describe("DesktopClientSettings", () => {
         const environment = yield* DesktopEnvironment.DesktopEnvironment;
         const fileSystem = yield* FileSystem.FileSystem;
         const settings = yield* DesktopClientSettings.DesktopClientSettings;
-        const contents = JSON.stringify({ conversationWidth: "fluid", timestampFormat: "24-hour" });
+        const contents = '{"conversationWidth":"fluid","timestampFormat":"24-hour"}';
         yield* fileSystem.makeDirectory(environment.stateDir, { recursive: true });
         yield* fileSystem.writeFileString(environment.clientSettingsPath, contents);
         const persisted = yield* settings.get;
@@ -129,7 +129,7 @@ describe("DesktopClientSettings", () => {
           assert.equal(persisted.value.timestampFormat, "24-hour");
           yield* settings.set(persisted.value);
           assert.notProperty(
-            JSON.parse(yield* fileSystem.readFileString(environment.clientSettingsPath)),
+            yield* decodeRecordJson(yield* fileSystem.readFileString(environment.clientSettingsPath)),
             "conversationWidth",
           );
         }
