@@ -1,4 +1,8 @@
-import { ClientSettingsSchema, PersistedClientSettingsSchema, type ClientSettings } from "@t3tools/contracts";
+import {
+  ClientSettingsSchema,
+  PersistedClientSettingsSchema,
+  type ClientSettings,
+} from "@t3tools/contracts";
 
 import { getLocalStorageItem, setLocalStorageItem } from "./hooks/useLocalStorage";
 

@@ -122,12 +122,16 @@ describe("DesktopClientSettings", () => {
         yield* fileSystem.makeDirectory(environment.stateDir, { recursive: true });
         yield* fileSystem.writeFileString(environment.clientSettingsPath, contents);
         const persisted = yield* settings.get;
+        assert.equal(yield* fileSystem.readFileString(environment.clientSettingsPath), contents);
         assert.isTrue(Option.isSome(persisted));
         if (Option.isSome(persisted)) {
           assert.equal(persisted.value.chatWidth, "full");
           assert.equal(persisted.value.timestampFormat, "24-hour");
           yield* settings.set(persisted.value);
-          assert.notProperty(JSON.parse(yield* fileSystem.readFileString(environment.clientSettingsPath)), "conversationWidth");
+          assert.notProperty(
+            JSON.parse(yield* fileSystem.readFileString(environment.clientSettingsPath)),
+            "conversationWidth",
+          );
         }
       }),
     ),
