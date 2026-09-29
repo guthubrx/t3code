@@ -947,6 +947,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
               ...exclusions,
             ],
             env: commitEnv,
+            timeoutMs: 180_000,
           });
         yield* stageFiles([]).pipe(
           Effect.catchTags({

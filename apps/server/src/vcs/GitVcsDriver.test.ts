@@ -1055,6 +1055,7 @@ it.effect("GitVcsDriver forwards execute env to the VCS process", () => {
 
 it.effect("GitVcsDriver flushes checkpoint objects and refs to disk before publishing them", () => {
   const observedArgs: ReadonlyArray<string>[] = [];
+  const observedCommands: VcsProcess.VcsProcessInput[] = [];
 
   return Effect.gen(function* () {
     const driver = yield* GitVcsDriver.makeVcsDriverShape();
@@ -1069,6 +1070,11 @@ it.effect("GitVcsDriver flushes checkpoint objects and refs to disk before publi
       writeCommands.some((command) => args.includes(command)),
     );
     assert.strictEqual(writes.length, 4);
+    const staging = observedCommands.filter(({ args }) => args.includes("add"));
+    assert.strictEqual(staging.length, 1);
+    assert.strictEqual(staging[0]!.timeoutMs, 180_000);
+    assert.isTrue(observedCommands.filter(({ args }) => !args.includes("add"))
+      .every(({ timeoutMs }) => timeoutMs === undefined));
     for (const args of writes) {
       const command = args.findIndex((arg) => writeCommands.includes(arg));
       for (const setting of ["core.fsync=objects,reference", "core.fsyncMethod=fsync"]) {
@@ -1096,6 +1102,7 @@ it.effect("GitVcsDriver flushes checkpoint objects and refs to disk before publi
           run: (input) =>
             Effect.sync(() => {
               observedArgs.push(input.args);
+              observedCommands.push(input);
               const stdout = input.args.includes("write-tree")
                 ? "tree0000\n"
                 : input.args.includes("commit-tree")
