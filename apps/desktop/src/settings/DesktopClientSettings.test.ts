@@ -112,6 +112,27 @@ const withClientSettings = <A, E, R>(
   }).pipe(Effect.provide(NodeServices.layer), Effect.scoped);
 
 describe("DesktopClientSettings", () => {
+  it.effect("migrates the local fluid width without rewriting settings during read", () =>
+    withClientSettings(
+      Effect.gen(function* () {
+        const environment = yield* DesktopEnvironment.DesktopEnvironment;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const settings = yield* DesktopClientSettings.DesktopClientSettings;
+        const contents = JSON.stringify({ conversationWidth: "fluid", timestampFormat: "24-hour" });
+        yield* fileSystem.makeDirectory(environment.stateDir, { recursive: true });
+        yield* fileSystem.writeFileString(environment.clientSettingsPath, contents);
+        const persisted = yield* settings.get;
+        assert.isTrue(Option.isSome(persisted));
+        if (Option.isSome(persisted)) {
+          assert.equal(persisted.value.chatWidth, "full");
+          assert.equal(persisted.value.timestampFormat, "24-hour");
+          yield* settings.set(persisted.value);
+          assert.notProperty(JSON.parse(yield* fileSystem.readFileString(environment.clientSettingsPath)), "conversationWidth");
+        }
+      }),
+    ),
+  );
+
   it.effect("returns none when no client settings file exists", () =>
     withClientSettings(
       Effect.gen(function* () {

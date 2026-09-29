@@ -502,6 +502,29 @@ export const ClientSettingsSchema = Schema.Struct({
 });
 export type ClientSettings = typeof ClientSettingsSchema.Type;
 
+/** Reads the local fork's older width preference without changing the wire schema. */
+export const PersistedClientSettingsSchema = Schema.Record(Schema.String, Schema.Unknown).pipe(
+  Schema.decodeTo(
+    ClientSettingsSchema,
+    SchemaTransformation.transform({
+      decode: (settings) => {
+        if (Object.hasOwn(settings, "chatWidth")) return settings;
+        switch (settings.conversationWidth) {
+          case "standard":
+            return { ...settings, chatWidth: "comfortable" as const };
+          case "large":
+            return { ...settings, chatWidth: "wide" as const };
+          case "fluid":
+            return { ...settings, chatWidth: "full" as const };
+          default:
+            return settings;
+        }
+      },
+      encode: (settings) => ({ ...settings }),
+    }),
+  ),
+);
+
 export const DEFAULT_CLIENT_SETTINGS: ClientSettings = Schema.decodeSync(ClientSettingsSchema)({});
 
 // ── Server Settings (server-authoritative) ────────────────────

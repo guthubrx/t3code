@@ -38,6 +38,34 @@ afterEach(() => {
 });
 
 describe("clientPersistenceStorage", () => {
+  it.each([
+    ["standard", "comfortable"],
+    ["large", "wide"],
+    ["fluid", "full"],
+    ["unknown", "comfortable"],
+  ])("migrates the saved local width %s to %s", async (conversationWidth, chatWidth) => {
+    const testWindow = getTestWindow();
+    const stored = JSON.stringify({ conversationWidth, timestampFormat: "24-hour" });
+    testWindow.localStorage.setItem("t3code:client-settings:v1", stored);
+    const { readBrowserClientSettings, writeBrowserClientSettings } =
+      await import("./clientPersistenceStorage");
+    const settings = readBrowserClientSettings();
+    expect(settings).toEqual(expect.objectContaining({ chatWidth, timestampFormat: "24-hour" }));
+    expect(testWindow.localStorage.getItem("t3code:client-settings:v1")).toBe(stored);
+    writeBrowserClientSettings(settings!);
+    expect(readBrowserClientSettings()).toEqual(settings);
+    expect(JSON.parse(testWindow.localStorage.getItem("t3code:client-settings:v1")!))
+      .not.toHaveProperty("conversationWidth");
+  });
+
+  it("prefers the native width when both preferences exist", async () => {
+    const testWindow = getTestWindow();
+    testWindow.localStorage.setItem("t3code:client-settings:v1",
+      JSON.stringify({ conversationWidth: "fluid", chatWidth: "wide" }));
+    const { readBrowserClientSettings } = await import("./clientPersistenceStorage");
+    expect(readBrowserClientSettings()?.chatWidth).toBe("wide");
+  });
+
   it("persists client settings in browser storage", async () => {
     getTestWindow();
     const { readBrowserClientSettings, writeBrowserClientSettings } =
