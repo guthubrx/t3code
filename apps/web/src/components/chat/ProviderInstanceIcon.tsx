@@ -44,7 +44,7 @@ export const ProviderInstanceIcon = memo(function ProviderInstanceIcon(props: {
             // (brand icons set it by class), the text color (icons drawn with
             // currentColor), and no grayscale or dimming on top.
             props.accentColor &&
-              "fill-[var(--provider-accent)] text-[var(--provider-accent)] grayscale-0 opacity-100 dark:fill-[var(--provider-accent)]",
+              "fill-(--provider-accent) text-(--provider-accent) grayscale-0 opacity-100 dark:fill-(--provider-accent)",
           )}
           aria-hidden
         />
