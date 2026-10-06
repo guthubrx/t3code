@@ -181,6 +181,7 @@ import {
   deriveUnsettledTurnId,
   type MessagesTimelineRowsProjection,
   liveWorkEntryLabel,
+  hasBridgetEnvelopeHeading,
   workEntryIsActiveTurnActivity,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
@@ -4017,7 +4018,11 @@ const UserMessageBody = memo(function UserMessageBody(props: {
       cwd={props.markdownCwd}
       threadRef={ctx.threadRef ?? undefined}
       skills={props.skills}
-      className="text-message-foreground"
+      className={cn(
+        "text-message-foreground",
+        hasBridgetEnvelopeHeading(props.text) &&
+          "[&>p:first-child]:text-secondary-label [&>p:first-child]:text-xs",
+      )}
       lineBreaks
       parseRawHtml={false}
       renderContextReference={props.renderContextReference}

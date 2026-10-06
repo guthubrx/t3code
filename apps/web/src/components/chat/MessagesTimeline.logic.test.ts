@@ -25,6 +25,7 @@ import {
   deriveMessagesTimelineRows,
   deriveMessagesTimelineRowsWithState,
   liveWorkEntryLabel,
+  hasBridgetEnvelopeHeading,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveWorkGroupScrollIndex,
@@ -43,6 +44,34 @@ import {
   type TimelineEntriesProjection,
 } from "../../session-logic";
 import { isImageAttachment, type ChatMessage, type TurnDiffSummary } from "../../types";
+
+describe("SPEC137 Bridget envelope heading", () => {
+  it.each([
+    "💬 Message Bridget de wild2-marketing (d842f5d4-5456-49c5-a82b-68caacf94a1d) (id mcp-48328-6ac45cb8-5, reply=no) :",
+    "💬 Message Bridget de 29aaed9b-9f6f-4849-87a5-1a23bbe01948 (id t3-test) :",
+    "🔔 Notification Bridget (id bridget-observation:test) :",
+    "📥 3 messages Bridget groupés dans ce tour (reply=no) :",
+  ])("recognizes a separated first heading: %s", (heading) => {
+    expect(hasBridgetEnvelopeHeading(`${heading}\n\nCorps intact.`)).toBe(true);
+  });
+
+  it.each([
+    "Texte normal\n\nCorps intact.",
+    "💬 Message Bridget de agent :\n\nCorps intact.",
+    "💬 Message Bridget de agent (id test) :\nCorps sans séparation.",
+    "> 💬 Message Bridget de agent (id test) :\n\nCitation.",
+    "```\n💬 Message Bridget de agent (id test) :\n\nCode.\n```",
+    "Introduction\n\n💬 Message Bridget de agent (id test) :\n\nCorps.",
+    `💬 Message Bridget de ${"x".repeat(1100)} (id test) :\n\nCorps.`,
+  ])("does not dim ordinary or ambiguous text: %s", (text) => {
+    expect(hasBridgetEnvelopeHeading(text)).toBe(false);
+  });
+
+  it("recognizes CRLF-separated headings", () => {
+    const text = "💬 Message Bridget de agent (id test) :\r\n\r\nCorps **intact**.";
+    expect(hasBridgetEnvelopeHeading(text)).toBe(true);
+  });
+});
 
 describe("streaming row projection", () => {
   function fixture(text = "") {
