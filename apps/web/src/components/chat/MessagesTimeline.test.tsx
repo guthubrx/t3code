@@ -285,6 +285,122 @@ function buildSnapShotTimelineEntry(previewUrl?: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it.each([
+    "💬 Message Bridget de psychologie (91388c07-f796-47e4-ae0e-41b62b4b54dd) (id test, reply=no) :",
+    "💬 Message Bridget de psychologie (91388c07-f796-47e4-ae0e-41b62b4b54dd) (via sous-agent codex 0123456789abcdef) (id test, reply=no) :",
+    "🧵 Sollicitation Bridget dans le fil abc (nouveautés jusqu'à 3, id notice) :",
+    "🔔 Notification Bridget (id bridget-observation:test) :",
+    "📥 3 messages Bridget groupés dans ce tour (reply=no) :",
+    "🔔 2 notifications Bridget groupées dans ce tour :",
+  ])("opens compact Bridget content and exact technical text for %s", async (heading) => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const previousNavigator = globalThis.navigator;
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const body = `**Preuve visible après ouverture** <script>not HTML</script>\n\n${"Long message intact. ".repeat(500)}`;
+    const text = `${heading}\n\n${body}`;
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(
+          <MessagesTimeline {...buildProps()} timelineEntries={[buildUserTimelineEntry(text)]} />,
+        );
+      });
+      const toggle = () => renderer!.root.findByProps({ "data-bridget-toggle": "true" });
+      expect(toggle().props["aria-expanded"]).toBe(false);
+      expect(renderer!.root.findAllByType("strong")).toHaveLength(0);
+      await act(() =>
+        renderer!.root
+          .find((node) => node.type === "button" && node.props["aria-label"] === "Copy message")
+          .props.onClick({ nativeEvent: {} }),
+      );
+      expect(writeText).toHaveBeenCalledExactlyOnceWith(text);
+      await act(() => toggle().props.onClick());
+      expect(toggle().props["aria-expanded"]).toBe(true);
+      expect(
+        renderer!.root
+          .findAllByType("strong")[0]!
+          .findAll(() => true)
+          .flatMap((node) => node.children)
+          .filter((child) => typeof child === "string")
+          .join(""),
+      ).toContain("Preuve visible après ouverture");
+      expect(renderer!.root.findAllByType("script")).toHaveLength(0);
+      expect(renderer!.root.findAllByProps({ "data-bridget-raw": "true" })).toHaveLength(0);
+      await act(() =>
+        renderer!.root.findByProps({ "data-bridget-details-toggle": "true" }).props.onClick(),
+      );
+      expect(renderer!.root.findByProps({ "data-bridget-raw": "true" }).children).toEqual([text]);
+      await act(() => toggle().props.onClick());
+      expect(renderer!.root.findAllByType("strong")).toHaveLength(0);
+      await act(() => {
+        renderer!.update(
+          <MessagesTimeline
+            {...buildProps()}
+            timelineEntries={[buildUserTimelineEntry("Ordinary **message**")]}
+          />,
+        );
+      });
+      expect(renderer!.root.findAllByProps({ "data-bridget-toggle": "true" })).toHaveLength(0);
+      expect(
+        renderer!.root
+          .findAllByType("strong")[0]!
+          .findAll(() => true)
+          .flatMap((node) => node.children)
+          .filter((child) => typeof child === "string")
+          .join(""),
+      ).toContain("message");
+    } finally {
+      await act(() => renderer?.unmount());
+      vi.stubGlobal("navigator", previousNavigator);
+    }
+  });
+
+  it("does not carry Bridget disclosure state into another thread or recycled message", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const text = "🔔 Notification Bridget (id bridget-observation:test) :\n\n**Notification body**";
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(
+          <MessagesTimeline {...buildProps()} timelineEntries={[buildUserTimelineEntry(text)]} />,
+        );
+      });
+      const toggle = () => renderer!.root.findByProps({ "data-bridget-toggle": "true" });
+      await act(() => toggle().props.onClick());
+      expect(toggle().props["aria-expanded"]).toBe(true);
+      await act(() => {
+        renderer!.update(
+          <MessagesTimeline
+            {...buildProps()}
+            routeThreadKey="environment-local:thread-2"
+            timelineEntries={[buildUserTimelineEntry(text)]}
+          />,
+        );
+      });
+      expect(toggle().props["aria-expanded"]).toBe(false);
+      await act(() => toggle().props.onClick());
+      const next = buildUserTimelineEntry(text);
+      next.message.id = MessageId.make("message-2");
+      await act(() => {
+        renderer!.update(
+          <MessagesTimeline
+            {...buildProps()}
+            routeThreadKey="environment-local:thread-2"
+            timelineEntries={[next]}
+          />,
+        );
+      });
+      expect(toggle().props["aria-expanded"]).toBe(false);
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
   it("renders previous and next controls with the minimap", () => {
     const first = buildUserTimelineEntry("First turn");
     const secondBase = buildUserTimelineEntry("Second turn");
