@@ -74,6 +74,100 @@ const BRIDGET_ENVELOPE_HEADING =
 const BRIDGET_DIRECT_BATCH_HEADING =
   /^📥 [1-9]\d* messages Bridget groupés dans ce tour \(reply=no\) :(\r?\n)\1/;
 const BRIDGET_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+
+function bridgetRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function bridgetHasError(record: Record<string, unknown>): boolean {
+  return (
+    record.error != null ||
+    [record.isError, record.is_error].some((flag) => flag !== undefined && flag !== false)
+  );
+}
+
+function bridgetSendReceiptValid(value: unknown): boolean {
+  const result = bridgetRecord(value);
+  if (!result || bridgetHasError(result)) return false;
+  // At most two representations: structured status and one text JSON receipt.
+  const statuses: string[] = [];
+  if (result.structuredContent !== undefined) {
+    const structured = bridgetRecord(result.structuredContent);
+    if (!structured || typeof structured.status !== "string" || bridgetHasError(structured))
+      return false;
+    statuses.push(structured.status);
+  }
+  if (result.content !== undefined) {
+    let text: unknown = result.content;
+    if (Array.isArray(text)) {
+      if (text.length !== 1) return false;
+      const block = bridgetRecord(text[0]);
+      if (!block || block.type !== "text") return false;
+      text = block.text;
+    }
+    if (typeof text !== "string") return false;
+    let receipt;
+    try {
+      receipt = bridgetRecord(JSON.parse(text));
+    } catch {
+      return false;
+    }
+    if (!receipt || typeof receipt.status !== "string" || bridgetHasError(receipt)) return false;
+    statuses.push(receipt.status);
+  }
+  return (
+    statuses.length > 0 &&
+    statuses.every((status) => status === "accepted" || status === "in_flight") &&
+    statuses.every((status) => status === statuses[0])
+  );
+}
+
+/** Presentation only, never proof of delivery. Time and space O(s+r):
+ * s is recipient length, r is receipt JSON length; the status list has at most two items. */
+export function projectBridgetSend(
+  entry: Pick<WorkLogEntry, "itemType" | "toolData" | "tone" | "toolLifecycleStatus">,
+): { recipient: string; recipientLabel: string } | null {
+  if (
+    entry.itemType !== "mcp_tool_call" ||
+    entry.tone === "error" ||
+    (entry.toolLifecycleStatus !== undefined &&
+      entry.toolLifecycleStatus !== "inProgress" &&
+      entry.toolLifecycleStatus !== "completed")
+  )
+    return null;
+  const data = bridgetRecord(entry.toolData);
+  if (!data || bridgetHasError(data)) return null;
+  if (data.status !== undefined && data.status !== "inProgress" && data.status !== "completed")
+    return null;
+  const codex =
+    data.type === "mcpToolCall" && data.server === "bridget" && data.tool === "bridget_send";
+  const claude = data.toolName === "mcp__bridget__bridget_send";
+  if (codex === claude) return null;
+  if (codex && data.toolName !== undefined) return null;
+  if (claude && (data.type !== undefined || data.server !== undefined || data.tool !== undefined))
+    return null;
+  const parameters = bridgetRecord(codex ? data.arguments : data.input);
+  if (
+    !parameters ||
+    typeof parameters.body !== "string" ||
+    typeof parameters.to !== "string" ||
+    !parameters.to.trim() ||
+    /[\r\n]/.test(parameters.to)
+  )
+    return null;
+  if (data.result === undefined || data.result === null) {
+    if (entry.toolLifecycleStatus !== "inProgress") return null;
+  } else if (!bridgetSendReceiptValid(data.result)) return null;
+  const recipient = parameters.to;
+  return {
+    recipient,
+    recipientLabel: new RegExp(`^${BRIDGET_UUID}$`, "i").test(recipient)
+      ? `${recipient.slice(0, 8)}…`
+      : recipient,
+  };
+}
 const BRIDGET_NO_REPLY_NOTICE =
   "Pas d'accusé de réception : n'envoie aucun « bien reçu », même pour annoncer ton silence. Ce n'est pas une absence de tâche : si ce message demande une action, fais-la. Ta réponse finale ne sera pas relayée ; pour transmettre un résultat à l'expéditeur, fais un nouvel envoi Bridget.";
 const BRIDGET_OBSERVATION_NOTICE =
@@ -87,6 +181,7 @@ const BRIDGET_OBSERVATIONS_NOTICE =
 
 export interface BridgetEnvelopePresentation {
   label: string;
+  senderIdentity?: string;
   kind: string;
   readableText: string;
   isDirectBatch?: true;
@@ -179,6 +274,7 @@ export function projectBridgetEnvelope(text: string): BridgetEnvelopePresentatio
       : null;
     return {
       label,
+      ...(identity ? { senderIdentity: identity } : {}),
       kind: noReply ? "Message" : "Réponse attendue",
       readableText:
         noReply || replyNotice
@@ -241,6 +337,93 @@ export function projectBridgetEnvelope(text: string): BridgetEnvelopePresentatio
     kind: "Notification",
     readableText: removeBridgetTransportSuffix(body, `\n\n${BRIDGET_OBSERVATION_NOTICE}`),
   };
+}
+
+const BRIDGET_REPLY_HEADING = new RegExp(
+  `^↪ Réponse à (${BRIDGET_UUID.replaceAll("a-f", "a-fA-F")}) \\(relayée par Bridget\\) :(\\r?\\n)\\2`,
+);
+const BRIDGET_USER_NOTE = /^(?:Résumé pour toi|Pour toi) :|^\*\*(?:Résumé pour toi|Pour toi) :\*\*/;
+
+/** Strict presentation hint, not proof of origin or delivery. O(n) time and space. */
+export function projectBridgetReply(text: string): {
+  recipient: string;
+  agentText: string;
+  userText: string | null;
+} | null {
+  const heading = BRIDGET_REPLY_HEADING.exec(text.slice(0, 1024));
+  if (!heading) return null;
+  const lines = text.split("\n");
+  let offset = 0;
+  const offsets: number[] = [];
+  let fence: string | null = null;
+  let boundary: number | null = null;
+  let crossBoundaryMarkdown = false;
+  for (const [index, raw] of lines.entries()) {
+    offsets.push(offset);
+    offset += raw.length + 1;
+    const line = raw.replace(/\r$/, "");
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (marker) {
+      if (!fence && marker[1]![0] === "`" && marker[2]!.includes("`")) return null;
+      if (!fence) fence = marker[1]!;
+      else if (
+        marker[1]![0] === fence[0] &&
+        marker[1]!.length >= fence.length &&
+        !marker[2]!.trim()
+      )
+        fence = null;
+      continue;
+    }
+    // References cross blocks and escape labels. Keep bracket-bearing mixed
+    // replies native instead of implementing a second Markdown parser.
+    if (!fence && (line.includes("[") || /<!--|<\/?[A-Za-z][\w-]*(?=[\s/>])/.test(line)))
+      crossBoundaryMarkdown = true;
+    if (!fence && /(?:Résumé\s+pour\s+toi|Pour\s+toi)/i.test(line) && !BRIDGET_USER_NOTE.test(line))
+      return null;
+    if (fence || !BRIDGET_USER_NOTE.test(line)) continue;
+    if (
+      boundary !== null ||
+      index < 3 ||
+      lines[index - 1]!.replace(/\r$/, "") !== "" ||
+      lines[index - 2]!.replace(/\r$/, "") !== "---" ||
+      lines[index - 3]!.replace(/\r$/, "") !== ""
+    )
+      return null;
+    boundary = index;
+  }
+  if (fence || (boundary !== null && crossBoundaryMarkdown)) return null;
+  return {
+    recipient: heading[1]!,
+    agentText:
+      boundary === null ? text : text.slice(0, offsets[boundary - 2]).replace(/\r?\n\r?\n$/, ""),
+    userText: boundary === null ? null : text.slice(offsets[boundary]),
+  };
+}
+
+/** Snapshot labels for each reply from earlier direct envelopes only. O(n) traversal. */
+export function bridgetReplyLabels(
+  entries: ReadonlyArray<TimelineEntry>,
+): ReadonlyMap<string, string> {
+  const senders = new Map<string, string>();
+  const labels = new Map<string, string>();
+  for (const entry of entries) {
+    if (entry.kind !== "message") continue;
+    if (entry.message.role === "user") {
+      if (!entry.message.text.startsWith("💬 Message Bridget de ")) continue;
+      const envelope = projectBridgetEnvelope(entry.message.text);
+      if (
+        envelope?.senderIdentity &&
+        envelope.label !== "Bridget" &&
+        envelope.label.toLowerCase() !== envelope.senderIdentity.toLowerCase()
+      )
+        senders.set(envelope.senderIdentity.toLowerCase(), envelope.label);
+    } else if (entry.message.role === "assistant") {
+      const heading = BRIDGET_REPLY_HEADING.exec(entry.message.text.slice(0, 1024));
+      const label = heading ? senders.get(heading[1]!.toLowerCase()) : undefined;
+      if (label) labels.set(entry.message.id, label);
+    }
+  }
+  return labels;
 }
 
 export function liveWorkEntryLabel(

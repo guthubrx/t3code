@@ -186,6 +186,9 @@ import {
   hasBridgetEnvelopeHeading,
   hasBridgetDirectBatchHeading,
   projectBridgetEnvelope,
+  projectBridgetSend,
+  projectBridgetReply,
+  bridgetReplyLabels,
   type BridgetEnvelopePresentation,
   workEntryIsActiveTurnActivity,
   resolveAssistantMessageCopyState,
@@ -275,6 +278,8 @@ import { ComputerUseAppIcon } from "~/components/Icons";
 
 interface TimelineRowSharedState {
   citationRequest: AssistantCitationTarget | null;
+  citationMessageId: string | undefined;
+  bridgetReplyLabels: ReadonlyMap<string, string>;
   listRef: React.RefObject<LegendListRef | null>;
   timestampFormat: TimestampFormat;
   routeThreadKey: string;
@@ -1145,9 +1150,12 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     };
   }, [timelineViewportElement, rows.length, reportContentOverflow, chatWidth]);
 
+  const relayLabels = useMemo(() => bridgetReplyLabels(timelineEntries), [timelineEntries]);
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
       citationRequest: readyCitationRequest,
+      citationMessageId: citationRequest?.citation.messageId,
+      bridgetReplyLabels: relayLabels,
       listRef,
       timestampFormat,
       routeThreadKey,
@@ -1185,6 +1193,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     }),
     [
       readyCitationRequest,
+      citationRequest?.citation.messageId,
+      relayLabels,
       listRef,
       timestampFormat,
       routeThreadKey,
@@ -2123,13 +2133,8 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
       <div
         className={
           bridgetEnvelope
-            ? "relative min-w-0 max-w-[92%] rounded-2xl border border-border/70 text-message-foreground sm:max-w-[80%]"
+            ? "relative min-w-0 max-w-[92%] text-message-foreground sm:max-w-[80%]"
             : "relative max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground"
-        }
-        style={
-          bridgetEnvelope
-            ? { backgroundColor: "color-mix(in oklab, var(--color-info) 8%, var(--color-message))" }
-            : undefined
         }
       >
         {!bridgetEnvelope && <MessageAuthorHeading>You</MessageAuthorHeading>}
@@ -2412,26 +2417,11 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
     <>
       <div className="relative min-w-0 px-1 py-0.5">
         <MessageAuthorHeading>T3 Code</MessageAuthorHeading>
-        <AssistantCitationSource
-          messageId={row.message.id}
-          {...(ctx.threadRef ? { threadRef: ctx.threadRef } : {})}
-          itemKey={row.id}
-          request={ctx.citationRequest}
-          listRef={ctx.listRef}
-        >
-          <ChatMarkdown
-            text={messageText}
-            cwd={ctx.markdownCwd}
-            threadRef={ctx.threadRef ?? undefined}
-            isStreaming={Boolean(row.message.streaming)}
-            lineBreaks={shouldPreserveAssistantLineBreaks(messageText)}
-            skills={ctx.skills}
-            headingLevelOffset={MESSAGE_HEADING_LEVEL}
-            onUseArtifactTemplate={ctx.onUseArtifactTemplate}
-            onRunShellCommand={ctx.onRunShellCommand}
-            onImageExpand={ctx.onImageExpand}
-          />
-        </AssistantCitationSource>
+        <AssistantTimelineBody
+          key={`${ctx.routeThreadKey}:${row.message.id}`}
+          row={row}
+          text={messageText}
+        />
         <AssistantChangedFilesSection
           turnSummary={row.assistantTurnDiffSummary}
           routeThreadKey={ctx.routeThreadKey}
@@ -2447,6 +2437,106 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
           />
         ) : null}
       </div>
+    </>
+  );
+}
+
+function AssistantTimelineBody({
+  row,
+  text,
+}: {
+  row: Extract<TimelineRow, { kind: "message" }>;
+  text: string;
+}) {
+  const ctx = use(TimelineRowCtx);
+  const contentId = useId();
+  const [disclosure, setDisclosure] = useState({ text, expanded: false });
+  const expanded = disclosure.text === text && disclosure.expanded;
+  if (!row.message.streaming && disclosure.text !== text) setDisclosure({ text, expanded: false });
+  const reply = useMemo(
+    () =>
+      row.message.streaming || ctx.citationMessageId === row.message.id
+        ? null
+        : projectBridgetReply(text),
+    [row.message.streaming, row.message.id, ctx.citationMessageId, text],
+  );
+  const label = reply ? ctx.bridgetReplyLabels.get(row.message.id) : undefined;
+  const recipient = label ?? `${reply?.recipient.slice(0, 8)}…`;
+  const markdown = {
+    cwd: ctx.markdownCwd,
+    threadRef: ctx.threadRef ?? undefined,
+    isStreaming: Boolean(row.message.streaming),
+    skills: ctx.skills,
+    headingLevelOffset: MESSAGE_HEADING_LEVEL,
+    onUseArtifactTemplate: ctx.onUseArtifactTemplate,
+    onRunShellCommand: ctx.onRunShellCommand,
+    onImageExpand: ctx.onImageExpand,
+  };
+  return (
+    <>
+      {reply && (
+        <button
+          type="button"
+          data-bridget-reply-toggle="true"
+          data-scroll-anchor-ignore
+          aria-expanded={expanded}
+          aria-controls={contentId}
+          aria-label={`Bridget · Pour ${label ? `${label} (${reply.recipient})` : reply.recipient} · Entre agents`}
+          className="flex min-h-8 max-w-full min-w-0 cursor-pointer items-center gap-2 rounded-md px-0.5 py-1 text-left text-sm text-secondary-label focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:ring-inset"
+          onClick={() => {
+            // A reply is not tool output: preserve toggle focus, not composer restoration.
+            ctx.onToggleWorkEntry(row.id, false);
+            setDisclosure({ text, expanded: !expanded });
+          }}
+        >
+          <img src={bridgetLogoUrl} alt="" className="size-5 shrink-0" />
+          <span className="min-w-0 truncate">→ {recipient}</span>
+          <span className="shrink-0 text-2xs">Entre agents</span>
+          <ChevronRightIcon
+            aria-hidden
+            className={cn("size-3.5 shrink-0", expanded && "rotate-90")}
+          />
+        </button>
+      )}
+      <AssistantCitationSource
+        messageId={row.message.id}
+        {...(ctx.threadRef ? { threadRef: ctx.threadRef } : {})}
+        itemKey={row.id}
+        request={ctx.citationRequest}
+        listRef={ctx.listRef}
+      >
+        {reply ? (
+          <>
+            {/* CSS-only hiding keeps the citation text stream stable for a visible user note. */}
+            <div
+              id={contentId}
+              hidden={reply.userText === null ? !expanded : undefined}
+              className={reply.userText !== null && !expanded ? "hidden" : undefined}
+            >
+              {(expanded || reply.userText !== null) && (
+                <ChatMarkdown
+                  {...markdown}
+                  text={reply.agentText}
+                  lineBreaks={shouldPreserveAssistantLineBreaks(reply.agentText)}
+                />
+              )}
+            </div>
+            {reply.userText !== null && (
+              <ChatMarkdown
+                {...markdown}
+                text={reply.userText}
+                lineBreaks={shouldPreserveAssistantLineBreaks(reply.userText)}
+              />
+            )}
+          </>
+        ) : (
+          <ChatMarkdown
+            {...markdown}
+            text={text}
+            lineBreaks={shouldPreserveAssistantLineBreaks(text)}
+          />
+        )}
+      </AssistantCitationSource>
     </>
   );
 }
@@ -4074,16 +4164,14 @@ function BridgetMessageBody(props: {
         aria-expanded={expanded}
         aria-controls={contentId}
         aria-label={`Bridget · ${props.envelope.isDirectBatch ? "Messages groupés" : props.envelope.label} · ${props.envelope.kind}`}
-        className="flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-2xl px-3 py-2.5 text-left text-secondary-label focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:ring-inset"
+        className="flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-md px-0.5 py-1 text-left text-secondary-label focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:ring-inset"
         onClick={() => toggle(false)}
       >
         <img src={bridgetLogoUrl} alt="" className="size-6 shrink-0" />
         <span className="min-w-0 flex-1 truncate text-sm">
           {props.envelope.isDirectBatch ? "Messages groupés" : props.envelope.label}
         </span>
-        <span className="max-w-[50%] shrink-0 truncate rounded-md bg-info/10 px-1.5 py-0.5 text-2xs">
-          {props.envelope.kind}
-        </span>
+        <span className="max-w-[50%] shrink-0 truncate text-2xs">{props.envelope.kind}</span>
         <ChevronRightIcon
           aria-hidden
           className={cn("size-3.5 shrink-0", expanded && "rotate-90")}
@@ -4091,9 +4179,9 @@ function BridgetMessageBody(props: {
       </button>
       <div id={contentId} hidden={!expanded}>
         {expanded && (
-          <div className="space-y-3 border-t border-border/50 px-3 pt-3 pb-2.5">
+          <div className="space-y-2 px-0.5 pt-1 pb-1">
             {props.envelope.messages ? (
-              <div className="divide-y divide-border/50">
+              <div className="space-y-1">
                 {props.envelope.messages.map((message, index) => {
                   const memberId = `${contentId}-member-${index}`;
                   const memberExpanded = openMembers.has(index);
@@ -4106,7 +4194,7 @@ function BridgetMessageBody(props: {
                         aria-label={`Message ${index + 1} de ${message.label}`}
                         aria-expanded={memberExpanded}
                         aria-controls={memberId}
-                        className="flex w-full min-w-0 cursor-pointer items-start gap-2 rounded-md py-2 text-left focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:ring-inset"
+                        className="flex w-full min-w-0 cursor-pointer items-start gap-2 rounded-md py-1 text-left focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:ring-inset"
                         onClick={() => toggleMember(index)}
                       >
                         <span className="min-w-0 flex-1">
@@ -4130,7 +4218,7 @@ function BridgetMessageBody(props: {
                       </button>
                       <div id={memberId} hidden={!memberExpanded}>
                         {memberExpanded && (
-                          <div className="pt-1 pb-3">
+                          <div className="pt-1 pb-1">
                             <UserMessageBody
                               text={message.text}
                               renderContextReference={props.renderContextReference}
@@ -4173,7 +4261,7 @@ function BridgetMessageBody(props: {
                   {detailsExpanded && (
                     <pre
                       data-bridget-raw="true"
-                      className="max-h-96 overflow-auto whitespace-pre-wrap wrap-anywhere rounded-md bg-background/50 p-2 text-xs text-secondary-label"
+                      className="max-h-96 overflow-auto whitespace-pre-wrap wrap-anywhere p-0.5 text-xs text-secondary-label"
                     >
                       {props.text}
                     </pre>
@@ -4939,6 +5027,8 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
   const iconConfig = workToneIcon(workEntry.tone);
   const showWarningIndicator = workEntry.sourceActivityKind === "runtime.warning";
   const showFailedIndicator = workEntryDisplayIndicatesToolFailure(workEntry);
+  const bridgetSend =
+    showWarningIndicator || showFailedIndicator ? null : projectBridgetSend(workEntry);
   const showDestructiveRowStyle =
     showFailedIndicator &&
     (workEntrySignalsSevereFailure(workEntry) || !workLogEntryIsToolLike(workEntry));
@@ -4954,8 +5044,9 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
   const questionHeading = workEntry.questionAnswer
     ? getQuestionTextPreview(workEntry.questionAnswer)
     : "";
-  const previewText =
-    displayLabel ?? (questionHeading || workEntryDisplayLabel(workEntry, workspaceRoot));
+  const previewText = bridgetSend
+    ? `Envoi · ${bridgetSend.recipientLabel}`
+    : (displayLabel ?? (questionHeading || workEntryDisplayLabel(workEntry, workspaceRoot)));
   const answerPreview =
     workEntry.questionAnswer && hasQuestionAnswer(workEntry.questionAnswer)
       ? getQuestionAnswerPreview(workEntry.questionAnswer)
@@ -5007,7 +5098,9 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
       : workLogEntryIsToolLike(workEntry)
         ? "text-secondary-label"
         : "text-foreground/80";
-  const accessiblePreview = [previewText, answerPreview].filter(Boolean).join(": ");
+  const accessiblePreview = bridgetSend
+    ? `Bridget · Envoi · ${bridgetSend.recipient}`
+    : [previewText, answerPreview].filter(Boolean).join(": ");
   const accessibleDisplayText = showFailedIndicator
     ? `${accessiblePreview}, tool call failed`
     : accessiblePreview;
@@ -5029,6 +5122,7 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
 
   return (
     <div
+      data-bridget-send={bridgetSend ? "true" : undefined}
       className={cn(
         "group/timeline-row relative flex flex-col rounded-md px-0.5 transition-colors",
         isExpandedToolGroupEntry ? "py-0" : "py-0.5",
@@ -5044,12 +5138,16 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
           role={showFailedIndicator ? "img" : undefined}
           aria-label={showFailedIndicator ? "Tool call failed" : undefined}
         >
-          <ToolActivityIconView
-            icon={entryToolIcon}
-            fallbackName={entryIconName}
-            className="block size-4 shrink-0 stroke-2"
-            muted
-          />
+          {bridgetSend ? (
+            <img src={bridgetLogoUrl} alt="" className="size-6 shrink-0" />
+          ) : (
+            <ToolActivityIconView
+              icon={entryToolIcon}
+              fallbackName={entryIconName}
+              className="block size-4 shrink-0 stroke-2"
+              muted
+            />
+          )}
         </span>
         <div className="flex min-w-0 flex-1 items-center gap-1.5">
           <div className="min-w-0 flex-1 overflow-hidden">
