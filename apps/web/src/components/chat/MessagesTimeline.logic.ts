@@ -71,7 +71,7 @@ export function workEntryDisplayLabel(entry: WorkLogEntry, workspaceRoot: string
 
 // Presentation only, never proof of origin. O(1): inspect at most 1024 characters.
 export function hasBridgetEnvelopeHeading(text: string): boolean {
-  return /^(?:💬 Message Bridget de [^\r\n]+ \(id [^()\r\n]+\) :|🔔 Notification Bridget \(id [^()\r\n]+\) :|📥 [1-9]\d* messages Bridget groupés dans ce tour \(reply=no\) :)\r?\n\r?\n/.test(
+  return /^(?:💬 Message Bridget de [^\r\n]+ \(id [^()\r\n]+\) :|🔔 Notification Bridget \(id [^()\r\n]+\) :|📥 [1-9]\d* messages Bridget groupés dans ce tour \(reply=no\) :|🧵 Sollicitation Bridget dans le fil [^()\r\n]+ \(nouveautés jusqu'à [1-9]\d*, id [^()\r\n]+\) :|🔔 [1-9]\d* notifications Bridget groupées dans ce tour :)\r?\n\r?\n/.test(
     text.slice(0, 1024),
   );
 }

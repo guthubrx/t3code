@@ -45,12 +45,14 @@ import {
 } from "../../session-logic";
 import { isImageAttachment, type ChatMessage, type TurnDiffSummary } from "../../types";
 
-describe("SPEC137 Bridget envelope heading", () => {
+describe("SPEC137/SPEC139 Bridget envelope heading", () => {
   it.each([
     "💬 Message Bridget de wild2-marketing (d842f5d4-5456-49c5-a82b-68caacf94a1d) (id mcp-48328-6ac45cb8-5, reply=no) :",
     "💬 Message Bridget de 29aaed9b-9f6f-4849-87a5-1a23bbe01948 (id t3-test) :",
     "🔔 Notification Bridget (id bridget-observation:test) :",
     "📥 3 messages Bridget groupés dans ce tour (reply=no) :",
+    "🧵 Sollicitation Bridget dans le fil c0d7a706-4d53-4917-8592-5081411d83a5 (nouveautés jusqu'à 3, id thread-notice:c0d7a706:agent:2) :",
+    "🔔 3 notifications Bridget groupées dans ce tour :",
   ])("recognizes a separated first heading: %s", (heading) => {
     expect(hasBridgetEnvelopeHeading(`${heading}\n\nCorps intact.`)).toBe(true);
   });
@@ -63,6 +65,13 @@ describe("SPEC137 Bridget envelope heading", () => {
     "```\n💬 Message Bridget de agent (id test) :\n\nCode.\n```",
     "Introduction\n\n💬 Message Bridget de agent (id test) :\n\nCorps.",
     `💬 Message Bridget de ${"x".repeat(1100)} (id test) :\n\nCorps.`,
+    "🧵 Sollicitation Bridget dans le fil exemple :\n\nCorps.",
+    "🧵 Sollicitation Bridget dans le fil exemple (nouveautés jusqu'à 3, id notice) :\nCorps.",
+    "> 🧵 Sollicitation Bridget dans le fil exemple (nouveautés jusqu'à 3, id notice) :\n\nCitation.",
+    "🔔 notifications Bridget groupées dans ce tour :\n\nCorps.",
+    "🔔 0 notifications Bridget groupées dans ce tour :\n\nCorps.",
+    "Introduction\n\n🔔 3 notifications Bridget groupées dans ce tour :\n\nCorps.",
+    `🧵 Sollicitation Bridget dans le fil ${"x".repeat(1100)} (nouveautés jusqu'à 3, id notice) :\n\nCorps.`,
   ])("does not dim ordinary or ambiguous text: %s", (text) => {
     expect(hasBridgetEnvelopeHeading(text)).toBe(false);
   });
@@ -70,6 +79,13 @@ describe("SPEC137 Bridget envelope heading", () => {
   it("recognizes CRLF-separated headings", () => {
     const text = "💬 Message Bridget de agent (id test) :\r\n\r\nCorps **intact**.";
     expect(hasBridgetEnvelopeHeading(text)).toBe(true);
+  });
+
+  it.each([
+    "🧵 Sollicitation Bridget dans le fil exemple (nouveautés jusqu'à 465, id thread-notice:exemple:agent:126) :",
+    "🔔 2 notifications Bridget groupées dans ce tour :",
+  ])("recognizes new formats with CRLF: %s", (heading) => {
+    expect(hasBridgetEnvelopeHeading(`${heading}\r\n\r\nCorps intact.`)).toBe(true);
   });
 });
 
