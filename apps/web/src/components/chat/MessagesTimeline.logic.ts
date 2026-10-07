@@ -69,11 +69,115 @@ export function workEntryDisplayLabel(entry: WorkLogEntry, workspaceRoot: string
   return `${heading.charAt(0).toUpperCase()}${heading.slice(1)}`;
 }
 
+const BRIDGET_ENVELOPE_HEADING =
+  /^(?:💬 Message Bridget de [^\r\n]+ \(id [^()\r\n]+\) :|🔔 Notification Bridget \(id [^()\r\n]+\) :|📥 [1-9]\d* messages Bridget groupés dans ce tour \(reply=no\) :|🧵 Sollicitation Bridget dans le fil [^()\r\n]+ \(nouveautés jusqu'à [1-9]\d*, id [^()\r\n]+\) :|🔔 [1-9]\d* notifications Bridget groupées dans ce tour :)\r?\n\r?\n/;
+const BRIDGET_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const BRIDGET_NO_REPLY_NOTICE =
+  "Pas d'accusé de réception : n'envoie aucun « bien reçu », même pour annoncer ton silence. Ce n'est pas une absence de tâche : si ce message demande une action, fais-la. Ta réponse finale ne sera pas relayée ; pour transmettre un résultat à l'expéditeur, fais un nouvel envoi Bridget.";
+const BRIDGET_OBSERVATION_NOTICE =
+  "Pas d'accusé de réception à envoyer. Agis seulement si ce fait change ce que tu dois faire ; informe l'utilisateur si utile.";
+const BRIDGET_THREAD_NOTICE =
+  "Consulte ce fil avec l'outil bridget_thread (read, puis ack) ; publie dans le fil si utile (post). Ne fais pas de réponse directe à cette alerte : le pont ne relaie pas ta réponse finale.";
+const BRIDGET_BATCH_NOTICE =
+  "Pas d'accusé de réception pour ces messages : n'envoie aucun « bien reçu ». Ce n'est pas une absence de tâche : si un message demande une action, fais-la. Le pont ne relaie pas ta réponse finale pour ce tour ; pour transmettre un résultat à un expéditeur, fais un nouvel envoi Bridget.";
+const BRIDGET_OBSERVATIONS_NOTICE =
+  "Pas d'accusé de réception à envoyer. Agis seulement si ces faits changent ce que tu dois faire ; informe l'utilisateur si utile.";
+
+export interface BridgetEnvelopePresentation {
+  label: string;
+  kind: string;
+  readableText: string;
+}
+
 // Presentation only, never proof of origin. O(1): inspect at most 1024 characters.
 export function hasBridgetEnvelopeHeading(text: string): boolean {
-  return /^(?:💬 Message Bridget de [^\r\n]+ \(id [^()\r\n]+\) :|🔔 Notification Bridget \(id [^()\r\n]+\) :|📥 [1-9]\d* messages Bridget groupés dans ce tour \(reply=no\) :|🧵 Sollicitation Bridget dans le fil [^()\r\n]+ \(nouveautés jusqu'à [1-9]\d*, id [^()\r\n]+\) :|🔔 [1-9]\d* notifications Bridget groupées dans ce tour :)\r?\n\r?\n/.test(
-    text.slice(0, 1024),
+  return BRIDGET_ENVELOPE_HEADING.test(text.slice(0, 1024));
+}
+
+function removeBridgetTransportSuffix(body: string, suffix: string): string {
+  // Unknown, modified or non-final instructions stay visible. The raw text is never changed.
+  for (const candidate of [suffix.replaceAll("\n", "\r\n"), suffix]) {
+    if (body.endsWith(candidate)) return body.slice(0, -candidate.length);
+  }
+  return body;
+}
+
+export function projectBridgetEnvelope(text: string): BridgetEnvelopePresentation | null {
+  const match = BRIDGET_ENVELOPE_HEADING.exec(text.slice(0, 1024));
+  if (!match) return null;
+  const heading = match[0];
+  const body = text.slice(heading.length);
+  const direct = /^💬 Message Bridget de (.+) \(id ([^()\r\n]+)\) :/.exec(heading);
+  if (direct) {
+    // The daemon emits only these providers and a validated 16-hex opaque child reference.
+    const sender = direct[1]!.replace(
+      / \(via sous-agent (?:codex|claude|cursor) [0-9a-fA-F]{16}\)$/,
+      "",
+    );
+    const identity = new RegExp(`(?:^|\\()(${BRIDGET_UUID})\\)?$`, "i").exec(sender)?.[1];
+    const label = new RegExp(`^${BRIDGET_UUID}$`, "i").test(sender)
+      ? "Bridget"
+      : sender.replace(new RegExp(` \\(${BRIDGET_UUID}\\)$`, "i"), "");
+    const noReply = direct[2]!.endsWith(", reply=no");
+    const replyNotice = identity
+      ? `— Réponds dans ce tour : Bridget transmettra ta réponse finale à ${identity}. Elle reste aussi affichée à l'utilisateur dans ce fil : commence-la par « ↪ Réponse à ${identity} (relayée par Bridget) : » pour qu'il sache qu'elle ne lui est pas adressée.`
+      : null;
+    return {
+      label,
+      kind: noReply ? "Message" : "Réponse attendue",
+      readableText:
+        noReply || replyNotice
+          ? removeBridgetTransportSuffix(
+              body,
+              `\n\n${noReply ? BRIDGET_NO_REPLY_NOTICE : replyNotice}`,
+            )
+          : body,
+    };
+  }
+  if (heading.startsWith("🧵")) {
+    const metadata = /^Titre du fil Bridget : ([^\r\n]+)\r?\n\r?\n/.exec(body.slice(0, 1024));
+    let label = "Fil partagé";
+    let readableText = body;
+    if (metadata) {
+      try {
+        const title: unknown = JSON.parse(metadata[1]!);
+        if (
+          typeof title === "string" &&
+          title.trim().length > 0 &&
+          [...title].length <= 200 &&
+          !/[\p{Cc}\p{Cf}\u2028\u2029]/u.test(title)
+        ) {
+          label = title;
+          readableText = body.slice(metadata[0].length);
+        }
+      } catch {
+        // A malformed or future metadata format remains part of the readable body.
+      }
+    }
+    return {
+      label,
+      kind: "Nouveautés",
+      readableText: removeBridgetTransportSuffix(readableText, `\n\n${BRIDGET_THREAD_NOTICE}`),
+    };
+  }
+  const batch = /^(?:📥|🔔) ([1-9]\d*) (messages|notifications) Bridget group(?:és|ées) /.exec(
+    heading,
   );
+  if (batch) {
+    return {
+      label: "Bridget",
+      kind: `${batch[1]} ${batch[2]}`,
+      readableText: removeBridgetTransportSuffix(
+        body,
+        `\n${batch[2] === "messages" ? BRIDGET_BATCH_NOTICE : BRIDGET_OBSERVATIONS_NOTICE}`,
+      ),
+    };
+  }
+  return {
+    label: "Bridget",
+    kind: "Notification",
+    readableText: removeBridgetTransportSuffix(body, `\n\n${BRIDGET_OBSERVATION_NOTICE}`),
+  };
 }
 
 export function liveWorkEntryLabel(

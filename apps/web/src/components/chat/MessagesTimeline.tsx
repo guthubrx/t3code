@@ -64,6 +64,7 @@ import {
   use,
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -165,6 +166,7 @@ import {
   timelineContentOverflowsViewport,
 } from "./timelineScrollAnchoring";
 import { MessageCopyButton } from "./MessageCopyButton";
+import bridgetLogoUrl from "../../assets/bridget-logo.svg";
 import { PierreEntryIcon } from "./PierreEntryIcon";
 import { inferEntryKindFromPath } from "../../pierre-icons";
 import { AssistantSelectionToolbar } from "./AssistantSelectionToolbar";
@@ -182,6 +184,8 @@ import {
   type MessagesTimelineRowsProjection,
   liveWorkEntryLabel,
   hasBridgetEnvelopeHeading,
+  projectBridgetEnvelope,
+  type BridgetEnvelopePresentation,
   workEntryIsActiveTurnActivity,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
@@ -1987,6 +1991,10 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
     (attachment) => !isImageAttachment(attachment) && !isFileAttachment(attachment),
   );
   const resolvedContext = useMemo(() => resolveUserMessageContext(row.message), [row.message]);
+  const bridgetEnvelope = useMemo(
+    () => projectBridgetEnvelope(resolvedContext.text),
+    [resolvedContext.text],
+  );
   const previewImages = useMemo(
     () => userImages.filter((image) => image.name.startsWith("preview-annotation-")),
     [userImages],
@@ -2111,8 +2119,19 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
 
   return (
     <div className="group flex flex-col items-end gap-1">
-      <div className="relative max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground">
-        <MessageAuthorHeading>You</MessageAuthorHeading>
+      <div
+        className={
+          bridgetEnvelope
+            ? "relative min-w-0 max-w-[92%] rounded-2xl border border-border/70 text-message-foreground sm:max-w-[80%]"
+            : "relative max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground"
+        }
+        style={
+          bridgetEnvelope
+            ? { backgroundColor: "color-mix(in oklab, var(--color-info) 8%, var(--color-message))" }
+            : undefined
+        }
+      >
+        {!bridgetEnvelope && <MessageAuthorHeading>You</MessageAuthorHeading>}
         {(regularImages.length > 0 || userVideos.length > 0) && (
           <div className="mb-2 grid max-w-[210px] grid-cols-2 gap-2">
             {regularImages.map((image) => (
@@ -2217,7 +2236,10 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
         ) : null}
         <div onCopyCapture={onBodyCopyCapture}>
           <CollapsibleUserMessageBody
+            key={`${ctx.routeThreadKey}:${row.message.id}`}
             text={resolvedContext.text}
+            bridgetEnvelope={bridgetEnvelope}
+            anchorKey={row.id}
             renderContextReference={renderContextReference}
             skills={ctx.skills}
             markdownCwd={ctx.markdownCwd}
@@ -3936,6 +3958,8 @@ function shouldCollapseUserMessage(text: string): boolean {
 
 const CollapsibleUserMessageBody = memo(function CollapsibleUserMessageBody(props: {
   text: string;
+  bridgetEnvelope?: BridgetEnvelopePresentation | null;
+  anchorKey?: string;
   renderContextReference: (reference: ChatMarkdownContextReference) => ReactNode;
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   markdownCwd: string | undefined;
@@ -3945,6 +3969,11 @@ const CollapsibleUserMessageBody = memo(function CollapsibleUserMessageBody(prop
   const hasVisibleBody = props.text.trim().length > 0;
   const canCollapse = hasVisibleBody && shouldCollapseUserMessage(props.text);
   const isCollapsed = canCollapse && !expanded;
+
+  if (props.bridgetEnvelope) {
+    // This presentation branch shares the original row, copy/actions and markdown renderer.
+    return <BridgetMessageBody {...props} envelope={props.bridgetEnvelope} />;
+  }
 
   return (
     <div>
@@ -4001,6 +4030,89 @@ const CollapsibleUserMessageBody = memo(function CollapsibleUserMessageBody(prop
     </div>
   );
 });
+
+function BridgetMessageBody(props: {
+  text: string;
+  envelope: BridgetEnvelopePresentation;
+  anchorKey?: string;
+  renderContextReference: (reference: ChatMarkdownContextReference) => ReactNode;
+  skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
+  markdownCwd: string | undefined;
+}) {
+  const ctx = use(TimelineRowCtx);
+  const contentId = useId();
+  const detailsId = useId();
+  const [expanded, setExpanded] = useState(false);
+  const [detailsExpanded, setDetailsExpanded] = useState(false);
+  const toggle = (details: boolean) => {
+    const next = !(details ? detailsExpanded : expanded);
+    if (props.anchorKey) ctx.onToggleWorkEntry(props.anchorKey, !next);
+    if (details) setDetailsExpanded(next);
+    else setExpanded(next);
+  };
+
+  return (
+    <div data-bridget-card="true">
+      <button
+        type="button"
+        data-bridget-toggle="true"
+        data-scroll-anchor-ignore
+        aria-expanded={expanded}
+        aria-controls={contentId}
+        aria-label={`Bridget · ${props.envelope.label} · ${props.envelope.kind}`}
+        className="flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-2xl px-3 py-2.5 text-left text-secondary-label focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:ring-inset"
+        onClick={() => toggle(false)}
+      >
+        <img src={bridgetLogoUrl} alt="" className="size-6 shrink-0" />
+        <span className="min-w-0 flex-1 truncate text-sm">{props.envelope.label}</span>
+        <span className="max-w-[50%] shrink-0 truncate rounded-md bg-info/10 px-1.5 py-0.5 text-2xs">
+          {props.envelope.kind}
+        </span>
+        <ChevronRightIcon
+          aria-hidden
+          className={cn("size-3.5 shrink-0", expanded && "rotate-90")}
+        />
+      </button>
+      <div id={contentId} hidden={!expanded}>
+        {expanded && (
+          <div className="space-y-3 border-t border-border/50 px-3 pt-3 pb-2.5">
+            <UserMessageBody
+              text={props.envelope.readableText}
+              renderContextReference={props.renderContextReference}
+              skills={props.skills}
+              markdownCwd={props.markdownCwd}
+            />
+            <button
+              type="button"
+              data-bridget-details-toggle="true"
+              data-scroll-anchor-ignore
+              aria-expanded={detailsExpanded}
+              aria-controls={detailsId}
+              className="flex cursor-pointer items-center gap-1 rounded-sm text-xs text-secondary-label hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+              onClick={() => toggle(true)}
+            >
+              <ChevronRightIcon
+                aria-hidden
+                className={cn("size-3", detailsExpanded && "rotate-90")}
+              />
+              Détails techniques
+            </button>
+            <div id={detailsId} hidden={!detailsExpanded}>
+              {detailsExpanded && (
+                <pre
+                  data-bridget-raw="true"
+                  className="max-h-96 overflow-auto whitespace-pre-wrap wrap-anywhere rounded-md bg-background/50 p-2 text-xs text-secondary-label"
+                >
+                  {props.text}
+                </pre>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 const UserMessageBody = memo(function UserMessageBody(props: {
   text: string;

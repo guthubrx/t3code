@@ -26,6 +26,7 @@ import {
   deriveMessagesTimelineRowsWithState,
   liveWorkEntryLabel,
   hasBridgetEnvelopeHeading,
+  projectBridgetEnvelope,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveWorkGroupScrollIndex,
@@ -86,6 +87,206 @@ describe("SPEC137/SPEC139 Bridget envelope heading", () => {
     "🔔 2 notifications Bridget groupées dans ce tour :",
   ])("recognizes new formats with CRLF: %s", (heading) => {
     expect(hasBridgetEnvelopeHeading(`${heading}\r\n\r\nCorps intact.`)).toBe(true);
+  });
+});
+
+describe("SPEC140 compact Bridget projection", () => {
+  it.each([
+    [
+      "💬 Message Bridget de psychologie (91388c07-f796-47e4-ae0e-41b62b4b54dd) (id test, reply=no) :",
+      "psychologie",
+      "Message",
+    ],
+    [
+      "💬 Message Bridget de 91388c07-f796-47e4-ae0e-41b62b4b54dd (id test) :",
+      "Bridget",
+      "Réponse attendue",
+    ],
+    ["🔔 Notification Bridget (id bridget-observation:test) :", "Bridget", "Notification"],
+    ["📥 3 messages Bridget groupés dans ce tour (reply=no) :", "Bridget", "3 messages"],
+    [
+      "🧵 Sollicitation Bridget dans le fil abc (nouveautés jusqu'à 3, id notice) :",
+      "Fil partagé",
+      "Nouveautés",
+    ],
+    ["🔔 2 notifications Bridget groupées dans ce tour :", "Bridget", "2 notifications"],
+  ])("projects factual labels for %s", (heading, label, kind) => {
+    const text = `${heading}\n\nTexte **intact**. action blocker decision history`;
+    expect(projectBridgetEnvelope(text)).toMatchObject({
+      label,
+      kind,
+      readableText: "Texte **intact**. action blocker decision history",
+    });
+    expect(text).toBe(`${heading}\n\nTexte **intact**. action blocker decision history`);
+  });
+
+  it.each([
+    "> 💬 Message Bridget de agent (id test) :\n\nCitation",
+    "Intro\n\n💬 Message Bridget de agent (id test) :\n\nTexte",
+    "💬 Message Bridget de agent (id test) :\nTexte",
+    "```\n💬 Message Bridget de agent (id test) :\n\nCode",
+    `💬 Message Bridget de ${"x".repeat(1100)} (id test) :\n\nTexte`,
+  ])("leaves ordinary, quoted and incomplete messages alone", (text) => {
+    expect(projectBridgetEnvelope(text)).toBeNull();
+  });
+
+  it("accepts CRLF without altering the readable body", () => {
+    expect(
+      projectBridgetEnvelope("💬 Message Bridget de agent (id test, reply=no) :\r\n\r\nA\r\nB")
+        ?.readableText,
+    ).toBe("A\r\nB");
+  });
+
+  it("removes only a closed final transport suffix", () => {
+    const heading = "💬 Message Bridget de agent (id test, reply=no) :\n\n";
+    const footer =
+      "Pas d'accusé de réception : n'envoie aucun « bien reçu », même pour annoncer ton silence. Ce n'est pas une absence de tâche : si ce message demande une action, fais-la. Ta réponse finale ne sera pas relayée ; pour transmettre un résultat à l'expéditeur, fais un nouvel envoi Bridget.";
+    expect(projectBridgetEnvelope(`${heading}Preuve\n\n${footer}`)?.readableText).toBe("Preuve");
+    expect(
+      projectBridgetEnvelope(`${heading}Preuve\n\n${footer}\nTexte après.`)?.readableText,
+    ).toBe(`Preuve\n\n${footer}\nTexte après.`);
+    expect(projectBridgetEnvelope(`${heading}Preuve\n\nSuffixe inconnu.`)?.readableText).toBe(
+      "Preuve\n\nSuffixe inconnu.",
+    );
+  });
+
+  it("keeps human labels with parentheses and hides only a final UUID", () => {
+    expect(
+      projectBridgetEnvelope(
+        "💬 Message Bridget de Agent (1157) (91388c07-f796-47e4-ae0e-41b62b4b54dd) (id test, reply=no) :\n\nTexte",
+      )?.label,
+    ).toBe("Agent (1157)");
+  });
+
+  it.each(
+    ["codex", "claude", "cursor"].flatMap((provider) =>
+      [true, false].flatMap((named) => [true, false].map((reply) => ({ provider, named, reply }))),
+    ),
+  )(
+    "projects the real delegated parent: $provider named=$named reply=$reply",
+    ({ provider, named, reply }) => {
+      const id = "91388c07-f796-47e4-ae0e-41b62b4b54dd";
+      const sender = `${named ? "psychologie (" : ""}${id}${named ? ")" : ""} (via sous-agent ${provider} 0123456789abcdef)`;
+      const footer = reply
+        ? `— Réponds dans ce tour : Bridget transmettra ta réponse finale à ${id}. Elle reste aussi affichée à l'utilisateur dans ce fil : commence-la par « ↪ Réponse à ${id} (relayée par Bridget) : » pour qu'il sache qu'elle ne lui est pas adressée.`
+        : "Pas d'accusé de réception : n'envoie aucun « bien reçu », même pour annoncer ton silence. Ce n'est pas une absence de tâche : si ce message demande une action, fais-la. Ta réponse finale ne sera pas relayée ; pour transmettre un résultat à l'expéditeur, fais un nouvel envoi Bridget.";
+      const text = `💬 Message Bridget de ${sender} (id test${reply ? "" : ", reply=no"}) :\n\nPreuve\n\n${footer}`;
+      expect(projectBridgetEnvelope(text)).toMatchObject({
+        label: named ? "psychologie" : "Bridget",
+        kind: reply ? "Réponse attendue" : "Message",
+        readableText: "Preuve",
+      });
+      expect(text).toContain(sender);
+    },
+  );
+
+  it.each([
+    "(via sous-agent gemini 0123456789abcdef)",
+    "(via sous-agent codex child-42)",
+    "(via sous-agent codex 0123456789abcde)",
+    "(via sous-agent codex 0123456789abcdeg)",
+    "(via sous-agent codex 0123456789abcdef",
+    "(via sous-agent codex 0123456789abcdef) autre texte",
+  ])("keeps an unknown, malformed or non-final delegated suffix: %s", (suffix) => {
+    const sender = `psychologie (91388c07-f796-47e4-ae0e-41b62b4b54dd) ${suffix}`;
+    expect(
+      projectBridgetEnvelope(`💬 Message Bridget de ${sender} (id test, reply=no) :\n\nPreuve`)
+        ?.label,
+    ).toBe(sender);
+  });
+
+  it("does not remove trailing whitespace without a closed reply suffix", () => {
+    const body = "Corps avec blancs finaux\n\n";
+    expect(
+      projectBridgetEnvelope(`💬 Message Bridget de agent sans identité (id test) :\n\n${body}`)
+        ?.readableText,
+    ).toBe(body);
+  });
+
+  it.each([
+    [
+      "🔔 Notification Bridget (id observation:test) :",
+      "\n\nPas d'accusé de réception à envoyer. Agis seulement si ce fait change ce que tu dois faire ; informe l'utilisateur si utile.",
+    ],
+    [
+      "🧵 Sollicitation Bridget dans le fil abc (nouveautés jusqu'à 3, id notice) :",
+      "\n\nConsulte ce fil avec l'outil bridget_thread (read, puis ack) ; publie dans le fil si utile (post). Ne fais pas de réponse directe à cette alerte : le pont ne relaie pas ta réponse finale.",
+    ],
+    [
+      "📥 3 messages Bridget groupés dans ce tour (reply=no) :",
+      "\nPas d'accusé de réception pour ces messages : n'envoie aucun « bien reçu ». Ce n'est pas une absence de tâche : si un message demande une action, fais-la. Le pont ne relaie pas ta réponse finale pour ce tour ; pour transmettre un résultat à un expéditeur, fais un nouvel envoi Bridget.",
+    ],
+    [
+      "🔔 2 notifications Bridget groupées dans ce tour :",
+      "\nPas d'accusé de réception à envoyer. Agis seulement si ces faits changent ce que tu dois faire ; informe l'utilisateur si utile.",
+    ],
+    [
+      "💬 Message Bridget de agent (91388c07-f796-47e4-ae0e-41b62b4b54dd) (id test) :",
+      "\n\n— Réponds dans ce tour : Bridget transmettra ta réponse finale à 91388c07-f796-47e4-ae0e-41b62b4b54dd. Elle reste aussi affichée à l'utilisateur dans ce fil : commence-la par « ↪ Réponse à 91388c07-f796-47e4-ae0e-41b62b4b54dd (relayée par Bridget) : » pour qu'il sache qu'elle ne lui est pas adressée.",
+    ],
+  ])("strips only the complete final adapter footer: %s", (heading, suffix) => {
+    expect(projectBridgetEnvelope(`${heading}\n\nCorps${suffix}`)?.readableText).toBe("Corps");
+    expect(
+      projectBridgetEnvelope(`${heading}\r\n\r\nCorps${suffix.replaceAll("\n", "\r\n")}`)
+        ?.readableText,
+    ).toBe("Corps");
+    const unknown = `Corps${suffix.slice(0, -1)}`;
+    expect(projectBridgetEnvelope(`${heading}\n\n${unknown}`)?.readableText).toBe(unknown);
+  });
+
+  it.each(["Organisation politique", 'Titre "cité" \\ utile', "<img onerror=alert(1)> 🧵"])(
+    "consumes a valid bounded JSON thread title: %s",
+    (title) => {
+      const heading =
+        "🧵 Sollicitation Bridget dans le fil abc (nouveautés jusqu'à 3, id notice) :\n\n";
+      const text = `${heading}Titre du fil Bridget : ${JSON.stringify(title)}\n\nCorps`;
+      expect(projectBridgetEnvelope(text)).toMatchObject({
+        label: title,
+        kind: "Nouveautés",
+        readableText: "Corps",
+      });
+      expect(text.endsWith("\n\nCorps")).toBe(true);
+    },
+  );
+
+  it.each([
+    '""',
+    '"    "',
+    "null",
+    '{"title":"pas une chaîne"}',
+    '"JSON non fermé',
+    JSON.stringify("x".repeat(201)),
+    JSON.stringify("ligne\n suivante"),
+    JSON.stringify("bidi\u202e renversé"),
+  ])("keeps invalid title metadata visible: %s", (value) => {
+    const body = `Titre du fil Bridget : ${value}\n\nCorps`;
+    expect(
+      projectBridgetEnvelope(
+        `🧵 Sollicitation Bridget dans le fil abc (nouveautés jusqu'à 3, id notice) :\n\n${body}`,
+      ),
+    ).toMatchObject({ label: "Fil partagé", readableText: body });
+  });
+
+  it("ignores title metadata outside the leading thread position", () => {
+    const body = 'Introduction\n\nTitre du fil Bridget : "Un faux titre"\n\nCorps';
+    expect(
+      projectBridgetEnvelope(
+        `🧵 Sollicitation Bridget dans le fil abc (nouveautés jusqu'à 3, id notice) :\n\n${body}`,
+      ),
+    ).toMatchObject({ label: "Fil partagé", readableText: body });
+    const direct = 'Titre du fil Bridget : "Un faux titre"\n\nCorps';
+    expect(
+      projectBridgetEnvelope(`💬 Message Bridget de agent (id test, reply=no) :\n\n${direct}`),
+    ).toMatchObject({ label: "agent", readableText: direct });
+  });
+
+  it("uses Unicode character count and CRLF title separators", () => {
+    const title = "🧵".repeat(200);
+    expect(
+      projectBridgetEnvelope(
+        `🧵 Sollicitation Bridget dans le fil abc (nouveautés jusqu'à 3, id notice) :\r\n\r\nTitre du fil Bridget : ${JSON.stringify(title)}\r\n\r\nCorps`,
+      ),
+    ).toMatchObject({ label: title, readableText: "Corps" });
   });
 });
 

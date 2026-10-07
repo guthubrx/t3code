@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1254" height="1254" viewBox="0 0 1254 1254" role="img" aria-labelledby="title desc">
+  <title id="title">Bridget</title>
+  <desc id="desc">Logo reconstruit en quatre formes vectorielles : une tige à sommet circulaire, une arche en courbes de Bézier et deux disques identiques. Fond transparent.</desc>
+  <path id="tige" fill="#005BFC" d="M 326,887 V 274 A 84,84 0 0 1 494,274 V 600 Z"/>
+  <path id="arche" fill="#40A2FC" d="M 326,887
+    C 311,675 464,474 644,474
+    C 814,474 938,609 938,776
+    C 938,814 934,852 929,887
+    L 727,887
+    C 727,852 757,829 779,802
+    C 785,787 788,772 788,758
+    C 788,677 723,612 644,612
+    C 558,612 489,682 489,765
+    C 489,810 510,850 528,887 Z"/>
+  <circle id="disque-gauche" cx="427" cy="887" r="101" fill="#005BFC"/>
+  <circle id="disque-droit" cx="828" cy="887" r="101" fill="#B5D2FC"/>
+</svg>
