@@ -285,12 +285,190 @@ function buildSnapShotTimelineEntry(previewUrl?: string) {
 }
 
 describe("MessagesTimeline", () => {
+  function directBatch(
+    bodies = ["**Premier corps**", "**Deuxième corps**", "**Troisième corps**"],
+  ) {
+    return (
+      `📥 ${bodies.length} messages Bridget groupés dans ce tour (reply=no) :\n` +
+      bodies
+        .map(
+          (body, index) =>
+            `\n── ${index + 1}/${bodies.length} — de ${index === 1 ? "Atelier coordination" : "Atelier interface"} (id same-id) ──\n${body}\n`,
+        )
+        .join("")
+    );
+  }
+  function strongTexts(renderer: ReactTestRenderer) {
+    return renderer.root.findAllByType("strong").map((node) =>
+      node
+        .findAll(() => true)
+        .flatMap((child) => child.children)
+        .filter((child) => typeof child === "string")
+        .join(""),
+    );
+  }
+
+  it("SPEC141 opens named sections independently and preserves choices while the group is closed", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const bodies = [
+      "**Premier corps**",
+      "**Deuxième corps**",
+      "**Troisième corps** " + "L".repeat(200),
+    ];
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(
+          <MessagesTimeline
+            {...buildProps()}
+            timelineEntries={[buildUserTimelineEntry(directBatch(bodies))]}
+          />,
+        );
+      });
+      const outer = () => renderer!.root.findByProps({ "data-bridget-toggle": "true" });
+      const members = () =>
+        renderer!.root.findAll(
+          (node) =>
+            node.type === "button" && node.props["data-bridget-member-toggle"] !== undefined,
+        );
+      expect(outer().props["aria-expanded"]).toBe(false);
+      expect(members()).toHaveLength(0);
+      await act(() => outer().props.onClick());
+      expect(members().map((node) => node.props["aria-expanded"])).toEqual([true, false, false]);
+      expect(members().map((node) => node.props["aria-label"])).toEqual([
+        "Message 1 de Atelier interface",
+        "Message 2 de Atelier coordination",
+        "Message 3 de Atelier interface",
+      ]);
+      expect(members().every((node) => node.props["aria-controls"])).toBe(true);
+      expect(new Set(members().map((node) => node.props["aria-controls"])).size).toBe(3);
+      expect(
+        renderer!.root
+          .findAllByProps({ "data-bridget-member-preview": "true" })
+          .map((node) => node.children.join("")),
+      ).toEqual(bodies.map((body) => body.slice(0, 120)));
+      expect(strongTexts(renderer!)).toEqual(["Premier corps"]);
+      await act(() => members()[1]!.props.onClick());
+      expect(members().map((node) => node.props["aria-expanded"])).toEqual([true, true, false]);
+      expect(strongTexts(renderer!)).toEqual(["Premier corps", "Deuxième corps"]);
+      await act(() => members()[0]!.props.onClick());
+      await act(() => outer().props.onClick());
+      expect(members()).toHaveLength(0);
+      await act(() => outer().props.onClick());
+      expect(members().map((node) => node.props["aria-expanded"])).toEqual([false, true, false]);
+      expect(renderer!.root.findAllByProps({ "data-bridget-details-toggle": "true" })).toHaveLength(
+        0,
+      );
+      expect(renderer!.root.findAllByProps({ "data-bridget-raw": "true" })).toHaveLength(0);
+      await act(() => {
+        renderer!.update(
+          <MessagesTimeline
+            {...buildProps()}
+            routeThreadKey="environment-local:other-thread"
+            timelineEntries={[buildUserTimelineEntry(directBatch(bodies))]}
+          />,
+        );
+      });
+      expect(outer().props["aria-expanded"]).toBe(false);
+      await act(() => outer().props.onClick());
+      expect(members().map((node) => node.props["aria-expanded"])).toEqual([true, false, false]);
+      const next = buildUserTimelineEntry(directBatch(bodies));
+      next.message.id = MessageId.make("other-message");
+      await act(() => {
+        renderer!.update(
+          <MessagesTimeline
+            {...buildProps()}
+            routeThreadKey="environment-local:other-thread"
+            timelineEntries={[next]}
+          />,
+        );
+      });
+      expect(outer().props["aria-expanded"]).toBe(false);
+      await act(() => outer().props.onClick());
+      expect(members().map((node) => node.props["aria-expanded"])).toEqual([true, false, false]);
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it.each(["valid", "fallback", "overlong", "mixed-heading"])(
+    "SPEC141 copies the exact original context links and hides sources even on fallback (%j)",
+    async (variant) => {
+      vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+      vi.stubGlobal("requestAnimationFrame", () => 0);
+      vi.stubGlobal("cancelAnimationFrame", () => {});
+      vi.stubGlobal("HTMLElement", ElementStub);
+      Object.assign(window, { HTMLElement: ElementStub });
+      const previousNavigator = globalThis.navigator;
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("navigator", { clipboard: { writeText } });
+      const raw = directBatch([
+        "**Corps conservé** [x](t3-context://v1/skill/ctx_1)\n<script>neverExecute()</script>",
+      ]);
+      const text =
+        variant === "fallback"
+          ? raw.replace("📥 1", "📥 2")
+          : variant === "overlong"
+            ? raw.replace("📥 1", `📥 ${"1".repeat(1100)}`)
+            : variant === "mixed-heading"
+              ? raw.replace(" :\n\n", " :\n\r\n")
+              : raw;
+      let renderer: ReactTestRenderer | undefined;
+      try {
+        const entry = buildSnapShotTimelineEntry("http://localhost/screenshot.png");
+        entry.message.text = text;
+        await act(() => {
+          renderer = create(
+            <MessagesTimeline
+              {...buildProps()}
+              onImageExpand={vi.fn()}
+              timelineEntries={[entry]}
+            />,
+          );
+        });
+        await act(() =>
+          renderer!.root
+            .find((node) => node.type === "button" && node.props["aria-label"] === "Copy message")
+            .props.onClick({ nativeEvent: {} }),
+        );
+        expect(writeText).toHaveBeenCalledExactlyOnceWith(text);
+        expect(
+          renderer!.root
+            .findAllByType("img")
+            .some((node) => node.props.src === "http://localhost/screenshot.png"),
+        ).toBe(true);
+        if (variant === "overlong")
+          expect(renderer!.root.findAllByProps({ "data-bridget-toggle": "true" })).toHaveLength(0);
+        else
+          await act(() =>
+            renderer!.root.findByProps({ "data-bridget-toggle": "true" }).props.onClick(),
+          );
+        expect(
+          renderer!.root.findAllByProps({ "data-bridget-details-toggle": "true" }),
+        ).toHaveLength(0);
+        expect(renderer!.root.findAllByProps({ "data-bridget-raw": "true" })).toHaveLength(0);
+        expect(renderer!.root.findAllByType("script")).toHaveLength(0);
+        expect(strongTexts(renderer!)).toContain("Corps conservé");
+        expect(
+          renderer!.root.findAll(
+            (node) =>
+              node.type === "button" && node.props["data-bridget-member-toggle"] !== undefined,
+          ),
+        ).toHaveLength(variant === "valid" ? 1 : 0);
+      } finally {
+        await act(() => renderer?.unmount());
+        vi.stubGlobal("navigator", previousNavigator);
+      }
+    },
+  );
+
   it.each([
     "💬 Message Bridget de psychologie (91388c07-f796-47e4-ae0e-41b62b4b54dd) (id test, reply=no) :",
     "💬 Message Bridget de psychologie (91388c07-f796-47e4-ae0e-41b62b4b54dd) (via sous-agent codex 0123456789abcdef) (id test, reply=no) :",
     "🧵 Sollicitation Bridget dans le fil abc (nouveautés jusqu'à 3, id notice) :",
     "🔔 Notification Bridget (id bridget-observation:test) :",
-    "📥 3 messages Bridget groupés dans ce tour (reply=no) :",
     "🔔 2 notifications Bridget groupées dans ce tour :",
   ])("opens compact Bridget content and exact technical text for %s", async (heading) => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);

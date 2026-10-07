@@ -290,6 +290,137 @@ describe("SPEC140 compact Bridget projection", () => {
   });
 });
 
+describe("SPEC141 direct message batches", () => {
+  const notice =
+    "Pas d'accusé de réception pour ces messages : n'envoie aucun « bien reçu ». Ce n'est pas une absence de tâche : si un message demande une action, fais-la. Le pont ne relaie pas ta réponse finale pour ce tour ; pour transmettre un résultat à un expéditeur, fais un nouvel envoi Bridget.";
+  const members = [
+    {
+      sender: "Atelier interface (11111111-1111-1111-1111-111111111111)",
+      text: "**Premier**\n\nAvec blancs finaux\n",
+    },
+    { sender: "Atelier coordination", text: "" },
+    { sender: "Atelier interface", text: "🧵".repeat(150) + "\nLong corps" },
+  ];
+  function batch(items = members, total = items.length) {
+    return (
+      `📥 ${total} messages Bridget groupés dans ce tour (reply=no) :\n` +
+      items
+        .map(
+          (item, index) =>
+            `\n── ${index + 1}/${total} — de ${item.sender} (id repeated-id) ──\n${item.text}\n`,
+        )
+        .join("") +
+      `\n${notice}`
+    );
+  }
+
+  it.each(["\n", "\r\n"])(
+    "projects the real producer format and preserves bodies (%j)",
+    (newline) => {
+      const text = batch().replaceAll("\n", newline);
+      const projection = projectBridgetEnvelope(text);
+      expect(projection?.isDirectBatch).toBe(true);
+      expect(projection?.messages).toEqual(
+        members.map((item, index) => ({
+          key: String(index + 1),
+          label: index === 0 ? "Atelier interface" : item.sender,
+          text: item.text.replaceAll("\n", newline),
+          preview: [...item.text.replaceAll("\n", newline)].slice(0, 120).join(""),
+        })),
+      );
+    },
+  );
+
+  it.each(["\n", "\r\n"])(
+    "preserves a body's terminal CR before the envelope delimiter (%j)",
+    (newline) => {
+      const text = batch([
+        { sender: "Atelier", text: "A\r" },
+        { sender: "Suite", text: "B\r" },
+      ]).replaceAll("\n", newline);
+      expect(projectBridgetEnvelope(text)?.messages?.map((message) => message.text)).toEqual([
+        "A\r",
+        "B\r",
+      ]);
+    },
+  );
+
+  it("rejects mixed structural newlines without losing the readable body", () => {
+    const raw = batch().replace("(id repeated-id) ──\n", "(id repeated-id) ──\r\n");
+    expect(projectBridgetEnvelope(raw)?.messages).toBeUndefined();
+  });
+
+  it("keeps unknown identities and long supplied names, without inventing names", () => {
+    const sender = "91388c07-f796-47e4-ae0e-41b62b4b54dd";
+    const longName = "Un nom réel ".repeat(40);
+    expect(
+      projectBridgetEnvelope(
+        batch([
+          { sender, text: "Preuve" },
+          { sender: longName, text: "Suite" },
+        ]),
+      )?.messages?.map((item) => item.label),
+    ).toEqual([sender, longName]);
+  });
+
+  it.each([" (11111111-1111-1111-1111-111111111111)", " (via sous-agent codex 0123456789abcdef)"])(
+    "falls back if cleaning leaves no sender: %s",
+    (sender) => {
+      expect(
+        projectBridgetEnvelope(batch([{ sender, text: "Corps intact" }]))?.messages,
+      ).toBeUndefined();
+    },
+  );
+
+  it.each([
+    (text: string) => text.replace("📥 3", "📥 4"),
+    (text: string) => text.replace("── 2/3", "── 1/3"),
+    (text: string) => text.replace("── 2/3", "── 2/4"),
+    (text: string) => text.replace("── 2/3", "── 4/3"),
+    (text: string) => text.replace("— de Atelier coordination", "— de "),
+    (text: string) => text.replace("**Premier**", "Texte\n── séparateur similaire dans le corps"),
+    (text: string) => text.replace("Atelier coordination", "x".repeat(1100)),
+    (text: string) => text.replace("\n── 1/3", "\nIntroduction\n── 1/3"),
+    (text: string) => text.replace("── 2/3", "─ 2/3"),
+  ])("falls back to the complete readable body on ambiguous structure %#", (change) => {
+    const text = change(batch());
+    const projected = projectBridgetEnvelope(text);
+    expect(projected?.isDirectBatch).toBe(true);
+    expect(projected?.messages).toBeUndefined();
+    expect(projected?.readableText).toBe(text.slice(text.indexOf("\n\n") + 2, -notice.length - 1));
+  });
+
+  it("preserves unknown final instructions and interior transport notices", () => {
+    const text = batch([{ sender: "Atelier", text: `Preuve\n${notice}\nSuite` }]);
+    expect(projectBridgetEnvelope(text)?.messages?.[0]?.text).toBe(`Preuve\n${notice}\nSuite`);
+    const unknown = text.slice(0, -1) + "!";
+    expect(projectBridgetEnvelope(unknown)?.readableText).toContain(notice.slice(0, -1) + "!");
+    expect(projectBridgetEnvelope(unknown)?.messages).toBeUndefined();
+  });
+
+  it("does not project notification batches as direct members", () => {
+    const projection = projectBridgetEnvelope(
+      "🔔 2 notifications Bridget groupées dans ce tour :\n\n── 1/2 (id a) ──\nObservation\n",
+    );
+    expect(projection?.messages).toBeUndefined();
+    expect(projection?.isDirectBatch).toBeUndefined();
+  });
+
+  it("preserves the unitary sender rule and removes only one delegated suffix", () => {
+    const sender =
+      "Atelier (via sous-agent codex 0123456789abcdef) (via sous-agent codex fedcba9876543210)";
+    expect(
+      projectBridgetEnvelope(`💬 Message Bridget de ${sender} (id test, reply=no) :\n\nCorps`)
+        ?.label,
+    ).toBe("Atelier (via sous-agent codex 0123456789abcdef)");
+  });
+
+  it("rejects an overlong outer header without truncating the source", () => {
+    const text = `📥 ${"1".repeat(1100)} messages Bridget groupés dans ce tour (reply=no) :\n\nCorps`;
+    expect(projectBridgetEnvelope(text)).toBeNull();
+  });
+});
+
 describe("streaming row projection", () => {
   function fixture(text = "") {
     const turnId = TurnId.make("live-turn");
