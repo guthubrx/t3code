@@ -71,6 +71,8 @@ export function workEntryDisplayLabel(entry: WorkLogEntry, workspaceRoot: string
 
 const BRIDGET_ENVELOPE_HEADING =
   /^(?:💬 Message Bridget de [^\r\n]+ \(id [^()\r\n]+\) :|🔔 Notification Bridget \(id [^()\r\n]+\) :|📥 [1-9]\d* messages Bridget groupés dans ce tour \(reply=no\) :|🧵 Sollicitation Bridget dans le fil [^()\r\n]+ \(nouveautés jusqu'à [1-9]\d*, id [^()\r\n]+\) :|🔔 [1-9]\d* notifications Bridget groupées dans ce tour :)\r?\n\r?\n/;
+const BRIDGET_DIRECT_BATCH_HEADING =
+  /^📥 [1-9]\d* messages Bridget groupés dans ce tour \(reply=no\) :(\r?\n)\1/;
 const BRIDGET_UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const BRIDGET_NO_REPLY_NOTICE =
   "Pas d'accusé de réception : n'envoie aucun « bien reçu », même pour annoncer ton silence. Ce n'est pas une absence de tâche : si ce message demande une action, fais-la. Ta réponse finale ne sera pas relayée ; pour transmettre un résultat à l'expéditeur, fais un nouvel envoi Bridget.";
@@ -87,11 +89,18 @@ export interface BridgetEnvelopePresentation {
   label: string;
   kind: string;
   readableText: string;
+  isDirectBatch?: true;
+  messages?: ReadonlyArray<{ key: string; label: string; text: string; preview: string }>;
 }
 
 // Presentation only, never proof of origin. O(1): inspect at most 1024 characters.
 export function hasBridgetEnvelopeHeading(text: string): boolean {
   return BRIDGET_ENVELOPE_HEADING.test(text.slice(0, 1024));
+}
+
+// Copy may inspect a complete canonical heading; this never opts text into compact rendering.
+export function hasBridgetDirectBatchHeading(text: string): boolean {
+  return BRIDGET_DIRECT_BATCH_HEADING.test(text);
 }
 
 function removeBridgetTransportSuffix(body: string, suffix: string): string {
@@ -100,6 +109,52 @@ function removeBridgetTransportSuffix(body: string, suffix: string): string {
     if (body.endsWith(candidate)) return body.slice(0, -candidate.length);
   }
   return body;
+}
+
+function bridgetSenderLabel(sender: string): string {
+  return sender
+    .replace(/ \(via sous-agent (?:codex|claude|cursor) [0-9a-fA-F]{16}\)$/, "")
+    .replace(new RegExp(` \\(${BRIDGET_UUID}\\)$`, "i"), "");
+}
+
+function projectBridgetBatchMembers(
+  body: string,
+  total: number,
+  newline: string,
+): BridgetEnvelopePresentation["messages"] {
+  if (!Number.isSafeInteger(total) || total < 1) return undefined;
+  const messages: NonNullable<BridgetEnvelopePresentation["messages"]>[number][] = [];
+  // Inspect each candidate once. Even malformed lookalikes must force a lossless fallback.
+  let previous: { end: number; key: string; label: string } | undefined;
+  const addBody = (end: number, final: boolean): boolean => {
+    if (!previous) return false;
+    const text = body.slice(previous.end, end);
+    const separator = final ? newline : newline + newline;
+    if (!text.endsWith(separator)) return false;
+    const memberText = text.slice(0, -separator.length);
+    let preview = "";
+    let length = 0;
+    for (const character of memberText) {
+      if (length++ === 120) break;
+      preview += character;
+    }
+    messages.push({ key: previous.key, label: previous.label, text: memberText, preview });
+    return true;
+  };
+  for (const candidate of body.matchAll(/^──[^\r\n]*(?:\r?\n|$)/gm)) {
+    if (candidate[0].length > 1024) return undefined;
+    const marker = /^── ([1-9]\d*)\/([1-9]\d*) — de ([^\r\n]+) \(id ([^()\r\n]+)\) ──(\r?\n)$/.exec(
+      candidate[0],
+    );
+    if (!marker || marker[5] !== newline || !marker[3]!.trim()) return undefined;
+    if (previous ? !addBody(candidate.index, false) : candidate.index !== 0) return undefined;
+    if (Number(marker[1]) !== messages.length + 1 || Number(marker[2]) !== total) return undefined;
+    const label = bridgetSenderLabel(marker[3]!);
+    if (!label.trim()) return undefined;
+    previous = { end: candidate.index + candidate[0].length, key: marker[1]!, label };
+  }
+  if (!addBody(body.length, true) || messages.length !== total) return undefined;
+  return messages;
 }
 
 export function projectBridgetEnvelope(text: string): BridgetEnvelopePresentation | null {
@@ -117,7 +172,7 @@ export function projectBridgetEnvelope(text: string): BridgetEnvelopePresentatio
     const identity = new RegExp(`(?:^|\\()(${BRIDGET_UUID})\\)?$`, "i").exec(sender)?.[1];
     const label = new RegExp(`^${BRIDGET_UUID}$`, "i").test(sender)
       ? "Bridget"
-      : sender.replace(new RegExp(` \\(${BRIDGET_UUID}\\)$`, "i"), "");
+      : bridgetSenderLabel(direct[1]!);
     const noReply = direct[2]!.endsWith(", reply=no");
     const replyNotice = identity
       ? `— Réponds dans ce tour : Bridget transmettra ta réponse finale à ${identity}. Elle reste aussi affichée à l'utilisateur dans ce fil : commence-la par « ↪ Réponse à ${identity} (relayée par Bridget) : » pour qu'il sache qu'elle ne lui est pas adressée.`
@@ -164,13 +219,21 @@ export function projectBridgetEnvelope(text: string): BridgetEnvelopePresentatio
     heading,
   );
   if (batch) {
+    const readableText = removeBridgetTransportSuffix(
+      body,
+      `\n${batch[2] === "messages" ? BRIDGET_BATCH_NOTICE : BRIDGET_OBSERVATIONS_NOTICE}`,
+    );
+    const directBatchHeading =
+      batch[2] === "messages" ? BRIDGET_DIRECT_BATCH_HEADING.exec(heading) : null;
+    const messages = directBatchHeading
+      ? projectBridgetBatchMembers(readableText, Number(batch[1]), directBatchHeading[1]!)
+      : undefined;
     return {
       label: "Bridget",
       kind: `${batch[1]} ${batch[2]}`,
-      readableText: removeBridgetTransportSuffix(
-        body,
-        `\n${batch[2] === "messages" ? BRIDGET_BATCH_NOTICE : BRIDGET_OBSERVATIONS_NOTICE}`,
-      ),
+      readableText,
+      ...(batch[2] === "messages" ? { isDirectBatch: true } : {}),
+      ...(messages ? { messages } : {}),
     };
   }
   return {

@@ -184,6 +184,7 @@ import {
   type MessagesTimelineRowsProjection,
   liveWorkEntryLabel,
   hasBridgetEnvelopeHeading,
+  hasBridgetDirectBatchHeading,
   projectBridgetEnvelope,
   type BridgetEnvelopePresentation,
   workEntryIsActiveTurnActivity,
@@ -2264,12 +2265,14 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
               <MessageCopyButton
                 // Structured paste needs the canonical links to retain their positions.
                 text={
-                  contextClipboardFragment
-                    ? resolvedContext.text
-                    : replaceComposerContextReferences(
-                        resolvedContext.text,
-                        (reference) => reference.label,
-                      )
+                  bridgetEnvelope?.isDirectBatch || hasBridgetDirectBatchHeading(row.message.text)
+                    ? row.message.text
+                    : contextClipboardFragment
+                      ? resolvedContext.text
+                      : replaceComposerContextReferences(
+                          resolvedContext.text,
+                          (reference) => reference.label,
+                        )
                 }
                 {...(contextClipboardFragment
                   ? {
@@ -4044,11 +4047,22 @@ function BridgetMessageBody(props: {
   const detailsId = useId();
   const [expanded, setExpanded] = useState(false);
   const [detailsExpanded, setDetailsExpanded] = useState(false);
+  const [openMembers, setOpenMembers] = useState<ReadonlySet<number>>(() => new Set([0]));
   const toggle = (details: boolean) => {
     const next = !(details ? detailsExpanded : expanded);
     if (props.anchorKey) ctx.onToggleWorkEntry(props.anchorKey, !next);
     if (details) setDetailsExpanded(next);
     else setExpanded(next);
+  };
+  const toggleMember = (index: number) => {
+    const next = !openMembers.has(index);
+    if (props.anchorKey) ctx.onToggleWorkEntry(props.anchorKey, !next);
+    setOpenMembers((current) => {
+      const updated = new Set(current);
+      if (next) updated.add(index);
+      else updated.delete(index);
+      return updated;
+    });
   };
 
   return (
@@ -4059,12 +4073,14 @@ function BridgetMessageBody(props: {
         data-scroll-anchor-ignore
         aria-expanded={expanded}
         aria-controls={contentId}
-        aria-label={`Bridget · ${props.envelope.label} · ${props.envelope.kind}`}
+        aria-label={`Bridget · ${props.envelope.isDirectBatch ? "Messages groupés" : props.envelope.label} · ${props.envelope.kind}`}
         className="flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-2xl px-3 py-2.5 text-left text-secondary-label focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:ring-inset"
         onClick={() => toggle(false)}
       >
         <img src={bridgetLogoUrl} alt="" className="size-6 shrink-0" />
-        <span className="min-w-0 flex-1 truncate text-sm">{props.envelope.label}</span>
+        <span className="min-w-0 flex-1 truncate text-sm">
+          {props.envelope.isDirectBatch ? "Messages groupés" : props.envelope.label}
+        </span>
         <span className="max-w-[50%] shrink-0 truncate rounded-md bg-info/10 px-1.5 py-0.5 text-2xs">
           {props.envelope.kind}
         </span>
@@ -4076,37 +4092,95 @@ function BridgetMessageBody(props: {
       <div id={contentId} hidden={!expanded}>
         {expanded && (
           <div className="space-y-3 border-t border-border/50 px-3 pt-3 pb-2.5">
-            <UserMessageBody
-              text={props.envelope.readableText}
-              renderContextReference={props.renderContextReference}
-              skills={props.skills}
-              markdownCwd={props.markdownCwd}
-            />
-            <button
-              type="button"
-              data-bridget-details-toggle="true"
-              data-scroll-anchor-ignore
-              aria-expanded={detailsExpanded}
-              aria-controls={detailsId}
-              className="flex cursor-pointer items-center gap-1 rounded-sm text-xs text-secondary-label hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-              onClick={() => toggle(true)}
-            >
-              <ChevronRightIcon
-                aria-hidden
-                className={cn("size-3", detailsExpanded && "rotate-90")}
+            {props.envelope.messages ? (
+              <div className="divide-y divide-border/50">
+                {props.envelope.messages.map((message, index) => {
+                  const memberId = `${contentId}-member-${index}`;
+                  const memberExpanded = openMembers.has(index);
+                  return (
+                    <section key={message.key} className="min-w-0 py-1 first:pt-0 last:pb-0">
+                      <button
+                        type="button"
+                        data-bridget-member-toggle={index}
+                        data-scroll-anchor-ignore
+                        aria-label={`Message ${index + 1} de ${message.label}`}
+                        aria-expanded={memberExpanded}
+                        aria-controls={memberId}
+                        className="flex w-full min-w-0 cursor-pointer items-start gap-2 rounded-md py-2 text-left focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:ring-inset"
+                        onClick={() => toggleMember(index)}
+                      >
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-sm font-medium wrap-anywhere">
+                            {message.label}
+                          </span>
+                          <span
+                            data-bridget-member-preview="true"
+                            className="block truncate text-xs text-secondary-label"
+                          >
+                            {message.preview}
+                          </span>
+                        </span>
+                        <ChevronRightIcon
+                          aria-hidden
+                          className={cn(
+                            "mt-0.5 size-3.5 shrink-0 text-secondary-label",
+                            memberExpanded && "rotate-90",
+                          )}
+                        />
+                      </button>
+                      <div id={memberId} hidden={!memberExpanded}>
+                        {memberExpanded && (
+                          <div className="pt-1 pb-3">
+                            <UserMessageBody
+                              text={message.text}
+                              renderContextReference={props.renderContextReference}
+                              skills={props.skills}
+                              markdownCwd={props.markdownCwd}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    </section>
+                  );
+                })}
+              </div>
+            ) : (
+              <UserMessageBody
+                text={props.envelope.readableText}
+                renderContextReference={props.renderContextReference}
+                skills={props.skills}
+                markdownCwd={props.markdownCwd}
               />
-              Détails techniques
-            </button>
-            <div id={detailsId} hidden={!detailsExpanded}>
-              {detailsExpanded && (
-                <pre
-                  data-bridget-raw="true"
-                  className="max-h-96 overflow-auto whitespace-pre-wrap wrap-anywhere rounded-md bg-background/50 p-2 text-xs text-secondary-label"
+            )}
+            {!props.envelope.isDirectBatch && (
+              <>
+                <button
+                  type="button"
+                  data-bridget-details-toggle="true"
+                  data-scroll-anchor-ignore
+                  aria-expanded={detailsExpanded}
+                  aria-controls={detailsId}
+                  className="flex cursor-pointer items-center gap-1 rounded-sm text-xs text-secondary-label hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                  onClick={() => toggle(true)}
                 >
-                  {props.text}
-                </pre>
-              )}
-            </div>
+                  <ChevronRightIcon
+                    aria-hidden
+                    className={cn("size-3", detailsExpanded && "rotate-90")}
+                  />
+                  Détails techniques
+                </button>
+                <div id={detailsId} hidden={!detailsExpanded}>
+                  {detailsExpanded && (
+                    <pre
+                      data-bridget-raw="true"
+                      className="max-h-96 overflow-auto whitespace-pre-wrap wrap-anywhere rounded-md bg-background/50 p-2 text-xs text-secondary-label"
+                    >
+                      {props.text}
+                    </pre>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>
