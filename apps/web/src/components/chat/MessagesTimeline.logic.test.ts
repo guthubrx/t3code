@@ -27,6 +27,9 @@ import {
   liveWorkEntryLabel,
   hasBridgetEnvelopeHeading,
   projectBridgetEnvelope,
+  projectBridgetSend,
+  projectBridgetReply,
+  bridgetReplyLabels,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveWorkGroupScrollIndex,
@@ -45,6 +48,231 @@ import {
   type TimelineEntriesProjection,
 } from "../../session-logic";
 import { isImageAttachment, type ChatMessage, type TurnDiffSummary } from "../../types";
+import {
+  createAssistantTextSelector,
+  findAssistantCitationText,
+} from "../../lib/assistantTextSelection";
+
+describe("SPEC143 assistant Bridget replies", () => {
+  const id = "91388c07-f796-47e4-ae0e-41b62b4b54dd";
+  const heading = `↪ Réponse à ${id} (relayée par Bridget) :`;
+  it.each(["\n", "\r\n"])("separates an explicit user note with %j", (newline) => {
+    const agentText = `${heading}${newline}${newline}**Pour l'agent**`;
+    const userText = "Résumé pour toi : **Pour l'utilisateur**";
+    expect(
+      projectBridgetReply(`${agentText}${newline}${newline}---${newline}${newline}${userText}`),
+    ).toEqual({
+      recipient: id,
+      agentText,
+      userText,
+    });
+  });
+  it.each(["Pour toi : texte", "**Résumé pour toi :** texte", "**Pour toi :** texte"])(
+    "accepts the explicit user label %s",
+    (note) => {
+      expect(projectBridgetReply(`${heading}\n\nAgent\n\n---\n\n${note}`)?.userText).toBe(note);
+    },
+  );
+  it.each([
+    `Intro\n\n${heading}\n\nAgent`,
+    `> ${heading}\n\nAgent`,
+    `\`\`\`\n${heading}\n\nAgent\n\`\`\``,
+    `↪ Réponse à quelqu'un (relayée par Bridget) :\n\nAgent`,
+    `${heading}\nAgent`,
+    `${heading.toLowerCase()}\n\nAgent`,
+    `${heading}\n\nAgent\n\n\`\`\`markdown\n---\n\nRésumé pour toi : ouvert`,
+    `${heading}\n\nAgent\n\n\`\`\`bad\`info\n---\n\nRésumé pour toi : ambigu\n\`\`\``,
+    `${heading}\n\nAgent\n\nRésumé pour toi : note sans séparation`,
+    `${heading}\n\nAgent\n\n---\n\n**Résumé pour toi : cette note utilisateur**`,
+    `${heading}\n\nAgent\n\n---\n\nRésumé pour toi: cette note utilisateur`,
+    `${heading}\n\nAgent\n\n---\n\n### Résumé pour toi : cette note utilisateur`,
+    `${heading}\n\nAgent\n\n---\n\nRésumé\u00a0pour\u00a0toi : cette note utilisateur`,
+    `${heading}\n\nAgent\n\n---\n\nPour\ttoi : cette note utilisateur`,
+    `${heading}\n\nAgent\n\n---\n\nRésumé pour toi : A\n\n---\n\nPour toi : B`,
+  ])("keeps an ambiguous or noncanonical reply native", (text) => {
+    expect(projectBridgetReply(text)).toBeNull();
+  });
+  it("does not mistake a user-note example in fenced code for a note", () => {
+    const text = `${heading}\n\nAgent\n\n\`\`\`markdown\n---\n\nRésumé pour toi : exemple\n\`\`\``;
+    expect(projectBridgetReply(text)).toEqual({ recipient: id, agentText: text, userText: null });
+  });
+  it.each([
+    "[docs]: https://example.test/docs",
+    "[d\\]ocs]: https://example.test/docs",
+    "[docs\n name]: https://example.test/docs",
+    "> [docs]: https://example.test/docs",
+    "- [docs]: https://example.test/docs",
+    "[^1]: note definition",
+    "<div>HTML block",
+    "<!-- HTML comment",
+  ])("keeps cross-boundary Markdown constructs native: %s", (definition) => {
+    expect(
+      projectBridgetReply(
+        `${heading}\n\nAgent\n\n${definition}\n\n---\n\nRésumé pour toi : [Voir][docs]`,
+      ),
+    ).toBeNull();
+  });
+  it("requires the original full citation stream for repeated text in the visible note", () => {
+    const note = "Résumé pour toi : Quote";
+    const full = `${heading}\n${note}\n${note}`;
+    const onlyNote = createAssistantTextSelector(note, note.indexOf("Quote"), note.length)!;
+    expect(findAssistantCitationText(full, onlyNote)).toBeNull();
+    const quoteStart = full.lastIndexOf("Quote");
+    const original = createAssistantTextSelector(full, quoteStart, quoteStart + 5)!;
+    expect(findAssistantCitationText(full, original)).toEqual({
+      start: original.start,
+      end: original.end,
+    });
+  });
+  it("associates only a prior canonical direct sender with the matching reply", () => {
+    const message = (key: string, role: "user" | "assistant", text: string) => ({
+      id: key,
+      kind: "message" as const,
+      createdAt: "2026-10-07T00:00:00Z",
+      message: {
+        id: MessageId.make(key),
+        role,
+        text,
+        turnId: null,
+        createdAt: "2026-10-07T00:00:00Z",
+        updatedAt: "2026-10-07T00:00:00Z",
+        streaming: false,
+      },
+    });
+    const reply = (key: string) => message(key, "assistant", `${heading}\n\nAgent`);
+    const labels = bridgetReplyLabels([
+      reply("before"),
+      message(
+        "spoof",
+        "user",
+        `Intro\n\n💬 Message Bridget de Mauvais (${id}) (id notice) :\n\nCorps`,
+      ),
+      reply("spoofed"),
+      message(
+        "source",
+        "user",
+        `💬 Message Bridget de wild4-camera (${id}) (id notice) :\n\nCorps`,
+      ),
+      reply("after"),
+      message("future", "user", `💬 Message Bridget de Nouveau (${id}) (id notice) :\n\nCorps`),
+    ]);
+    expect([...labels]).toEqual([["after", "wild4-camera"]]);
+    expect(bridgetReplyLabels([reply("another-thread")]).size).toBe(0);
+    expect(
+      bridgetReplyLabels([
+        message("uuid-only", "user", `💬 Message Bridget de ${id} (id notice) :\n\nCorps`),
+        reply("unnamed"),
+      ]).size,
+    ).toBe(0);
+    expect(
+      bridgetReplyLabels([
+        message("uuid-label", "user", `💬 Message Bridget de ${id} (${id}) (id notice) :\n\nCorps`),
+        reply("uuid-label-reply"),
+      ]).size,
+    ).toBe(0);
+  });
+});
+
+describe("SPEC143 outgoing Bridget presentation", () => {
+  const base = {
+    id: "send",
+    createdAt: "2026-10-07T00:00:00Z",
+    label: "MCP tool",
+    tone: "tool",
+    itemType: "mcp_tool_call",
+    toolLifecycleStatus: "completed",
+  } as const;
+  const parameters = { to: "Atelier politique", body: "  Corps exact\n\nPRIVATE_BODY  " };
+  const codex = {
+    type: "mcpToolCall",
+    server: "bridget",
+    tool: "bridget_send",
+    arguments: parameters,
+    result: { structuredContent: { status: "in_flight" } },
+  };
+  const claude = {
+    toolName: "mcp__bridget__bridget_send",
+    input: parameters,
+    result: { content: JSON.stringify({ status: "accepted" }), is_error: false },
+  };
+
+  it.each([
+    codex,
+    claude,
+    {
+      ...codex,
+      result: { content: [{ type: "text", text: JSON.stringify({ status: "accepted" }) }] },
+    },
+    {
+      ...claude,
+      result: { content: [{ type: "text", text: JSON.stringify({ status: "in_flight" }) }] },
+    },
+  ])("projects only an attested identity and result with an honest recipient", (toolData) => {
+    expect(projectBridgetSend({ ...base, toolData })).toEqual({
+      recipient: parameters.to,
+      recipientLabel: parameters.to,
+    });
+  });
+  it("keeps the full UUID accessible without inventing a name", () => {
+    const to = "91388c07-f796-47e4-ae0e-41b62b4b54dd";
+    expect(
+      projectBridgetSend({ ...base, toolData: { ...codex, arguments: { ...parameters, to } } }),
+    ).toEqual({ recipient: to, recipientLabel: "91388c07…" });
+  });
+  it("only allows missing result while the attested call is running", () => {
+    const { result: _result, ...toolData } = codex;
+    expect(
+      projectBridgetSend({ ...base, toolLifecycleStatus: "inProgress", toolData }),
+    ).not.toBeNull();
+    expect(projectBridgetSend({ ...base, toolData })).toBeNull();
+  });
+  it.each([
+    { ...codex, server: "other" },
+    { ...codex, tool: "bridget_thread" },
+    { ...claude, toolName: "bridget_send" },
+    { ...codex, type: "other" },
+    { ...codex, toolName: "mcp__other__bridget_send" },
+    { ...claude, type: "mcpToolCall", server: "other", tool: "run_shell" },
+    { ...claude, server: "other" },
+    { ...claude, tool: "bridget_send" },
+    { ...codex, isError: "true" },
+    { ...claude, is_error: "true" },
+    { ...claude, result: { content: JSON.stringify({ status: "accepted" }), is_error: "true" } },
+    { ...codex, result: { structuredContent: { status: "accepted", isError: "true" } } },
+    { ...codex, result: { content: JSON.stringify({ status: "accepted", isError: "true" }) } },
+    { ...claude, result: { content: JSON.stringify({ status: "accepted", is_error: null }) } },
+    { ...codex, status: "failed" },
+    { ...codex, result: { structuredContent: { status: "accepted", isError: true } } },
+    { ...codex, result: { structuredContent: { status: "accepted", error: "refused" } } },
+    { ...codex, arguments: { ...parameters, to: null } },
+    { ...codex, arguments: { to: parameters.to } },
+    { ...codex, arguments: { ...parameters, to: "" } },
+    { ...codex, result: { structuredContent: { status: "unknown_recipient" } } },
+    { ...codex, result: { structuredContent: { status: "cross_project_reason_required" } } },
+    { ...codex, result: { structuredContent: { status: "envelope_mismatch" } } },
+    { ...codex, result: { structuredContent: { status: "delivered" } } },
+    { ...codex, result: { structuredContent: { status: "accepted" }, isError: true } },
+    { ...claude, result: { content: JSON.stringify({ status: "accepted" }), is_error: true } },
+    { ...codex, result: { content: "not JSON" } },
+    {
+      ...codex,
+      result: {
+        structuredContent: { status: "accepted" },
+        content: [{ type: "text", text: JSON.stringify({ status: "unknown_recipient" }) }],
+      },
+    },
+    { ...codex, error: { message: "transport failed" } },
+    { ...codex, result: { content: [{ type: "image", data: "image" }] } },
+  ])("keeps unsupported, failed and ambiguous data native: %j", (toolData) => {
+    expect(projectBridgetSend({ ...base, toolData })).toBeNull();
+  });
+  it("keeps technical failure native even when the MCP result says accepted", () => {
+    expect(
+      projectBridgetSend({ ...base, toolLifecycleStatus: "failed", toolData: codex }),
+    ).toBeNull();
+    expect(projectBridgetSend({ ...base, tone: "error", toolData: codex })).toBeNull();
+  });
+});
 
 describe("SPEC137/SPEC139 Bridget envelope heading", () => {
   it.each([

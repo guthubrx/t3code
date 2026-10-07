@@ -3,6 +3,7 @@ import {
   CheckpointRef,
   EnvironmentId,
   MessageId,
+  ThreadId,
   TurnId,
   type ComposerContextRecord,
 } from "@t3tools/contracts";
@@ -285,6 +286,532 @@ function buildSnapShotTimelineEntry(previewUrl?: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it("keeps the composer resting after closing an inter-agent reply at the timeline end", async () => {
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.set(++nextFrame, callback);
+      return nextFrame;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (frame: number) => frames.delete(frame));
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const flushFrame = () =>
+      act(() => {
+        const callbacks = [...frames.values()];
+        frames.clear();
+        callbacks.forEach((callback) => callback(0));
+      });
+    const props = buildProps();
+    props.listRef.current = {
+      getState: () => ({ isAtEnd: true }),
+      getScrollableNode: () => null,
+    } as unknown as LegendListRef;
+    let composerState: ReturnType<typeof useComposerFocusState> | undefined;
+    let resting = false;
+    function ThreadProbe() {
+      const composer = useComposerFocusState();
+      useLayoutEffect(() => {
+        composerState = composer;
+        resting = composer.isComposerScrollCollapsed;
+      });
+      return (
+        <MessagesTimeline
+          {...props}
+          onToolOutputCollapsedAtEnd={composer.restoreAfterTimelineReachedEnd}
+          timelineEntries={[
+            buildAssistantTimelineEntry(
+              "↪ Réponse à 91388c07-f796-47e4-ae0e-41b62b4b54dd (relayée par Bridget) :\n\n**Agent reply**",
+            ),
+          ]}
+        />
+      );
+    }
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(<ThreadProbe />);
+      });
+      await act(() => composerState!.setIsComposerScrollCollapsed(true));
+      const toggle = () => renderer!.root.findByProps({ "data-bridget-reply-toggle": "true" });
+      await act(() => toggle().props.onClick());
+      await flushFrame();
+      await flushFrame();
+      expect(toggle().props["aria-expanded"]).toBe(true);
+      expect(resting).toBe(true);
+      await act(() => toggle().props.onClick());
+      await flushFrame();
+      await flushFrame();
+      expect(toggle().props["aria-expanded"]).toBe(false);
+      expect(resting).toBe(true);
+      await act(() => toggle().props.onClick());
+      expect(toggle().props["aria-expanded"]).toBe(true);
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it.each([
+    "**Résumé pour toi : cette note utilisateur**",
+    "Résumé pour toi: cette note utilisateur",
+    "### Résumé pour toi : cette note utilisateur",
+    "Résumé\u00a0pour\u00a0toi : cette note utilisateur",
+    "Pour\ttoi : cette note utilisateur",
+  ])("does not hide an ambiguous user-note variant: %s", async (note) => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const reply = buildAssistantTimelineEntry(
+      `↪ Réponse à 91388c07-f796-47e4-ae0e-41b62b4b54dd (relayée par Bridget) :\n\nAgent\n\n---\n\n${note}`,
+    );
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(<MessagesTimeline {...buildProps()} timelineEntries={[reply]} />);
+      });
+      expect(renderer!.root.findAllByProps({ "data-bridget-reply-toggle": "true" })).toHaveLength(
+        0,
+      );
+      const source = renderer!.root.findByProps({
+        "data-assistant-citation-source": reply.message.id,
+      });
+      expect(
+        source
+          .findAll(() => true)
+          .flatMap((node) => node.children)
+          .filter((child) => typeof child === "string")
+          .join(" "),
+      ).toContain("cette note utilisateur");
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it("preserves a mixed reply's complete citation DOM while its agent body is visually collapsed", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const note = "Résumé pour toi : Quote";
+    const text = `↪ Réponse à 91388c07-f796-47e4-ae0e-41b62b4b54dd (relayée par Bridget) :\n\n\`\`\`text\n${note}\n\`\`\`\n\n---\n\n${note}`;
+    const reply = buildAssistantTimelineEntry(text);
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(<MessagesTimeline {...buildProps()} timelineEntries={[reply]} />);
+      });
+      const toggle = () => renderer!.root.findByProps({ "data-bridget-reply-toggle": "true" });
+      const content = () => renderer!.root.findByProps({ id: toggle().props["aria-controls"] });
+      expect(toggle().props["aria-expanded"]).toBe(false);
+      expect(content().props.hidden).toBeUndefined();
+      expect(content().props["aria-hidden"]).toBeUndefined();
+      expect(content().props.className).toBe("hidden");
+      expect(
+        content().findByProps({ className: "chat-markdown-shiki" }).props.dangerouslySetInnerHTML
+          .__html,
+      ).toContain("Quote");
+      await act(() => toggle().props.onClick());
+      expect(content().props.className).toBeUndefined();
+      expect(
+        content().findByProps({ className: "chat-markdown-shiki" }).props.dangerouslySetInnerHTML
+          .__html,
+      ).toContain("Quote");
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it.each([
+    ["[docs]: https://example.test/docs", "[Voir][docs]"],
+    ["[d\\]ocs]: https://example.test/docs", "[Voir][d\\]ocs]"],
+    ["[docs\n name]: https://example.test/docs", "[Voir][docs name]"],
+    ["> [docs]: https://example.test/docs", "[Voir][docs]"],
+    ["- [docs]: https://example.test/docs", "[Voir][docs]"],
+  ])(
+    "keeps a Markdown reference from the agent section available to the user note: %s",
+    async (definition, link) => {
+      vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+      vi.stubGlobal("requestAnimationFrame", () => 0);
+      vi.stubGlobal("cancelAnimationFrame", () => {});
+      const reply = buildAssistantTimelineEntry(
+        `↪ Réponse à 91388c07-f796-47e4-ae0e-41b62b4b54dd (relayée par Bridget) :\n\n${definition}\n\n---\n\nRésumé pour toi : ${link}`,
+      );
+      let renderer: ReactTestRenderer | undefined;
+      try {
+        await act(() => {
+          renderer = create(<MessagesTimeline {...buildProps()} timelineEntries={[reply]} />);
+        });
+        expect(renderer!.root.findAllByProps({ "data-bridget-reply-toggle": "true" })).toHaveLength(
+          0,
+        );
+        expect(
+          renderer!.root
+            .findAllByType("a")
+            .some((link) => link.props.href === "https://example.test/docs"),
+        ).toBe(true);
+      } finally {
+        await act(() => renderer?.unmount());
+      }
+    },
+  );
+
+  it("keeps the complete original reply native when an assistant citation targets it", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    vi.stubGlobal("document", {
+      ...globalThis.document,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    });
+    const reply = buildAssistantTimelineEntry(
+      "↪ Réponse à 91388c07-f796-47e4-ae0e-41b62b4b54dd (relayée par Bridget) :\n\n**Quote**\n\n---\n\nRésumé pour toi : **Quote**",
+    );
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(
+          <MessagesTimeline
+            {...buildProps()}
+            timelineEntries={[reply]}
+            citationRequest={{
+              key: "quote-target",
+              citation: {
+                version: 1,
+                environmentId: ACTIVE_THREAD_ENVIRONMENT_ID,
+                threadId: ThreadId.make("thread-1"),
+                messageId: reply.message.id,
+                text: "Quote",
+                start: 90,
+                end: 95,
+                prefix: "",
+                suffix: "",
+              },
+            }}
+          />,
+        );
+      });
+      expect(renderer!.root.findAllByProps({ "data-bridget-reply-toggle": "true" })).toHaveLength(
+        0,
+      );
+      expect(
+        renderer!.root.findAllByProps({ "data-assistant-citation-source": reply.message.id }),
+      ).toHaveLength(1);
+      expect(renderer!.root.findAllByType("strong")).toHaveLength(2);
+      expect(renderer!.root.findAllByType("hr")).toHaveLength(1);
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  it("collapses an inter-agent assistant reply while keeping its user note visible and copy exact", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const previousNavigator = globalThis.navigator;
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const id = "91388c07-f796-47e4-ae0e-41b62b4b54dd";
+    const text = `↪ Réponse à ${id} (relayée par Bridget) :\n\n**Preuve pour l'agent**\n\n---\n\nRésumé pour toi : **Note utilisateur visible**`;
+    const source = buildUserTimelineEntry(
+      `💬 Message Bridget de wild4-camera (${id}) (id test) :\n\nQuestion`,
+    );
+    const reply = buildAssistantTimelineEntry(text);
+    reply.id = "reply-entry";
+    reply.message.id = MessageId.make("reply-message");
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(<MessagesTimeline {...buildProps()} timelineEntries={[source, reply]} />);
+      });
+      const toggle = () => renderer!.root.findByProps({ "data-bridget-reply-toggle": "true" });
+      const strongText = () =>
+        renderer!.root
+          .findAllByType("strong")
+          .filter((node) => {
+            for (let ancestor = node.parent; ancestor; ancestor = ancestor.parent) {
+              if (ancestor.props.hidden || ancestor.props.className === "hidden") return false;
+            }
+            return true;
+          })
+          .flatMap((node) =>
+            node
+              .findAll(() => true)
+              .flatMap((child) => child.children)
+              .filter((child) => typeof child === "string"),
+          )
+          .join(" ");
+      expect(toggle().props["aria-expanded"]).toBe(false);
+      expect(toggle().props["aria-label"]).toBe(
+        `Bridget · Pour wild4-camera (${id}) · Entre agents`,
+      );
+      expect(strongText()).toContain("Note utilisateur visible");
+      expect(strongText()).not.toContain("Preuve pour l'agent");
+      await act(() =>
+        renderer!.root
+          .findAll((node) => node.type === "button" && node.props["aria-label"] === "Copy message")
+          .at(-1)!
+          .props.onClick({ nativeEvent: {} }),
+      );
+      expect(writeText).toHaveBeenCalledExactlyOnceWith(text);
+      await act(() => toggle().props.onClick());
+      expect(toggle().props["aria-expanded"]).toBe(true);
+      expect(strongText()).toContain("Preuve pour l'agent");
+      await act(() => {
+        renderer!.update(
+          <MessagesTimeline
+            {...buildProps()}
+            routeThreadKey="environment-local:thread-2"
+            timelineEntries={[reply]}
+          />,
+        );
+      });
+      expect(toggle().props["aria-expanded"]).toBe(false);
+      expect(toggle().props["aria-label"]).not.toContain("wild4-camera");
+      await act(() => toggle().props.onClick());
+      const edited = { ...reply, message: { ...reply.message, text: `${text}\nCorrection` } };
+      await act(() => {
+        renderer!.update(
+          <MessagesTimeline
+            {...buildProps()}
+            routeThreadKey="environment-local:thread-2"
+            timelineEntries={[edited]}
+          />,
+        );
+      });
+      expect(toggle().props["aria-expanded"]).toBe(false);
+      await act(() => {
+        renderer!.update(
+          <MessagesTimeline
+            {...buildProps()}
+            routeThreadKey="environment-local:thread-2"
+            timelineEntries={[reply]}
+          />,
+        );
+      });
+      expect(toggle().props["aria-expanded"]).toBe(false);
+    } finally {
+      await act(() => renderer?.unmount());
+      vi.stubGlobal("navigator", previousNavigator);
+    }
+  });
+
+  it("leaves a streaming relay reply in the ordinary assistant flow until completed", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const reply = buildAssistantTimelineEntry(
+      "↪ Réponse à 91388c07-f796-47e4-ae0e-41b62b4b54dd (relayée par Bridget) :\n\n**Live reply**",
+    );
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(
+          <MessagesTimeline
+            {...buildProps()}
+            timelineEntries={[{ ...reply, message: { ...reply.message, streaming: true } }]}
+          />,
+        );
+      });
+      expect(renderer!.root.findAllByProps({ "data-bridget-reply-toggle": "true" })).toHaveLength(
+        0,
+      );
+      expect(
+        renderer!.root
+          .findAllByType("strong")[0]!
+          .findAll(() => true)
+          .flatMap((node) => node.children)
+          .filter((child) => typeof child === "string")
+          .join(""),
+      ).toContain("Live reply");
+      await act(() => {
+        renderer!.update(<MessagesTimeline {...buildProps()} timelineEntries={[reply]} />);
+      });
+      expect(
+        renderer!.root.findByProps({ "data-bridget-reply-toggle": "true" }).props["aria-expanded"],
+      ).toBe(false);
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
+  const outgoing143 = {
+    type: "mcpToolCall",
+    server: "bridget",
+    tool: "bridget_send",
+    arguments: {
+      to: "91388c07-f796-47e4-ae0e-41b62b4b54dd",
+      body: "  Corps exact\nPRIVATE_BODY  ",
+    },
+    result: { structuredContent: { status: "in_flight" } },
+  };
+  function outgoingEntry143(toolData: unknown = outgoing143) {
+    return {
+      id: "send143",
+      kind: "work" as const,
+      createdAt: MESSAGE_CREATED_AT,
+      entry: {
+        id: "send143",
+        createdAt: MESSAGE_CREATED_AT,
+        toolCallId: "send143",
+        label: "bridget_send native",
+        tone: "tool" as const,
+        itemType: "mcp_tool_call" as const,
+        toolLifecycleStatus: "completed" as const,
+        toolData,
+      },
+    };
+  }
+  it.each([
+    "💬 Message Bridget de psychologie (id test, reply=no) :\n\n**Corps intact**",
+    "🧵 Sollicitation Bridget dans le fil politique (nouveautés jusqu'à 3, id notice) :\n\n**Corps intact**",
+    "🔔 Notification Bridget (id test) :\n\n**Corps intact**",
+    "🔔 2 notifications Bridget groupées dans ce tour :\n\n**Corps intact**",
+    "📥 1 messages Bridget groupés dans ce tour (reply=no) :\n\n── 1/1 — de psychologie (id test) ──\n**Corps intact**\n",
+    "📥 2 messages Bridget groupés dans ce tour (reply=no) :\n\n**Corps intact**",
+  ])("SPEC143 removes entry frames and preserves actual disclosure for %s", async (text) => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(
+          <MessagesTimeline {...buildProps()} timelineEntries={[buildUserTimelineEntry(text)]} />,
+        );
+      });
+      const toggle = () => renderer!.root.findByProps({ "data-bridget-toggle": "true" });
+      const container = renderer!.root.findAll(
+        (node) =>
+          typeof node.type === "string" && String(node.props.className).includes("max-w-[92%]"),
+      )[0]!;
+      expect(container.props.className).not.toMatch(/(?:^|\s)(?:bg-|border(?:-|\s))/);
+      expect(container.props.style?.backgroundColor).toBeUndefined();
+      expect(toggle().props.className).toContain("py-1");
+      await act(() => toggle().props.onClick());
+      expect(strongTexts(renderer!)).toContain("Corps intact");
+      for (const node of renderer!.root
+        .findByProps({ "data-bridget-card": "true" })
+        .findAll((node) => typeof node.type === "string" && node.props.className)) {
+        if (
+          String(node.props.className).includes("border-t") ||
+          String(node.props.className).includes("divide-border")
+        )
+          throw new Error("Bridget separator still framed");
+      }
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+  it.each([
+    ["Codex", outgoing143],
+    [
+      "Claude",
+      {
+        toolName: "mcp__bridget__bridget_send",
+        input: outgoing143.arguments,
+        result: { content: JSON.stringify({ status: "accepted" }), is_error: false },
+      },
+    ],
+  ])(
+    "SPEC143 reuses %s outgoing disclosure with keyboard, full native data and no delivery claim",
+    async (_provider, toolData) => {
+      vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+      vi.stubGlobal("requestAnimationFrame", () => 0);
+      vi.stubGlobal("cancelAnimationFrame", () => {});
+      let renderer: ReactTestRenderer | undefined;
+      try {
+        await act(() => {
+          renderer = create(
+            <MessagesTimeline {...buildProps()} timelineEntries={[outgoingEntry143(toolData)]} />,
+          );
+        });
+        const row = () => renderer!.root.findByProps({ "data-bridget-send": "true" });
+        expect(row().props["aria-expanded"]).toBe(false);
+        expect(row().props["aria-label"]).toContain(outgoing143.arguments.to);
+        expect(renderer!.root.findAllByType("pre")).toHaveLength(0);
+        expect(row().findAllByType("img")).toHaveLength(1);
+        expect(
+          row()
+            .findAllByType("span")
+            .flatMap((node) => node.children)
+            .join(" "),
+        ).toContain("Envoi");
+        expect(row().props["aria-label"]).not.toMatch(/livré|reçu/i);
+        const preventDefault = vi.fn();
+        await act(() => row().props.onKeyDown({ key: "Enter", preventDefault }));
+        expect(preventDefault).toHaveBeenCalledOnce();
+        expect(row().props["aria-expanded"]).toBe(true);
+        const native = renderer!.root.findByType("pre").children.join("");
+        expect(native).toContain(JSON.stringify(toolData, null, 2));
+        expect(
+          renderer!.root.findAllByProps({ "data-bridget-details-toggle": "true" }),
+        ).toHaveLength(0);
+        await act(() => row().props.onKeyDown({ key: " ", preventDefault }));
+        expect(row().props["aria-expanded"]).toBe(false);
+        await act(() => row().props.onClick());
+        expect(renderer!.root.findByType("pre").children.join("")).toBe(native);
+      } finally {
+        await act(() => renderer?.unmount());
+      }
+    },
+  );
+  it.each(["unknown_recipient", "cross_project_reason_required", "envelope_mismatch", "unknown"])(
+    "SPEC143 keeps %s native and readable after opening",
+    async (status) => {
+      vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+      vi.stubGlobal("requestAnimationFrame", () => 0);
+      vi.stubGlobal("cancelAnimationFrame", () => {});
+      const toolData = { ...outgoing143, result: { structuredContent: { status } } };
+      let renderer: ReactTestRenderer | undefined;
+      try {
+        await act(() => {
+          renderer = create(
+            <MessagesTimeline {...buildProps()} timelineEntries={[outgoingEntry143(toolData)]} />,
+          );
+        });
+        expect(renderer!.root.findAllByProps({ "data-bridget-send": "true" })).toHaveLength(0);
+        await act(() => renderer!.root.findByProps({ "aria-expanded": false }).props.onClick());
+        expect(renderer!.root.findByType("pre").children.join("")).toContain(status);
+      } finally {
+        await act(() => renderer?.unmount());
+      }
+    },
+  );
+
+  it.each([
+    {
+      toolName: "mcp__bridget__bridget_send",
+      type: "mcpToolCall",
+      server: "other",
+      tool: "run_shell",
+      input: outgoing143.arguments,
+      result: { content: JSON.stringify({ status: "accepted" }) },
+    },
+    {
+      toolName: "mcp__bridget__bridget_send",
+      input: outgoing143.arguments,
+      result: { content: JSON.stringify({ status: "accepted" }), is_error: "true" },
+    },
+    { ...outgoing143, result: { structuredContent: { status: "accepted", isError: "true" } } },
+  ])("SPEC143 leaves ambiguous provider/error data fully native: %j", async (toolData) => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(
+          <MessagesTimeline {...buildProps()} timelineEntries={[outgoingEntry143(toolData)]} />,
+        );
+      });
+      expect(renderer!.root.findAllByProps({ "data-bridget-send": "true" })).toHaveLength(0);
+      await act(() => renderer!.root.findByProps({ "aria-expanded": false }).props.onClick());
+      expect(renderer!.root.findByType("pre").children.join("")).toContain(
+        JSON.stringify(toolData, null, 2),
+      );
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
   function directBatch(
     bodies = ["**Premier corps**", "**Deuxième corps**", "**Troisième corps**"],
   ) {
