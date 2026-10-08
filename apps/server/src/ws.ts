@@ -2141,6 +2141,8 @@ const makeWsRpcLayer = (
       return WsRpcGroup.of({
         [WS_METHODS.bridgetRead]: (input) =>
           observeRpcEffect(WS_METHODS.bridgetRead, bridgetReader.read(input)),
+        [WS_METHODS.bridgetWatch]: (input) =>
+          observeRpcStream(WS_METHODS.bridgetWatch, bridgetReader.watch(input)),
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,

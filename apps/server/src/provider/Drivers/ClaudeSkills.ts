@@ -25,6 +25,12 @@ import { fromLenientJson } from "@t3tools/shared/schemaJson";
 import { parse as parseYamlDocument } from "yaml";
 
 import { expandHomePath } from "../../pathExpansion.ts";
+import {
+  claudeSettingsPaths as skillOverrideSettingsPaths,
+  findRepositoryRoot,
+} from "./ClaudeSettingsPaths.ts";
+
+export { claudeSettingsPaths as skillOverrideSettingsPaths } from "./ClaudeSettingsPaths.ts";
 
 type ClaudeSkillScope = "user" | "project";
 
@@ -100,87 +106,6 @@ function parseSkillFrontmatter(contents: string): SkillFrontmatter {
 }
 
 /**
- * Where an administrator installs the policy file whose settings outrank every
- * user and project one. Absent on almost every machine, which is why a missing
- * file is the normal case rather than an error.
- */
-function claudeManagedSettingsPath(
-  path: Path.Path,
-  platform: NodeJS.Platform,
-  environment: NodeJS.ProcessEnv,
-): string | undefined {
-  if (platform === "darwin") {
-    return "/Library/Application Support/ClaudeCode/managed-settings.json";
-  }
-  if (platform === "win32") {
-    const programData = environment.PROGRAMDATA?.trim();
-    return programData ? path.join(programData, "ClaudeCode", "managed-settings.json") : undefined;
-  }
-  return "/etc/claude-code/managed-settings.json";
-}
-
-/**
- * Settings files Claude Code merges for `skillOverrides`, in increasing
- * precedence: user, project, project-local, then the administrator's managed
- * policy, which wins outright. When the workspace sits inside a git
- * repository, the repository root's `settings.local.json` is read too and
- * outranks the workspace's own local file. Verified against the CLI from a
- * nested cwd: a root local file switching a skill off wins over a cwd one
- * switching it on, the root's plain `settings.json` is not consulted, and
- * without a `.git` above the cwd no root file is read. A skill the user
- * switched off is reported disabled rather than dropped, so the picker can
- * grey it out instead of silently losing it.
- */
-export function skillOverrideSettingsPaths(
-  path: Path.Path,
-  configDirPath: string,
-  cwd: string | undefined,
-  platform: NodeJS.Platform,
-  environment: NodeJS.ProcessEnv,
-  repositoryRoot?: string,
-): ReadonlyArray<string> {
-  const managedPath = claudeManagedSettingsPath(path, platform, environment);
-  const root = repositoryRoot !== undefined && repositoryRoot !== cwd ? repositoryRoot : undefined;
-  return [
-    path.join(configDirPath, "settings.json"),
-    ...(cwd
-      ? [
-          path.join(cwd, ".claude", "settings.json"),
-          path.join(cwd, ".claude", "settings.local.json"),
-        ]
-      : []),
-    ...(root ? [path.join(root, ".claude", "settings.local.json")] : []),
-    ...(managedPath ? [managedPath] : []),
-  ];
-}
-
-/**
- * Nearest ancestor of `cwd` (inclusive) holding a `.git` entry, which is the
- * boundary Claude Code walks up to for project settings. `undefined` outside
- * a repository.
- */
-const findRepositoryRoot = Effect.fn("findRepositoryRoot")(function* (
-  cwd: string,
-): Effect.fn.Return<string | undefined, never, FileSystem.FileSystem | Path.Path> {
-  const fileSystem = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
-  let current = path.resolve(cwd);
-  while (true) {
-    const isRoot = yield* fileSystem
-      .exists(path.join(current, ".git"))
-      .pipe(Effect.orElseSucceed(() => false));
-    if (isRoot) {
-      return current;
-    }
-    const parent = path.dirname(current);
-    if (parent === current) {
-      return undefined;
-    }
-    current = parent;
-  }
-});
-
-/**
  * The four states Claude Code accepts. The CLI validates the whole map, not
  * each entry: verified against it, one entry with an unknown value (or a
  * boolean) makes it drop every override in that file, so this schema does the
@@ -228,7 +153,10 @@ const readSkillOverrides = Effect.fn("readSkillOverrides")(function* (
   const path = yield* Path.Path;
   const platform = yield* HostProcessPlatform;
   const overridesByName = new Map<string, SkillOverride>();
-  const repositoryRoot = cwd === undefined ? undefined : yield* findRepositoryRoot(cwd);
+  const repositoryRoot =
+    cwd === undefined
+      ? undefined
+      : yield* findRepositoryRoot(cwd, "lenient").pipe(Effect.orElseSucceed(() => undefined));
 
   for (const settingsPath of skillOverrideSettingsPaths(
     path,

@@ -351,15 +351,16 @@ export async function executeAtomQuery<A, E>(
 ): Promise<AtomCommandResult<A, E>> {
   const query = Effect.scoped(
     Effect.gen(function* () {
+      const key = Atom.isSerializable(atom) ? atom[Atom.SerializableTypeId].key : atom;
+      const node = registry.getNodes().get(key);
+      const cached: AsyncResult.AsyncResult<A, E> | undefined =
+        node?.currentState() === "valid" ? node.value() : undefined;
       yield* AtomRegistry.mount(registry, atom);
-      if (options.refresh) {
+      if (options.refresh && cached !== undefined && cached._tag !== "Initial" && !cached.waiting) {
         yield* Effect.sync(() => {
-          // Only a settled value can be a leftover from an earlier read; a
-          // computation that mounting just started is already fresh.
-          const current = registry.get(atom);
-          if (current._tag !== "Initial" && !current.waiting) {
-            registry.refresh(atom);
-          }
+          // Capture cache state before mounting: a new synchronous read may
+          // already have settled by now, but must not run a second time.
+          registry.refresh(atom);
         });
       }
       return yield* AtomRegistry.getResult(registry, atom, {

@@ -94,7 +94,7 @@ const RIGHT_PANEL_STORAGE_KEY = "t3code:right-panel-state:v2";
 // v10 keys pull-request surfaces by reference instead of a singleton tab.
 // v11 stops persisting the pull-request list's shared panel, so a restart opens the page fresh.
 // v12 adds the device surface.
-const RIGHT_PANEL_STORAGE_VERSION = 13;
+const RIGHT_PANEL_STORAGE_VERSION = 14;
 
 /** A fixed workspace-level ref: each PR surface carries its own real environment. */
 export const PULL_REQUESTS_PANEL_REF = scopeThreadRef(
@@ -117,6 +117,9 @@ export interface ThreadRightPanelState {
 
 interface RightPanelStoreState {
   byThreadKey: Record<string, ThreadRightPanelState>;
+  /** Only references; closing or rebuilding surfaces must not lose the human choice. */
+  bridgetSelectionByContextKey: Record<string, string>;
+  setBridgetSelection: (contextKey: string, sharedThreadId: string | null) => void;
   /** Session-only count of user panel choices per thread. Automatic updates do not advance it. */
   userActionRevisionByThreadKey: Record<string, number>;
   getUserActionRevision: (ref: ScopedThreadRef) => number;
@@ -350,11 +353,30 @@ function normalizeRevealLine(line: number | undefined): number | null {
   return Math.max(1, Math.trunc(line));
 }
 
+function parseBridgetContextKey(key: string): string[] | null {
+  try {
+    const parts: unknown = JSON.parse(key);
+    return Array.isArray(parts) &&
+      parts.length === 3 &&
+      parts.every((part) => typeof part === "string" && part.length > 0) &&
+      JSON.stringify(parts) === key
+      ? parts
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+const isBridgetUuid = (value: unknown): value is string =>
+  typeof value === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+
 export function migratePersistedRightPanelState(persistedState: unknown): {
   byThreadKey: Record<string, ThreadRightPanelState>;
+  bridgetSelectionByContextKey: Record<string, string>;
 } {
   if (!persistedState || typeof persistedState !== "object") {
-    return { byThreadKey: {} };
+    return { byThreadKey: {}, bridgetSelectionByContextKey: {} };
   }
   const byThreadKey =
     "byThreadKey" in persistedState &&
@@ -477,13 +499,47 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
             }),
         )
       : {};
-  return { byThreadKey };
+  const selections =
+    "bridgetSelectionByContextKey" in persistedState
+      ? persistedState.bridgetSelectionByContextKey
+      : null;
+  const bridgetSelectionByContextKey =
+    selections && typeof selections === "object"
+      ? Object.fromEntries(
+          Object.entries(selections).filter(
+            ([key, value]) => parseBridgetContextKey(key) !== null && isBridgetUuid(value),
+          ),
+        )
+      : {};
+  return { byThreadKey, bridgetSelectionByContextKey };
 }
 
 export const useRightPanelStore = create<RightPanelStoreState>()(
   persist(
     (set, get) => ({
       byThreadKey: {},
+      bridgetSelectionByContextKey: {},
+      setBridgetSelection: (contextKey, sharedThreadId) => {
+        if (
+          !parseBridgetContextKey(contextKey) ||
+          (sharedThreadId !== null && !isBridgetUuid(sharedThreadId))
+        )
+          return;
+        set((state) => {
+          if ((state.bridgetSelectionByContextKey[contextKey] ?? null) === sharedThreadId)
+            return state;
+          if (sharedThreadId !== null)
+            return {
+              bridgetSelectionByContextKey: {
+                ...state.bridgetSelectionByContextKey,
+                [contextKey]: sharedThreadId,
+              },
+            };
+          const { [contextKey]: _removed, ...bridgetSelectionByContextKey } =
+            state.bridgetSelectionByContextKey;
+          return { bridgetSelectionByContextKey };
+        });
+      },
       userActionRevisionByThreadKey: {},
       getUserActionRevision: (ref) =>
         get().userActionRevisionByThreadKey[scopedThreadKey(ref)] ?? 0,
@@ -857,16 +913,24 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
       removeThread: (ref) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
+          const bridgetSelectionByContextKey = Object.fromEntries(
+            Object.entries(state.bridgetSelectionByContextKey).filter(([key]) => {
+              const parts = parseBridgetContextKey(key);
+              return parts?.[0] !== ref.environmentId || parts?.[2] !== ref.threadId;
+            }),
+          );
           if (
             !(threadKey in state.byThreadKey) &&
-            !(threadKey in state.userActionRevisionByThreadKey)
+            !(threadKey in state.userActionRevisionByThreadKey) &&
+            Object.keys(bridgetSelectionByContextKey).length ===
+              Object.keys(state.bridgetSelectionByContextKey).length
           ) {
             return state;
           }
           const { [threadKey]: _removed, ...rest } = state.byThreadKey;
           const { [threadKey]: _revision, ...userActionRevisionByThreadKey } =
             state.userActionRevisionByThreadKey;
-          return { byThreadKey: rest, userActionRevisionByThreadKey };
+          return { byThreadKey: rest, userActionRevisionByThreadKey, bridgetSelectionByContextKey };
         }),
     }),
     {
@@ -876,6 +940,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
         resolveStorage(typeof window !== "undefined" ? window.localStorage : undefined),
       ),
       partialize: (state) => ({
+        bridgetSelectionByContextKey: state.bridgetSelectionByContextKey,
         byThreadKey: Object.fromEntries(
           Object.entries(state.byThreadKey).filter(
             ([threadKey]) => !isPullRequestsPanelKey(threadKey),
@@ -883,6 +948,10 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
         ),
       }),
       migrate: migratePersistedRightPanelState,
+      merge: (persisted, current) => ({
+        ...current,
+        ...migratePersistedRightPanelState(persisted),
+      }),
     },
   ),
 );

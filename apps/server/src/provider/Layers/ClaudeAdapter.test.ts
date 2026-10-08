@@ -12,6 +12,9 @@ import type {
   PermissionResult,
   SDKMessage,
   SDKUserMessage,
+  McpServerStatus,
+  McpServerConfig,
+  McpSetServersResult,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   ApprovalRequestId,
@@ -30,6 +33,7 @@ import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Random from "effect/Random";
 import * as Ref from "effect/Ref";
@@ -73,6 +77,25 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   public readonly setMaxThinkingTokensCalls: Array<number | null> = [];
   public closeCalls = 0;
   public closeError: unknown | undefined;
+  public mcpStatuses: McpServerStatus[] = [{ name: "bridget", status: "disabled", scope: "user" }];
+  public mcpStatusCalls = 0;
+  public readonly mcpSetCalls: Array<Record<string, McpServerConfig>> = [];
+  public mcpStatusHook: (() => Promise<McpServerStatus[]>) | undefined;
+  public mcpSetHook:
+    | ((servers: Record<string, McpServerConfig>) => Promise<McpSetServersResult>)
+    | undefined;
+  public readonly mcpServerStatus = async (): Promise<McpServerStatus[]> => {
+    this.mcpStatusCalls += 1;
+    return this.mcpStatusHook ? this.mcpStatusHook() : this.mcpStatuses;
+  };
+  public readonly setMcpServers = async (servers: Record<string, McpServerConfig>) => {
+    this.mcpSetCalls.push(servers);
+    if (this.mcpSetHook) return this.mcpSetHook(servers);
+    this.mcpStatuses = [
+      { name: "bridget", status: "connected", tools: [{ name: "bridget_thread" }] },
+    ];
+    return { added: Object.keys(servers), removed: [], errors: {} };
+  };
   /** Set by tests that exercise Claude's graceful interrupt. */
   public interrupt?: () => Promise<unknown>;
 
@@ -175,6 +198,8 @@ function makeHarness(config?: {
   readonly environment?: ClaudeAdapterLiveOptions["environment"];
   readonly getSessionMessages?: ClaudeAdapterLiveOptions["getSessionMessages"];
   readonly forkSession?: ClaudeAdapterLiveOptions["forkSession"];
+  readonly nextQuery?: () => FakeClaudeQuery;
+  readonly automaticMcp?: boolean;
 }) {
   const query = new FakeClaudeQuery();
   const queries = [query];
@@ -186,14 +211,19 @@ function makeHarness(config?: {
     | undefined;
 
   const adapterOptions: ClaudeAdapterLiveOptions = {
-    ...(config?.environment ? { environment: config.environment } : {}),
+    // Legacy adapter tests must not read the developer's real Claude profiles.
+    environment: {
+      ...(config?.environment ?? process.env),
+      ...(config?.automaticMcp ? {} : { BRIDGET_AGENT_INSTANCE_ID: "147-test-no-auto-mount" }),
+    },
     ...(config?.instanceId ? { instanceId: config.instanceId } : {}),
     ...(config?.scopedLimitNames ? { scopedLimitNames: config.scopedLimitNames } : {}),
     modelCatalog: Effect.succeed(SYNTHETIC_CLAUDE_MODEL_CATALOG),
     ...(config?.getSessionMessages ? { getSessionMessages: config.getSessionMessages } : {}),
     ...(config?.forkSession ? { forkSession: config.forkSession } : {}),
     createQuery: (input) => {
-      if (createInput && config?.getSessionMessages) queries.push(new FakeClaudeQuery());
+      if (createInput && config?.getSessionMessages)
+        queries.push(config.nextQuery?.() ?? new FakeClaudeQuery());
       createInput = input;
       return queries.at(-1)!;
     },
@@ -371,6 +401,278 @@ const sendCompletedClaudeTurn = (
   });
 
 describe("ClaudeAdapterLive", () => {
+  for (const resumed of [false, true]) {
+    it.effect(`SPEC147 MCP prepares ${resumed ? "resume" : "new"} before publishing ready`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const home = yield* fs.makeTempDirectoryScoped();
+          const harness = makeHarness({
+            automaticMcp: true,
+            environment: {
+              HOME: home,
+              CLAUDE_CONFIG_DIR: home,
+              T3CODE_BRIDGET_EXECUTABLE: "/usr/bin/true",
+              PATH: "/usr/bin:/bin",
+            },
+          });
+          harness.query.mcpStatuses = [];
+          yield* Effect.gen(function* () {
+            const adapter = yield* ClaudeAdapter;
+            yield* adapter.startSession({
+              threadId: THREAD_ID,
+              runtimeMode: "full-access",
+              ...(resumed
+                ? { resumeCursor: { resume: "89000000-0000-4000-8000-000000000147" } }
+                : {}),
+            });
+            assert.equal(harness.query.mcpSetCalls.length, 1);
+            assert.deepEqual(harness.query.mcpSetCalls[0]?.bridget, {
+              type: "stdio",
+              command: "/usr/bin/true",
+              args: ["mcp"],
+              env: {
+                HOME: home,
+                BRIDGET_HOME: NodePath.join(home, ".cache", "bridget-core"),
+                BRIDGET_SOCKET: NodePath.join(home, ".cache", "bridget-core", "bridget.sock"),
+              },
+            });
+            assert.equal(harness.query.closeCalls, 0);
+            assert.equal(
+              harness.getLastCreateQueryInput()?.options.resume,
+              resumed ? "89000000-0000-4000-8000-000000000147" : undefined,
+            );
+          }).pipe(Effect.provide(harness.layer));
+        }).pipe(Effect.provide(NodeServices.layer)),
+      ),
+    );
+  }
+
+  it.effect(
+    "SPEC147 MCP deadline closes an unpublished candidate and ignores late SDK status",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const home = yield* fs.makeTempDirectoryScoped();
+          const harness = makeHarness({
+            automaticMcp: true,
+            environment: {
+              HOME: home,
+              CLAUDE_CONFIG_DIR: home,
+              T3CODE_BRIDGET_EXECUTABLE: "/usr/bin/true",
+              PATH: "/usr/bin:/bin",
+            },
+          });
+          let resolveStatus: ((status: McpServerStatus[]) => void) | undefined;
+          let notifyEntered: (() => void) | undefined;
+          const entered = new Promise<void>((resolve) => {
+            notifyEntered = resolve;
+          });
+          harness.query.mcpStatusHook = () =>
+            new Promise((resolve) => {
+              resolveStatus = resolve;
+              notifyEntered?.();
+            });
+          yield* Effect.gen(function* () {
+            const adapter = yield* ClaudeAdapter;
+            const fiber = yield* adapter
+              .startSession({ threadId: THREAD_ID, runtimeMode: "full-access" })
+              .pipe(Effect.result, Effect.forkChild);
+            yield* Effect.promise(() => entered).pipe(
+              Effect.raceFirst(
+                Fiber.join(fiber).pipe(
+                  Effect.flatMap(() => Effect.die("candidate published before MCP status")),
+                ),
+              ),
+            );
+            assert.equal((yield* adapter.listSessions()).length, 0);
+            yield* TestClock.adjust("6 seconds");
+            const result = yield* Fiber.join(fiber);
+            assert.equal(result._tag, "Failure");
+            assert.equal(harness.query.closeCalls, 1);
+            assert.equal((yield* adapter.listSessions()).length, 0);
+            const next = harness.getLastCreateQueryInput()?.prompt[Symbol.asyncIterator]().next();
+            assert.equal((yield* Effect.promise(() => next!)).done, true);
+            resolveStatus?.([]);
+            yield* Effect.yieldNow;
+            assert.equal(harness.query.mcpSetCalls.length, 0);
+          }).pipe(Effect.provide(harness.layer));
+        }).pipe(Effect.provide(NodeServices.layer)),
+      ),
+  );
+
+  it.effect("SPEC147 MCP failed replacement keeps the existing query and session", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const home = yield* fs.makeTempDirectoryScoped();
+        const second = new FakeClaudeQuery();
+        second.mcpStatusHook = async () => {
+          throw new Error("PRIVATE_API_KEY=foreign");
+        };
+        const harness = makeHarness({
+          automaticMcp: true,
+          getSessionMessages: async () => [],
+          nextQuery: () => second,
+          environment: {
+            HOME: home,
+            CLAUDE_CONFIG_DIR: home,
+            T3CODE_BRIDGET_EXECUTABLE: "/usr/bin/true",
+            PATH: "/usr/bin:/bin",
+          },
+        });
+        yield* Effect.gen(function* () {
+          const adapter = yield* ClaudeAdapter;
+          const initial = yield* adapter.startSession({
+            threadId: THREAD_ID,
+            runtimeMode: "full-access",
+          });
+          const error = yield* adapter
+            .startSession({ threadId: THREAD_ID, runtimeMode: "full-access" })
+            .pipe(Effect.flip);
+          assert.instanceOf(error, ProviderAdapterProcessError);
+          if (error._tag !== "ProviderAdapterProcessError") return;
+          assert.equal(error.detail, "Claude MCP preparation failed (sdk_failed).");
+          assert.notMatch(error.message, /PRIVATE_API_KEY|foreign/);
+          assert.equal(harness.query.closeCalls, 0);
+          assert.equal(second.closeCalls, 1);
+          assert.deepEqual(yield* adapter.listSessions(), [initial]);
+        }).pipe(Effect.provide(harness.layer));
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+
+  for (const launchArgs of ["--strict-mcp-config", "--mcp-config explicit-user-config.json"]) {
+    it.effect(`SPEC147 MCP explicit ${launchArgs} is a normal session skip`, () => {
+      return Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const home = yield* fs.makeTempDirectoryScoped();
+          const harness = makeHarness({
+            automaticMcp: true,
+            claudeConfig: { launchArgs },
+            environment: {
+              HOME: home,
+              CLAUDE_CONFIG_DIR: home,
+              PATH: "/usr/bin:/bin",
+              T3CODE_BRIDGET_EXECUTABLE: "/usr/bin/true",
+            },
+          });
+          yield* Effect.gen(function* () {
+            const adapter = yield* ClaudeAdapter;
+            const session = yield* adapter.startSession({
+              threadId: THREAD_ID,
+              runtimeMode: "auto",
+            });
+            assert.equal(session.status, "ready");
+            assert.equal(harness.query.mcpStatusCalls, 0);
+            assert.equal(harness.query.mcpSetCalls.length, 0);
+            assert.equal(harness.query.closeCalls, 0);
+            assert.equal(harness.getLastCreateQueryInput()?.options.permissionMode, "auto");
+            assert.equal(
+              harness.getLastCreateQueryInput()?.options.env?.BRIDGET_AGENT_INSTANCE_ID,
+              undefined,
+            );
+          }).pipe(Effect.provide(harness.layer));
+        }).pipe(Effect.provide(NodeServices.layer)),
+      );
+    });
+  }
+
+  it.effect("SPEC147 MCP closes an unowned candidate if replacing the old query fails", () => {
+    const candidate = new FakeClaudeQuery();
+    const harness = makeHarness({ getSessionMessages: async () => [], nextQuery: () => candidate });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const original = yield* adapter.startSession({ threadId: THREAD_ID, runtimeMode: "auto" });
+      harness.query.closeError = new Error("owned fixture refuses close");
+      const result = yield* adapter
+        .startSession({ threadId: THREAD_ID, runtimeMode: "auto" })
+        .pipe(Effect.result);
+      harness.query.closeError = undefined;
+      assert.equal(result._tag, "Failure");
+      assert.equal(candidate.closeCalls, 1);
+      assert.deepEqual(yield* adapter.listSessions(), [original]);
+      const next = harness.getLastCreateQueryInput()?.prompt[Symbol.asyncIterator]().next();
+      assert.equal((yield* Effect.promise(() => next!)).done, true);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  for (const cancellation of ["deadline", "interruption"] as const) {
+    it.effect(
+      `SPEC147 MCP ${cancellation} closes pending setMcpServers and preserves the old query`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const fs = yield* FileSystem.FileSystem;
+            const home = yield* fs.makeTempDirectoryScoped();
+            const candidate = new FakeClaudeQuery();
+            candidate.mcpStatuses = [];
+            let notifyEntered: (() => void) | undefined;
+            const entered = new Promise<void>((resolve) => {
+              notifyEntered = resolve;
+            });
+            let resolveSet: ((result: McpSetServersResult) => void) | undefined;
+            candidate.mcpSetHook = () =>
+              new Promise((resolve) => {
+                resolveSet = resolve;
+                notifyEntered?.();
+              });
+            const harness = makeHarness({
+              automaticMcp: true,
+              getSessionMessages: async () => [],
+              nextQuery: () => candidate,
+              environment: {
+                HOME: home,
+                CLAUDE_CONFIG_DIR: home,
+                T3CODE_BRIDGET_EXECUTABLE: "/usr/bin/true",
+                PATH: "/usr/bin:/bin",
+              },
+            });
+            yield* Effect.gen(function* () {
+              const adapter = yield* ClaudeAdapter;
+              const original = yield* adapter.startSession({
+                threadId: THREAD_ID,
+                runtimeMode: "full-access",
+              });
+              const fiber = yield* adapter
+                .startSession({ threadId: THREAD_ID, runtimeMode: "full-access" })
+                .pipe(Effect.result, Effect.forkChild);
+              yield* Effect.promise(() => entered).pipe(
+                Effect.raceFirst(
+                  Fiber.join(fiber).pipe(
+                    Effect.flatMap(() =>
+                      Effect.die("candidate published before native set completed"),
+                    ),
+                  ),
+                ),
+              );
+              assert.equal(candidate.mcpSetCalls.length, 1);
+              assert.deepEqual(yield* adapter.listSessions(), [original]);
+              if (cancellation === "deadline") {
+                yield* TestClock.adjust("6 seconds");
+                const result = yield* Fiber.join(fiber);
+                assert.equal(result._tag, "Failure");
+              } else {
+                yield* Fiber.interrupt(fiber);
+              }
+              assert.equal(candidate.closeCalls, 1);
+              assert.equal(harness.query.closeCalls, 0);
+              assert.deepEqual(yield* adapter.listSessions(), [original]);
+              const next = harness.getLastCreateQueryInput()?.prompt[Symbol.asyncIterator]().next();
+              assert.equal((yield* Effect.promise(() => next!)).done, true);
+              resolveSet?.({ added: ["bridget"], removed: [], errors: {} });
+              yield* Effect.yieldNow;
+              assert.equal(candidate.mcpStatusCalls, 1);
+              assert.deepEqual(yield* adapter.listSessions(), [original]);
+              assert.equal(harness.query.closeCalls, 0);
+            }).pipe(Effect.provide(harness.layer));
+          }).pipe(Effect.provide(NodeServices.layer)),
+        ),
+    );
+  }
+
   it.effect("returns validation error for non-claude provider on startSession", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
@@ -408,6 +710,7 @@ describe("ClaudeAdapterLive", () => {
       Effect.gen(function* () {
         const claudeConfig = decodeClaudeSettings({});
         return yield* makeClaudeAdapter(claudeConfig, {
+          environment: { ...process.env, BRIDGET_AGENT_INSTANCE_ID: "147-test-no-auto-mount" },
           createQuery: () => {
             throw cause;
           },
@@ -3434,6 +3737,7 @@ describe("ClaudeAdapterLive", () => {
       Effect.gen(function* () {
         const claudeConfig = decodeClaudeSettings({});
         return yield* makeClaudeAdapter(claudeConfig, {
+          environment: { ...process.env, BRIDGET_AGENT_INSTANCE_ID: "147-test-no-auto-mount" },
           createQuery: () => {
             const query = new FakeClaudeQuery();
             queries.push(query);
@@ -4279,6 +4583,7 @@ describe("ClaudeAdapterLive", () => {
       Effect.gen(function* () {
         const claudeConfig = decodeClaudeSettings({});
         return yield* makeClaudeAdapter(claudeConfig, {
+          environment: { ...process.env, BRIDGET_AGENT_INSTANCE_ID: "147-test-no-auto-mount" },
           createQuery: () => {
             const query = new FakeClaudeQuery();
             queries.push(query);
@@ -4362,6 +4667,7 @@ describe("ClaudeAdapterLive", () => {
       Effect.gen(function* () {
         const claudeConfig = decodeClaudeSettings({});
         return yield* makeClaudeAdapter(claudeConfig, {
+          environment: { ...process.env, BRIDGET_AGENT_INSTANCE_ID: "147-test-no-auto-mount" },
           createQuery: (input) => {
             // Simulate the SDK consuming the prompt iterable
             (async () => {

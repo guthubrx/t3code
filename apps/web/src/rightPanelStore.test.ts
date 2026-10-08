@@ -17,10 +17,86 @@ const refA = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-A"))
 const refB = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-B"));
 
 beforeEach(() => {
-  useRightPanelStore.setState({ byThreadKey: {}, userActionRevisionByThreadKey: {} });
+  useRightPanelStore.setState({
+    byThreadKey: {},
+    userActionRevisionByThreadKey: {},
+    bridgetSelectionByContextKey: {},
+  });
 });
 
 describe("rightPanelStore", () => {
+  const selected = "10000000-0000-4000-8000-000000000001";
+  const selectionKey = JSON.stringify(["env-1", "project-A", "thread-A"]);
+  it("memorizes only a Bridget UUID independently of the panel surfaces", () => {
+    const store = useRightPanelStore.getState();
+    store.setBridgetSelection(selectionKey, selected);
+    store.open(refA, "bridget");
+    store.open(refA, "files");
+    store.closeAllSurfaces(refA);
+    expect(useRightPanelStore.getState().bridgetSelectionByContextKey).toEqual({
+      [selectionKey]: selected,
+    });
+    const persisted = useRightPanelStore.persist.getOptions().partialize!(
+      useRightPanelStore.getState(),
+    );
+    expect(persisted).toMatchObject({ bridgetSelectionByContextKey: { [selectionKey]: selected } });
+    expect(JSON.stringify(persisted)).not.toContain("body");
+    store.removeThread(refA);
+    expect(useRightPanelStore.getState().bridgetSelectionByContextKey).toEqual({});
+  });
+  it("isolates Bridget choices by environment, project and conversation", () => {
+    const keys = [
+      selectionKey,
+      JSON.stringify(["env-2", "project-A", "thread-A"]),
+      JSON.stringify(["env-1", "project-B", "thread-A"]),
+      JSON.stringify(["env-1", "project-A", "thread-B"]),
+    ];
+    keys.forEach((key, index) =>
+      useRightPanelStore
+        .getState()
+        .setBridgetSelection(key, selected.replace(/1$/, String(index + 1))),
+    );
+    expect(Object.keys(useRightPanelStore.getState().bridgetSelectionByContextKey)).toEqual(keys);
+    useRightPanelStore.getState().removeThread(refA);
+    expect(Object.keys(useRightPanelStore.getState().bridgetSelectionByContextKey)).toEqual([
+      keys[1],
+      keys[3],
+    ]);
+  });
+  it("migrates old snapshots to an empty selection table and rejects bodies or malformed keys", () => {
+    expect(migratePersistedRightPanelState({ byThreadKey: {} })).toMatchObject({
+      bridgetSelectionByContextKey: {},
+    });
+    expect(
+      migratePersistedRightPanelState({
+        byThreadKey: {},
+        bridgetSelectionByContextKey: {
+          [selectionKey]: selected,
+          bad: selected,
+          '["env","thread"]': selected,
+          '["env","project","thread"]': { body: "secret" },
+        },
+      }),
+    ).toMatchObject({ bridgetSelectionByContextKey: { [selectionKey]: selected } });
+    useRightPanelStore.getState().setBridgetSelection(selectionKey, "message body");
+    expect(useRightPanelStore.getState().bridgetSelectionByContextKey).toEqual({});
+  });
+  it("validates selection references when rehydrating the current storage version", () => {
+    const merge = useRightPanelStore.persist.getOptions().merge!;
+    const restored = merge(
+      {
+        bridgetSelectionByContextKey: {
+          [selectionKey]: { body: "secret" },
+          [JSON.stringify(["env", "project", "thread"])]: selected,
+        },
+      },
+      useRightPanelStore.getState(),
+    );
+    expect(restored.bridgetSelectionByContextKey).toEqual({
+      [JSON.stringify(["env", "project", "thread"])]: selected,
+    });
+    expect(typeof restored.setBridgetSelection).toBe("function");
+  });
   it("keeps Bridget singleton scoped by environment and conversation through migration", () => {
     const store = useRightPanelStore.getState();
     store.open(refA, "bridget");
@@ -255,6 +331,7 @@ describe("rightPanelStore", () => {
         },
       }),
     ).toEqual({
+      bridgetSelectionByContextKey: {},
       byThreadKey: {
         "env-1:thread-A": {
           isOpen: false,
@@ -277,6 +354,7 @@ describe("rightPanelStore", () => {
         },
       }),
     ).toEqual({
+      bridgetSelectionByContextKey: {},
       byThreadKey: {
         "env-1:thread-A": {
           isOpen: true,
@@ -307,6 +385,7 @@ describe("rightPanelStore", () => {
         },
       }),
     ).toEqual({
+      bridgetSelectionByContextKey: {},
       byThreadKey: {
         "env-1:thread-A": {
           isOpen: true,
@@ -350,6 +429,7 @@ describe("rightPanelStore", () => {
         },
       }),
     ).toEqual({
+      bridgetSelectionByContextKey: {},
       byThreadKey: {
         "env-1:thread-A": {
           isOpen: true,
@@ -394,7 +474,7 @@ describe("rightPanelStore", () => {
           "env-1:thread-A": panelState,
         },
       }),
-    ).toEqual({ byThreadKey: { "env-1:thread-A": panelState } });
+    ).toEqual({ bridgetSelectionByContextKey: {}, byThreadKey: { "env-1:thread-A": panelState } });
   });
 
   it("drops persisted plan surfaces and does not reopen an empty panel", () => {
@@ -417,6 +497,7 @@ describe("rightPanelStore", () => {
         },
       }),
     ).toEqual({
+      bridgetSelectionByContextKey: {},
       byThreadKey: {
         "env-1:thread-A": {
           isOpen: false,

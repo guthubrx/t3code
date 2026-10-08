@@ -15,6 +15,31 @@ const RecentCursor = Schema.String.check(
 );
 const context = { threadId: ThreadId.check(Schema.isUUID()), projectId: ProjectId };
 
+const WatchInput = Schema.Struct(context);
+export const BridgetWatchInput = Schema.declareConstructor<
+  typeof WatchInput.Type,
+  typeof WatchInput.Encoded
+>()([WatchInput], ([codec]) => {
+  const decode = SchemaParser.decodeUnknownEffect(codec, { onExcessProperty: "error" });
+  return (input) => decode(input);
+});
+export type BridgetWatchInput = typeof BridgetWatchInput.Type;
+
+const WatchEvent = Schema.Struct({
+  version: Schema.Literal(1),
+  generation: Uuid.check(Schema.isPattern(/^[0-9a-f-]{36}$/)),
+  seq: Sequence,
+  status: Schema.Literals(["ready", "changed", "resync"]),
+});
+export const BridgetWatchEvent = Schema.declareConstructor<
+  typeof WatchEvent.Type,
+  typeof WatchEvent.Encoded
+>()([WatchEvent], ([codec]) => {
+  const decode = SchemaParser.decodeUnknownEffect(codec, { onExcessProperty: "error" });
+  return (input) => decode(input);
+});
+export type BridgetWatchEvent = typeof BridgetWatchEvent.Type;
+
 const ReadInput = Schema.Union([
   Schema.Struct({
     ...context,
@@ -209,6 +234,9 @@ const BridgetReadErrorCode = Schema.Literals([
   "invalid_request",
   "command_failed",
   "storage_unavailable",
+  "binding_unavailable",
+  "thread_unavailable",
+  "response_too_large",
 ]);
 export class BridgetReadError extends Schema.TaggedError<BridgetReadError>()("BridgetReadError", {
   code: BridgetReadErrorCode,
@@ -235,6 +263,12 @@ export class BridgetReadError extends Schema.TaggedError<BridgetReadError>()("Br
         return "The Bridget read command failed.";
       case "storage_unavailable":
         return "The conversation context could not be read.";
+      case "binding_unavailable":
+        return "The selected conversation has no available Bridget binding.";
+      case "thread_unavailable":
+        return "The shared thread is unavailable for this conversation.";
+      case "response_too_large":
+        return "The Bridget human thread capacity was exceeded.";
     }
   }
 }

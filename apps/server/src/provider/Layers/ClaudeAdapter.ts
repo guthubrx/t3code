@@ -24,6 +24,7 @@ import {
   type SettingSource,
   type SDKUserMessage,
   type ModelUsage,
+  type Query,
 } from "@anthropic-ai/claude-agent-sdk";
 import { parseCliArgs } from "@t3tools/shared/cliArgs";
 import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
@@ -91,6 +92,7 @@ import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { resolveClaudeSdkExecutablePath } from "../Drivers/ClaudeExecutable.ts";
 import { claudeSignedOutMessage, makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
+import { prepareClaudeMcp } from "../Drivers/ClaudeMcp.ts";
 import { planClaudeSkillDispatch } from "../Drivers/ClaudeSkillDispatch.ts";
 import { discoverClaudeSkills } from "../Drivers/ClaudeSkills.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
@@ -468,6 +470,8 @@ interface ClaudeSessionContext {
 }
 
 interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
+  readonly mcpServerStatus: Query["mcpServerStatus"];
+  readonly setMcpServers: Query["setMcpServers"];
   /** SDK Query.interrupt — present on real queries; optional for test doubles. */
   readonly interrupt?: () => Promise<unknown>;
   readonly setModel: (model?: string) => Promise<void>;
@@ -4475,16 +4479,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       }
 
       const existingContext = sessions.get(input.threadId);
-      if (existingContext) {
-        yield* Effect.logWarning("claude.session.replacing", {
-          threadId: input.threadId,
-          existingSessionStatus: existingContext.session.status,
-          reason: "startSession called with existing active session",
-        });
-        yield* stopSessionInternal(existingContext, {
-          emitExitEvent: false,
-        });
-      }
 
       const startedAt = yield* nowIso;
       const resumeState = readClaudeResumeState(input.resumeCursor);
@@ -5063,79 +5057,127 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         "claude.query.path_to_executable": claudeBinaryPath,
       });
 
-      const queryRuntime = yield* Effect.try({
-        try: () =>
-          createQuery({
-            prompt,
-            options: queryOptions,
-          }),
-        catch: (cause) =>
-          new ProviderAdapterProcessError({
-            provider: PROVIDER,
+      const context = yield* Effect.scoped(
+        Effect.gen(function* () {
+          let published = false;
+          const queryRuntime = yield* Effect.acquireRelease(
+            Effect.try({
+              try: () =>
+                createQuery({
+                  prompt,
+                  options: queryOptions,
+                }),
+              catch: (cause) =>
+                new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId,
+                  detail: "Failed to start Claude runtime session.",
+                  cause,
+                }),
+            }),
+            (candidate) =>
+              published
+                ? Effect.void
+                : Effect.try({ try: () => candidate.close(), catch: () => undefined }).pipe(
+                    Effect.orElseSucceed(() => undefined),
+                    Effect.andThen(Queue.shutdown(promptQueue)),
+                  ),
+          );
+
+          // The SDK consumes an empty queue until this preparation completes.
+          // A timed-out native Promise is not abortable: close its candidate CLI
+          // and queue before returning, so a late reply cannot publish a session.
+          yield* prepareClaudeMcp({
+            query: queryRuntime,
+            config: claudeSettings,
+            environment: claudeEnvironment,
+            ...(input.cwd ? { cwd: input.cwd } : {}),
+            extraArgs,
+            ...(queryOptions.mcpServers ? { servers: queryOptions.mcpServers } : {}),
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
+            Effect.tap((result) => Effect.logDebug("claude.mcp.prepared", { code: result.code })),
+            Effect.mapError(
+              (error) =>
+                new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId,
+                  detail: `Claude MCP preparation failed (${error.code}).`,
+                }),
+            ),
+          );
+
+          if (existingContext) {
+            yield* stopSessionInternal(existingContext, { emitExitEvent: false });
+          }
+
+          const session: ProviderSession = {
             threadId,
-            detail: "Failed to start Claude runtime session.",
-            cause,
-          }),
-      });
+            provider: PROVIDER,
+            providerInstanceId: boundInstanceId,
+            status: "ready",
+            runtimeMode: input.runtimeMode,
+            ...(input.cwd ? { cwd: input.cwd } : {}),
+            ...(modelSelection?.model ? { model: modelSelection.model } : {}),
+            ...(threadId ? { threadId } : {}),
+            resumeCursor: {
+              ...(threadId ? { threadId } : {}),
+              ...(sessionId ? { resume: sessionId } : {}),
+              ...(resumeState?.resumeSessionAt
+                ? { resumeSessionAt: resumeState.resumeSessionAt }
+                : {}),
+              turnCount: resumeState?.turnCount ?? 0,
+              ...(resumeState?.turnStartMessageIds
+                ? { turnStartMessageIds: resumeState.turnStartMessageIds }
+                : {}),
+            },
+            createdAt: startedAt,
+            updatedAt: startedAt,
+          };
 
-      const session: ProviderSession = {
-        threadId,
-        provider: PROVIDER,
-        providerInstanceId: boundInstanceId,
-        status: "ready",
-        runtimeMode: input.runtimeMode,
-        ...(input.cwd ? { cwd: input.cwd } : {}),
-        ...(modelSelection?.model ? { model: modelSelection.model } : {}),
-        ...(threadId ? { threadId } : {}),
-        resumeCursor: {
-          ...(threadId ? { threadId } : {}),
-          ...(sessionId ? { resume: sessionId } : {}),
-          ...(resumeState?.resumeSessionAt ? { resumeSessionAt: resumeState.resumeSessionAt } : {}),
-          turnCount: resumeState?.turnCount ?? 0,
-          ...(resumeState?.turnStartMessageIds
-            ? { turnStartMessageIds: resumeState.turnStartMessageIds }
-            : {}),
-        },
-        createdAt: startedAt,
-        updatedAt: startedAt,
-      };
-
-      const context: ClaudeSessionContext = {
-        session,
-        startInput: input,
-        turnStartMessageIds: resumeState?.turnStartMessageIds
-          ? [...resumeState.turnStartMessageIds]
-          : Array.from({ length: resumeState?.turnCount ?? 0 }, () => null),
-        promptQueue,
-        query: queryRuntime,
-        streamFiber: undefined,
-        startedAt,
-        basePermissionMode: permissionMode,
-        currentApiModelId: apiModelId,
-        currentEffort: effectiveEffort ?? undefined,
-        resumeSessionId: sessionId,
-        pendingApprovals,
-        pendingUserInputs,
-        turns: [],
-        inFlightTools,
-        claudeTasks,
-        taskAgents,
-        pendingTaskModels,
-        subagentToolParents,
-        workflowMemberFingerprints,
-        liveTaskIds,
-        turnState: undefined,
-        lastKnownContextWindow: initialContextWindow,
-        lastKnownTokenUsage: undefined,
-        lastKnownTotalProcessedTokens: undefined,
-        lastAssistantUuid: resumeState?.resumeSessionAt,
-        lastThreadStartedId: undefined,
-        announcedUsageLimits: undefined,
-        interruptedTurnSettled: undefined,
-        stopped: false,
-      };
-      yield* Ref.set(contextRef, context);
-      sessions.set(threadId, context);
+          const context: ClaudeSessionContext = {
+            session,
+            startInput: input,
+            turnStartMessageIds: resumeState?.turnStartMessageIds
+              ? [...resumeState.turnStartMessageIds]
+              : Array.from({ length: resumeState?.turnCount ?? 0 }, () => null),
+            promptQueue,
+            query: queryRuntime,
+            streamFiber: undefined,
+            startedAt,
+            basePermissionMode: permissionMode,
+            currentApiModelId: apiModelId,
+            currentEffort: effectiveEffort ?? undefined,
+            resumeSessionId: sessionId,
+            pendingApprovals,
+            pendingUserInputs,
+            turns: [],
+            inFlightTools,
+            claudeTasks,
+            taskAgents,
+            pendingTaskModels,
+            subagentToolParents,
+            workflowMemberFingerprints,
+            liveTaskIds,
+            turnState: undefined,
+            lastKnownContextWindow: initialContextWindow,
+            lastKnownTokenUsage: undefined,
+            lastKnownTotalProcessedTokens: undefined,
+            lastAssistantUuid: resumeState?.resumeSessionAt,
+            lastThreadStartedId: undefined,
+            announcedUsageLimits: undefined,
+            interruptedTurnSettled: undefined,
+            stopped: false,
+          };
+          yield* Ref.set(contextRef, context);
+          sessions.set(threadId, context);
+          // Transfer ownership only once the adapter can stop this candidate.
+          published = true;
+          return context;
+        }),
+      );
+      const session = context.session;
 
       const sessionStartedStamp = yield* makeEventStamp();
       yield* offerRuntimeEvent({

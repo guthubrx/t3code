@@ -1,12 +1,42 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
-import { BridgetHumanView, BridgetReadInput } from "./bridget.ts";
+import {
+  BridgetHumanView,
+  BridgetReadInput,
+  BridgetWatchInput,
+  BridgetWatchEvent,
+} from "./bridget.ts";
 
 const threadId = "8b09a229-dc14-4b38-91b5-2bf0e2a294ac";
 const sharedThreadId = "3503a3ce-cb97-46eb-b17b-339377b0c1ce";
 const base = { threadId, projectId: "project-1" };
 const decodeInput = Schema.decodeUnknownSync(BridgetReadInput);
 const decodeView = Schema.decodeUnknownSync(BridgetHumanView);
+
+describe("Bridget human watch contract", () => {
+  it("accepts only the conversation context and content-free signals", () => {
+    const decodeWatch = Schema.decodeUnknownSync(BridgetWatchInput);
+    const decodeEvent = Schema.decodeUnknownSync(BridgetWatchEvent);
+    expect(decodeWatch(base)).toEqual(base);
+    for (const field of ["projectRoot", "agentId", "instanceId", "sharedThreadId", "credentials"])
+      expect(() => decodeWatch({ ...base, [field]: "forged" })).toThrow();
+    for (const status of ["ready", "changed", "resync"]) {
+      const event = { version: 1, generation: sharedThreadId, seq: 0, status };
+      expect(decodeEvent(event)).toEqual(event);
+      for (const field of ["body", "thread_id", "title", "detail"])
+        expect(() => decodeEvent({ ...event, [field]: "private" })).toThrow();
+    }
+  });
+  it("rejects unsafe counters, noncanonical generations and incompatible versions", () => {
+    const decodeEvent = Schema.decodeUnknownSync(BridgetWatchEvent);
+    const event = { version: 1, generation: sharedThreadId, seq: 0, status: "ready" };
+    for (const seq of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1])
+      expect(() => decodeEvent({ ...event, seq })).toThrow();
+    for (const generation of ["invalid", sharedThreadId.toUpperCase()])
+      expect(() => decodeEvent({ ...event, generation })).toThrow();
+    expect(() => decodeEvent({ ...event, version: 2 })).toThrow();
+  });
+});
 
 describe("Bridget human read contract", () => {
   const recentCursor = `1791331200:${sharedThreadId}`;

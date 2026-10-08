@@ -15,11 +15,12 @@ import {
 } from "./RpcAuthorization.ts";
 
 describe("RPC authorization scopes", () => {
-  it("requires read scope for the only Bridget RPC", () => {
+  it("requires read scope for Bridget reads and streams", () => {
     expect(requiredScopeForRpcMethod("bridget.read")).toBe(AuthOrchestrationReadScope);
+    expect(requiredScopeForRpcMethod("bridget.watch")).toBe(AuthOrchestrationReadScope);
     expect(
       [...WsRpcGroup.requests.keys()].filter((method) => method.startsWith("bridget.")),
-    ).toEqual(["bridget.read"]);
+    ).toEqual(["bridget.read", "bridget.watch"]);
   });
   it("declares exactly one scope for every RPC in the server group", () => {
     expect(new Set(Object.keys(RPC_REQUIRED_SCOPES))).toEqual(new Set(WsRpcGroup.requests.keys()));

@@ -3,18 +3,25 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   ProjectId,
   ThreadId,
+  BridgetReadError,
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { resolveCommandPath } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as Stream from "effect/Stream";
+import * as Sink from "effect/Sink";
+import * as TestClock from "effect/testing/TestClock";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import type * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ProcessRunner from "../processRunner.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as BridgetReader from "./BridgetReader.ts";
@@ -29,6 +36,7 @@ const envelope = {
   result: { status: "listed", threads: [], next_after: null },
 };
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const isBridgetReadError = Schema.is(BridgetReadError);
 const output = (stdout = encodeJson(envelope), code = 0): ProcessRunner.ProcessRunOutput => ({
   stdout,
   stderr: "private diagnostic secret",
@@ -48,9 +56,38 @@ const harness = Effect.fn("BridgetReaderTest.harness")(function* (
     environment?: NodeJS.ProcessEnv;
     result?: ProcessRunner.ProcessRunOutput;
     error?: ProcessRunner.ProcessRunError;
+    watchOutput?: Stream.Stream<Uint8Array>;
+    watchSpawner?: ChildProcessSpawner.ChildProcessSpawner["Service"];
   } = {},
 ) {
   const calls: ProcessRunner.ProcessRunInput[] = [];
+  const watchCalls: ChildProcess.Command[] = [];
+  let activeChildren = 0;
+  const spawner = ChildProcessSpawner.make((command) =>
+    Effect.acquireRelease(
+      Effect.sync(() => {
+        watchCalls.push(command);
+        activeChildren += 1;
+        return ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(147),
+          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          isRunning: Effect.succeed(true),
+          kill: () => Effect.void,
+          stdin: Sink.drain,
+          stdout: options.watchOutput ?? Stream.empty,
+          stderr: Stream.empty,
+          all: Stream.empty,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.empty,
+          unref: Effect.succeed(Effect.void),
+        });
+      }),
+      () =>
+        Effect.sync(() => {
+          activeChildren -= 1;
+        }),
+    ),
+  );
   const snapshots = ProjectionSnapshotQuery.of({
     getThreadShellById: () =>
       Effect.succeed(
@@ -84,6 +121,9 @@ const harness = Effect.fn("BridgetReaderTest.harness")(function* (
       BridgetReader.layer.pipe(
         Layer.provide(Layer.succeed(ProjectionSnapshotQuery, snapshots)),
         Layer.provide(Layer.succeed(ProcessRunner.ProcessRunner, runner)),
+        Layer.provide(
+          Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, options.watchSpawner ?? spawner),
+        ),
         Layer.provide(NodeServices.layer),
         Layer.provide(
           Layer.succeed(
@@ -98,7 +138,275 @@ const harness = Effect.fn("BridgetReaderTest.harness")(function* (
       ),
     ),
   );
-  return { reader, calls };
+  return { reader, calls, watchCalls, activeChildren: () => activeChildren };
+});
+
+const watchReady = { version: 1, generation: sharedThreadId, seq: 0, status: "ready" };
+const watchBytes = (value: unknown) => new TextEncoder().encode(`${encodeJson(value)}\n`);
+
+describe("BridgetReader.watch", () => {
+  it.live("distinguishes a real CLI transport exit from its closed binding refusal line", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped();
+        for (const [exitCode, expected] of [
+          [2, "binding_unavailable"],
+          [3, "unavailable"],
+          [null, "binding_unavailable"],
+        ] as const) {
+          const executable = path.join(directory, `human-watch-error-${exitCode}`);
+          const finish =
+            exitCode === null ? "setInterval(() => {}, 60000)" : `process.exit(${exitCode})`;
+          yield* fs.writeFileString(
+            executable,
+            `#!${process.execPath}\nprocess.stdout.write('${JSON.stringify({ version: 1, status: "error", code: "binding_unavailable" })}\\n', () => ${finish});\n`,
+          );
+          yield* fs.chmod(executable, 0o700);
+          const h = yield* harness({
+            environment: { T3CODE_BRIDGET_EXECUTABLE: executable },
+            watchSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+          });
+          const error = yield* Stream.runDrain(h.reader.watch({ threadId, projectId })).pipe(
+            Effect.timeout("1 second"),
+            Effect.flip,
+          );
+          expect(isBridgetReadError(error) && error.code).toBe(expected);
+        }
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  it.live("fails and releases a real child that closes stdout but stays alive after ready", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped();
+        const executable = path.join(directory, "human-watch-eof");
+        yield* fs.writeFileString(
+          executable,
+          `#!${process.execPath}\nprocess.stdout.end('${JSON.stringify(watchReady)}\\n');\nsetInterval(() => {}, 60000);\n`,
+        );
+        yield* fs.chmod(executable, 0o700);
+        const nativeSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        let handle: ChildProcessSpawner.ChildProcessHandle | undefined;
+        const h = yield* harness({
+          environment: { T3CODE_BRIDGET_EXECUTABLE: executable },
+          watchSpawner: ChildProcessSpawner.make((command) =>
+            nativeSpawner.spawn(command).pipe(
+              Effect.tap((child) =>
+                Effect.sync(() => {
+                  handle = child;
+                }),
+              ),
+            ),
+          ),
+        });
+        const error = yield* Stream.runDrain(h.reader.watch({ threadId, projectId })).pipe(
+          Effect.timeoutOrElse({
+            duration: "1 second",
+            orElse: () => Effect.fail(new BridgetReadError({ code: "timeout" })),
+          }),
+          Effect.flip,
+        );
+        expect(error.code).toBe("command_failed");
+        expect(handle).toBeDefined();
+        expect(yield* handle!.isRunning).toBe(false);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  it.effect("expires only the initial handshake after six seconds", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const waiting = yield* Deferred.make<void>();
+        const h = yield* harness({
+          watchOutput: Stream.fromEffect(Deferred.succeed(waiting, undefined)).pipe(
+            Stream.drain,
+            Stream.concat(Stream.never),
+          ),
+        });
+        const fiber = yield* Stream.runDrain(h.reader.watch({ threadId, projectId })).pipe(
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(waiting);
+        yield* TestClock.adjust("6 seconds");
+        expect((yield* Fiber.join(fiber).pipe(Effect.flip)).code).toBe("timeout");
+        expect(h.activeChildren()).toBe(0);
+      }),
+    ),
+  );
+  it.effect(
+    "decodes split lines and emits ready, changed and resync without collecting a final output",
+    () =>
+      Effect.gen(function* () {
+        const events = [
+          watchReady,
+          { ...watchReady, seq: 1, status: "changed" },
+          { ...watchReady, seq: 3, status: "resync" },
+        ];
+        const bytes = new TextEncoder().encode(
+          events.map((event) => `${encodeJson(event)}\n`).join(""),
+        );
+        const h = yield* harness({
+          watchOutput: Stream.make(bytes.subarray(0, 17), bytes.subarray(17)).pipe(
+            Stream.concat(Stream.never),
+          ),
+        });
+        expect(
+          yield* h.reader.watch({ threadId, projectId }).pipe(Stream.take(3), Stream.runCollect),
+        ).toEqual(events);
+        expect(h.activeChildren()).toBe(0);
+      }),
+  );
+  it.effect("terminates the real child it spawned when its stream consumer leaves", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped();
+        const executable = path.join(directory, "human-watch");
+        yield* fs.writeFileString(
+          executable,
+          `#!${process.execPath}\nprocess.stdout.write('${JSON.stringify(watchReady)}\\n');\nsetInterval(() => {}, 60000);\n`,
+        );
+        yield* fs.chmod(executable, 0o700);
+        const nativeSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        let handle: ChildProcessSpawner.ChildProcessHandle | undefined;
+        const spawner = ChildProcessSpawner.make((command) =>
+          nativeSpawner.spawn(command).pipe(
+            Effect.tap((child) =>
+              Effect.sync(() => {
+                handle = child;
+              }),
+            ),
+          ),
+        );
+        const h = yield* harness({
+          environment: { T3CODE_BRIDGET_EXECUTABLE: executable },
+          watchSpawner: spawner,
+        });
+        const ready = yield* Deferred.make<void>();
+        const fiber = yield* h.reader.watch({ threadId, projectId }).pipe(
+          Stream.tap(() => Deferred.succeed(ready, undefined)),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(ready);
+        expect(handle).toBeDefined();
+        expect(handle!.pid).not.toBe(process.pid);
+        yield* Fiber.interrupt(fiber);
+        expect(yield* handle!.isRunning).toBe(false);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  it.effect(
+    "uses the server workspace and releases its child on cancellation without timing out accepted streams",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const ready = yield* Deferred.make<void>();
+          const h = yield* harness({
+            watchOutput: Stream.make(watchBytes(watchReady)).pipe(Stream.concat(Stream.never)),
+          });
+          const fiber = yield* h.reader.watch({ threadId, projectId }).pipe(
+            Stream.tap(() => Deferred.succeed(ready, undefined)),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* Deferred.await(ready);
+          yield* TestClock.adjust("1 minute");
+          expect(h.activeChildren()).toBe(1);
+          const command = h.watchCalls[0]!;
+          expect(command._tag).toBe("StandardCommand");
+          if (command._tag === "StandardCommand") {
+            expect(command.args).toEqual([
+              "thread",
+              "watch",
+              "--t3-thread",
+              threadId,
+              "--project-root",
+              "/project with spaces/$(forged); é",
+              "--json",
+            ]);
+            expect(command.options.shell).toBe(false);
+          }
+          expect(h.calls).toEqual([]);
+          yield* Fiber.interrupt(fiber);
+          expect(h.activeChildren()).toBe(0);
+        }),
+      ),
+  );
+  it.effect("checks context before spawning and never trusts a browser root", () =>
+    Effect.gen(function* () {
+      const h = yield* harness({ differentProject: true });
+      expect(
+        (yield* Stream.runDrain(h.reader.watch({ threadId, projectId })).pipe(Effect.flip)).code,
+      ).toBe("project_mismatch");
+      expect(h.watchCalls).toEqual([]);
+      const forged = { threadId, projectId, projectRoot: "/forged" };
+      expect((yield* Stream.runDrain(h.reader.watch(forged)).pipe(Effect.flip)).code).toBe(
+        "invalid_request",
+      );
+    }),
+  );
+  it.effect(
+    "bounds partial JSONL and rejects invalid UTF8, leaked fields and invalid stream ordering",
+    () =>
+      Effect.gen(function* () {
+        const cases = [
+          { bytes: new TextEncoder().encode("x".repeat(4097)), code: "output_limit" },
+          {
+            bytes: new TextEncoder().encode(`${encodeJson(watchReady).padEnd(4096)}\n`),
+            code: "output_limit",
+          },
+          { bytes: new Uint8Array([0xff, 10]), code: "invalid_output" },
+          { bytes: watchBytes({ ...watchReady, body: "private" }), code: "invalid_output" },
+          { bytes: watchBytes({ ...watchReady, status: "changed" }), code: "invalid_output" },
+          { bytes: watchBytes({ ...watchReady, seq: 1 }), code: "invalid_output" },
+          { bytes: watchBytes({ ...watchReady, version: 2 }), code: "unsupported_version" },
+        ];
+        for (const { bytes, code } of cases) {
+          const h = yield* harness({ watchOutput: Stream.make(bytes) });
+          expect(
+            (yield* Stream.runDrain(h.reader.watch({ threadId, projectId })).pipe(Effect.flip))
+              .code,
+          ).toBe(code);
+          expect(h.activeChildren()).toBe(0);
+        }
+        for (const event of [
+          watchReady,
+          { ...watchReady, seq: 0, status: "changed" },
+          { ...watchReady, seq: 1, status: "changed", generation: threadId },
+        ]) {
+          const h = yield* harness({
+            watchOutput: Stream.make(watchBytes(watchReady), watchBytes(event)),
+          });
+          expect(
+            (yield* Stream.runDrain(h.reader.watch({ threadId, projectId })).pipe(Effect.flip))
+              .code,
+          ).toBe("invalid_output");
+        }
+      }),
+  );
+  it.effect("preserves closed refusal categories and stops the stream", () =>
+    Effect.gen(function* () {
+      for (const code of [
+        "binding_unavailable",
+        "thread_unavailable",
+        "storage_unavailable",
+        "response_too_large",
+      ]) {
+        const h = yield* harness({
+          watchOutput: Stream.make(watchBytes({ version: 1, status: "error", code })),
+        });
+        expect(
+          (yield* Stream.runDrain(h.reader.watch({ threadId, projectId })).pipe(Effect.flip)).code,
+        ).toBe(code);
+        expect(h.activeChildren()).toBe(0);
+      }
+    }),
+  );
 });
 
 describe("BridgetReader", () => {
