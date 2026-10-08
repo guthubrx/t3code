@@ -1,4 +1,4 @@
-import { ORCHESTRATION_WS_METHODS } from "@t3tools/contracts";
+import { ORCHESTRATION_WS_METHODS, WS_METHODS } from "@t3tools/contracts";
 import { Atom } from "effect/unstable/reactivity";
 
 import { createEnvironmentRpcQueryAtomFamily } from "./runtime.ts";
@@ -8,6 +8,12 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
   return {
+    bridgetRead: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:bridget-read",
+      tag: WS_METHODS.bridgetRead,
+      staleTimeMs: 3_000,
+      idleTtlMs: 10_000,
+    }),
     turnDiff: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:orchestration:turn-diff",
       tag: ORCHESTRATION_WS_METHODS.getTurnDiff,

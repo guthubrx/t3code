@@ -8,6 +8,7 @@ import {
 import * as Schema from "effect/Schema";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
+import { BridgetHumanView, BridgetReadInput, BridgetReadError } from "./bridget.ts";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   CodexAuthCallbackInput,
@@ -287,6 +288,7 @@ import {
 import { VcsError } from "./vcs.ts";
 
 export const WS_METHODS = {
+  bridgetRead: "bridget.read",
   // Project registry methods
   projectsList: "projects.list",
   projectsAdd: "projects.add",
@@ -993,6 +995,12 @@ const WsProjectsReadFileRpc = Rpc.make(WS_METHODS.projectsReadFile, {
   error: Schema.Union([ProjectReadFileError, EnvironmentAuthorizationError]),
 });
 
+const WsBridgetReadRpc = Rpc.make(WS_METHODS.bridgetRead, {
+  payload: BridgetReadInput,
+  success: BridgetHumanView,
+  error: Schema.Union([BridgetReadError, EnvironmentAuthorizationError]),
+});
+
 const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   payload: ProjectWriteFileInput,
   success: ProjectWriteFileResult,
@@ -1450,6 +1458,7 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
 });
 
 export const WsRpcGroup = RpcGroup.make(
+  WsBridgetReadRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

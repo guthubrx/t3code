@@ -6763,6 +6763,62 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("Bridget human read requires read scope and never dispatches an agent command", () =>
+    Effect.gen(function* () {
+      let contextReads = 0;
+      let dispatched = 0;
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getThreadShellById: () =>
+              Effect.sync(() => {
+                contextReads += 1;
+                return Option.none();
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: () =>
+              Effect.sync(() => {
+                dispatched += 1;
+                return { sequence: 0 };
+              }),
+          },
+        },
+      });
+      for (const scope of ["access:read", "orchestration:read"]) {
+        const token = yield* exchangeAccessToken(defaultDesktopBootstrapToken, { scope });
+        assert.equal(token.response.status, 200);
+        const ticketResponse = yield* HttpClient.post("/api/auth/websocket-ticket", {
+          headers: { authorization: `Bearer ${token.body.access_token ?? ""}` },
+        });
+        const { ticket } = yield* responseJsonEffect<{ readonly ticket: string }>(ticketResponse);
+        const wsUrl = `${yield* getWsServerUrl("/ws", { authenticated: false })}?wsTicket=${encodeURIComponent(ticket)}`;
+        yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            Effect.gen(function* () {
+              const error = yield* client[WS_METHODS.bridgetRead]({
+                threadId: ThreadId.make("8b09a229-dc14-4b38-91b5-2bf0e2a294ac"),
+                projectId: defaultProjectId,
+                action: "list",
+              }).pipe(Effect.flip);
+              if (scope === "access:read") {
+                assert.equal(error._tag, "EnvironmentAuthorizationError");
+                if (error._tag === "EnvironmentAuthorizationError")
+                  assert.equal(error.requiredScope, "orchestration:read");
+                assert.equal(contextReads, 0);
+              } else {
+                assert.equal(error._tag, "BridgetReadError");
+                if (error._tag === "BridgetReadError") assert.equal(error.code, "context_missing");
+                assert.equal(contextReads, 1);
+              }
+            }),
+          ),
+        );
+      }
+      assert.equal(dispatched, 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("provider setup binds private sign-in to the authenticated websocket session", () =>
     Effect.gen(function* () {
       const flowId = "private-sign-in-flow";

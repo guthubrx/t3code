@@ -21,6 +21,31 @@ beforeEach(() => {
 });
 
 describe("rightPanelStore", () => {
+  it("keeps Bridget singleton scoped by environment and conversation through migration", () => {
+    const store = useRightPanelStore.getState();
+    store.open(refA, "bridget");
+    store.open(refA, "bridget");
+    const remote = scopeThreadRef("env-2" as EnvironmentId, refA.threadId);
+    store.open(remote, "bridget");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces,
+    ).toEqual([{ id: "bridget", kind: "bridget" }]);
+    const migrated = migratePersistedRightPanelState({
+      byThreadKey: useRightPanelStore.getState().byThreadKey,
+    });
+    useRightPanelStore.setState(migrated);
+    store.closeSurface(refA, "bridget");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces,
+    ).toEqual([]);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, remote)
+        .activeSurfaceId,
+    ).toBe("bridget");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refB).surfaces,
+    ).toEqual([]);
+  });
   it("gives each host/device its own tab and preserves renamed tabs", () => {
     const store = useRightPanelStore.getState();
     const android = {
