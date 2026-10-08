@@ -5,6 +5,14 @@ import { NonNegativeInt, PositiveInt, ProjectId, ThreadId } from "./baseSchemas.
 const Uuid = Schema.String.check(Schema.isUUID());
 const Name = Schema.NullOr(Schema.String.check(Schema.isMaxLength(256)));
 const Sequence = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+const RecentCursor = Schema.String.check(
+  Schema.isMaxLength(128),
+  Schema.makeFilter((cursor) => {
+    const match =
+      /^(0|[1-9][0-9]*):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.exec(cursor);
+    return match !== null && Number.isSafeInteger(Number(match[1]));
+  }),
+);
 const context = { threadId: ThreadId.check(Schema.isUUID()), projectId: ProjectId };
 
 const ReadInput = Schema.Union([
@@ -15,6 +23,20 @@ const ReadInput = Schema.Union([
     limit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(100))),
   }),
   Schema.Struct({ ...context, action: Schema.Literal("show"), sharedThreadId: Uuid }),
+  Schema.Struct({
+    ...context,
+    action: Schema.Literal("list_recent"),
+    after: Schema.optional(RecentCursor),
+    limit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(100))),
+  }),
+  Schema.Struct({
+    ...context,
+    action: Schema.Literal("history_recent"),
+    sharedThreadId: Uuid,
+    limit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(200))),
+    beforeSeq: Schema.optional(Sequence),
+    toSeq: Schema.optional(Sequence),
+  }),
   Schema.Struct({
     ...context,
     action: Schema.Literal("history"),
@@ -94,6 +116,61 @@ const HumanView = Schema.Struct({
       created_at: Schema.Int,
       closed_at: Schema.NullOr(Schema.Int),
     }),
+    Schema.Struct({
+      status: Schema.Literal("listed_recent"),
+      threads: Schema.Array(
+        Schema.Struct({
+          ...ThreadSummary.fields,
+          last_activity_at: Sequence,
+        }),
+      ).check(Schema.isMaxLength(100)),
+      next_after: Schema.NullOr(RecentCursor),
+    }).check(
+      Schema.makeFilter((result) => {
+        const seen = new Set<string>();
+        for (let index = 0; index < result.threads.length; index++) {
+          const current = result.threads[index]!;
+          if (seen.has(current.thread_id)) return false;
+          seen.add(current.thread_id);
+          const previous = result.threads[index - 1];
+          if (
+            previous &&
+            (previous.last_activity_at < current.last_activity_at ||
+              (previous.last_activity_at === current.last_activity_at &&
+                previous.thread_id >= current.thread_id))
+          )
+            return false;
+        }
+        const last = result.threads.at(-1);
+        return (
+          result.next_after === null ||
+          (last !== undefined && result.next_after === `${last.last_activity_at}:${last.thread_id}`)
+        );
+      }),
+    ),
+    Schema.Struct({
+      status: Schema.Literal("history_recent"),
+      thread_id: Uuid,
+      entries: Schema.Array(Entry).check(Schema.isMaxLength(200)),
+      snapshot_seq: Sequence,
+      through_seq: Sequence,
+      has_more: Schema.Boolean,
+      next_before_seq: Schema.NullOr(Sequence),
+    }).check(
+      Schema.makeFilter((result) => {
+        if (result.through_seq > result.snapshot_seq) return false;
+        for (let index = 0; index < result.entries.length; index++) {
+          const current = result.entries[index]!;
+          const previous = result.entries[index - 1];
+          if (current.seq > result.through_seq || (previous && previous.seq <= current.seq))
+            return false;
+        }
+        const last = result.entries.at(-1);
+        return result.has_more
+          ? last !== undefined && last.seq > 1 && result.next_before_seq === last.seq - 1
+          : result.next_before_seq === null;
+      }),
+    ),
     Schema.Struct({
       status: Schema.Literal("history"),
       thread_id: Uuid,

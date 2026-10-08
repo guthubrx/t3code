@@ -9,6 +9,169 @@ const decodeInput = Schema.decodeUnknownSync(BridgetReadInput);
 const decodeView = Schema.decodeUnknownSync(BridgetHumanView);
 
 describe("Bridget human read contract", () => {
+  const recentCursor = `1791331200:${sharedThreadId}`;
+  const recentThread = {
+    thread_id: sharedThreadId,
+    title: "Recent",
+    creator_id: threadId,
+    state: "open",
+    last_seq: 3,
+    members: [],
+    last_activity_at: 1791331200,
+  };
+  const recentEntry = (seq: number) => ({
+    seq,
+    message_id: sharedThreadId,
+    author_id: threadId,
+    author_name: "Agent",
+    created_at: 1791331200,
+    body: "  é🙂\nexact body\n",
+    notify: { mode: "none", targets: [] },
+    reply_to_seq: null,
+  });
+  const recentHistory = {
+    status: "history_recent",
+    thread_id: sharedThreadId,
+    entries: [recentEntry(3), recentEntry(2)],
+    snapshot_seq: 3,
+    through_seq: 3,
+    has_more: true,
+    next_before_seq: 1,
+  };
+  it("accepts independent recent variants and keeps their exact bodies", () => {
+    expect(
+      decodeInput({ ...base, action: "list_recent", after: recentCursor, limit: 100 }).action,
+    ).toBe("list_recent");
+    expect(
+      decodeInput({ ...base, action: "history_recent", sharedThreadId, beforeSeq: 0, toSeq: 3 })
+        .action,
+    ).toBe("history_recent");
+    expect(
+      decodeView({
+        version: 1,
+        subject: null,
+        result: {
+          status: "listed_recent",
+          threads: [recentThread],
+          next_after: recentCursor,
+        },
+      }).result.status,
+    ).toBe("listed_recent");
+    const result = decodeView({ version: 1, subject: null, result: recentHistory }).result;
+    expect(result.status === "history_recent" && result.entries[0]?.body).toBe(recentEntry(3).body);
+  });
+  it.each(["01791331200", "+1791331200", "-1", "9007199254740992", "1791331200 "])(
+    "rejects noncanonical or unsafe cursor timestamp %s",
+    (timestamp) => {
+      expect(() =>
+        decodeInput({ ...base, action: "list_recent", after: `${timestamp}:${sharedThreadId}` }),
+      ).toThrow();
+    },
+  );
+  it.each([
+    { action: "list_recent", after: `${recentCursor}:extra` },
+    { action: "list_recent", after: recentCursor.toUpperCase() },
+    { action: "list_recent", beforeSeq: 1 },
+    { action: "list", after: recentCursor },
+    { action: "history_recent", sharedThreadId, fromSeq: 1 },
+    { action: "history_recent", sharedThreadId, beforeSeq: -1 },
+    { action: "history_recent", sharedThreadId, toSeq: Number.MAX_SAFE_INTEGER + 1 },
+    { action: "history_recent", sharedThreadId, socket: "/forged" },
+  ])("rejects recent cross-action or injected options %j", (input) => {
+    expect(() => decodeInput({ ...base, ...input })).toThrow();
+  });
+  it.each([
+    { entries: [recentEntry(2), recentEntry(3)] },
+    { entries: [recentEntry(3), recentEntry(3)] },
+    { through_seq: 2 },
+    { through_seq: 4 },
+    { next_before_seq: 2 },
+    { next_before_seq: null },
+    { has_more: false },
+    { entries: [] },
+    { entries: [recentEntry(1)], next_before_seq: 0 },
+  ])("rejects incoherent recent pagination %j", (change) => {
+    expect(() =>
+      decodeView({ version: 1, subject: null, result: { ...recentHistory, ...change } }),
+    ).toThrow();
+  });
+  it("accepts terminal sequence one and an empty zero-bound page without continuation", () => {
+    for (const change of [
+      { entries: [recentEntry(1)] },
+      { entries: [], snapshot_seq: 0, through_seq: 0 },
+    ])
+      expect(
+        decodeView({
+          version: 1,
+          subject: null,
+          result: {
+            ...recentHistory,
+            ...change,
+            has_more: false,
+            next_before_seq: null,
+          },
+        }).result.status,
+      ).toBe("history_recent");
+  });
+  it("accepts an exhausted sparse history without inventing older rows", () => {
+    expect(
+      decodeView({
+        version: 1,
+        subject: null,
+        result: {
+          ...recentHistory,
+          entries: [recentEntry(5)],
+          snapshot_seq: 5,
+          through_seq: 5,
+          has_more: false,
+          next_before_seq: null,
+        },
+      }).result.status,
+    ).toBe("history_recent");
+  });
+  it("rejects missing activity, out-of-order lists and a cursor unrelated to the emitted page", () => {
+    for (const change of [
+      { threads: [{ ...recentThread, last_activity_at: undefined }] },
+      { threads: [{ ...recentThread, last_activity_at: Number.MAX_SAFE_INTEGER + 1 }] },
+      {
+        threads: [
+          recentThread,
+          { ...recentThread, thread_id: threadId, last_activity_at: 1791331201 },
+        ],
+      },
+      { threads: [recentThread, recentThread] },
+      { next_after: `1791331201:${sharedThreadId}` },
+      { threads: [] },
+    ])
+      expect(() =>
+        decodeView({
+          version: 1,
+          subject: null,
+          result: {
+            status: "listed_recent",
+            threads: [recentThread],
+            next_after: recentCursor,
+            ...change,
+          },
+        }),
+      ).toThrow();
+  });
+  it("accepts equal activity UUID ASC and rejects UUID DESC", () => {
+    const second = { ...recentThread, thread_id: threadId };
+    const result = {
+      status: "listed_recent",
+      threads: [recentThread, second],
+      next_after: `1791331200:${threadId}`,
+    };
+    expect(decodeView({ version: 1, subject: null, result }).result.status).toBe("listed_recent");
+    expect(() =>
+      decodeView({
+        version: 1,
+        subject: null,
+        result: { ...result, threads: [second, recentThread], next_after: null },
+      }),
+    ).toThrow();
+  });
   it("accepts the three bounded read actions", () => {
     expect(decodeInput({ ...base, action: "list", limit: 100 })).toMatchObject({ action: "list" });
     expect(decodeInput({ ...base, action: "show", sharedThreadId })).toMatchObject({

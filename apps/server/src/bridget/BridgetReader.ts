@@ -93,12 +93,19 @@ const make = Effect.gen(function* () {
       input.action,
       "--json",
     ];
-    if (input.action !== "list") args.push("--thread", input.sharedThreadId);
+    const isList = input.action === "list" || input.action === "list_recent";
+    if (input.action === "show" || input.action === "history" || input.action === "history_recent")
+      args.push("--thread", input.sharedThreadId);
     if (input.action !== "show" && input.limit !== undefined)
       args.push("--limit", String(input.limit));
-    if (input.action === "list" && input.after !== undefined) args.push("--after", input.after);
+    if ((input.action === "list" || input.action === "list_recent") && input.after !== undefined)
+      args.push("--after", input.after);
     if (input.action === "history") {
       if (input.fromSeq !== undefined) args.push("--from-seq", String(input.fromSeq));
+      if (input.toSeq !== undefined) args.push("--to-seq", String(input.toSeq));
+    }
+    if (input.action === "history_recent") {
+      if (input.beforeSeq !== undefined) args.push("--before-seq", String(input.beforeSeq));
       if (input.toSeq !== undefined) args.push("--to-seq", String(input.toSeq));
     }
     const output = yield* runner
@@ -142,17 +149,48 @@ const make = Effect.gen(function* () {
         subject: null,
         result: { ...view.result, detail: refusalDetails[view.result.code] },
       };
-    const expectedStatus =
-      input.action === "list" ? "listed" : input.action === "show" ? "shown" : "history";
+    const expectedStatus = {
+      list: "listed",
+      list_recent: "listed_recent",
+      show: "shown",
+      history: "history",
+      history_recent: "history_recent",
+    }[input.action];
     if (
       output.code !== 0 ||
       view.subject === null ||
       view.result.status !== expectedStatus ||
-      (input.action !== "list" &&
+      (!isList &&
+        "sharedThreadId" in input &&
         view.result.status !== "listed" &&
+        view.result.status !== "listed_recent" &&
         view.result.thread_id !== input.sharedThreadId)
     ) {
       return yield* new BridgetReadError({ code: "invalid_output" });
+    }
+    if (input.action === "history_recent" && view.result.status === "history_recent") {
+      if (
+        (input.toSeq !== undefined && view.result.snapshot_seq !== input.toSeq) ||
+        view.result.through_seq !==
+          Math.min(input.beforeSeq ?? view.result.snapshot_seq, view.result.snapshot_seq) ||
+        view.result.entries.length > (input.limit ?? 200)
+      )
+        return yield* new BridgetReadError({ code: "invalid_output" });
+    }
+    if (input.action === "list_recent" && view.result.status === "listed_recent") {
+      if (view.result.threads.length > (input.limit ?? 100))
+        return yield* new BridgetReadError({ code: "invalid_output" });
+      if (input.after !== undefined) {
+        const [timestamp, id] = input.after.split(":");
+        if (
+          view.result.threads.some(
+            (row) =>
+              row.last_activity_at > Number(timestamp) ||
+              (row.last_activity_at === Number(timestamp) && row.thread_id <= id!),
+          )
+        )
+          return yield* new BridgetReadError({ code: "invalid_output" });
+      }
     }
     return view;
   });

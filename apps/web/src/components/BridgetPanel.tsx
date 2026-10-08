@@ -1,6 +1,6 @@
 import type { BridgetHumanView, EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
-import { Copy, RefreshCw, X } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { ChevronDown, ChevronUp, Copy, RefreshCw, X } from "lucide-react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { orchestrationEnvironment } from "~/state/orchestration";
 import { useEnvironmentQuery } from "~/state/query";
@@ -9,10 +9,38 @@ import { ScrollArea } from "~/components/ui/scroll-area";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 import { cn } from "~/lib/utils";
 import { Input } from "~/components/ui/input";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 
-type Listed = Extract<BridgetHumanView["result"], { status: "listed" }>;
-type History = Extract<BridgetHumanView["result"], { status: "history" }>;
+type Listed = Extract<BridgetHumanView["result"], { status: "listed_recent" }>;
+type History = Extract<BridgetHumanView["result"], { status: "history_recent" }>;
 type Context = { environmentId: EnvironmentId; threadId: ThreadId; projectId: ProjectId };
+
+// T3's timestamp tooltips contain English ordinals; this French panel keeps its labels local.
+const shortDate = new Intl.DateTimeFormat("fr-FR", {
+  day: "2-digit",
+  month: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+});
+const exactDate = new Intl.DateTimeFormat("fr-FR", {
+  dateStyle: "full",
+  timeStyle: "long",
+});
+
+function BridgetDate({ seconds }: { seconds: number }) {
+  const date = new Date(seconds * 1000);
+  if (Number.isNaN(date.getTime())) return <span>Date indisponible</span>;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={<time dateTime={date.toISOString()} aria-label={exactDate.format(date)} />}
+      >
+        {shortDate.format(date)}
+      </TooltipTrigger>
+      <TooltipPopup>{exactDate.format(date)}</TooltipPopup>
+    </Tooltip>
+  );
+}
 
 export function BridgetPanel(props: {
   environmentId: EnvironmentId | null;
@@ -52,7 +80,7 @@ function BridgetSession(context: Context) {
       input: {
         threadId: context.threadId,
         projectId: context.projectId,
-        action: "list",
+        action: "list_recent",
         limit: 20,
         ...(after ? { after } : {}),
       },
@@ -73,7 +101,7 @@ function BridgetSession(context: Context) {
     (!query.isPending ? query.error : null) ??
     (result?.status === "error"
       ? result.detail
-      : result && result.status !== "listed"
+      : result && result.status !== "listed_recent"
         ? "Réponse Bridget incompatible."
         : null);
   const loading = query.isPending || (!error && result === null);
@@ -87,10 +115,15 @@ function BridgetSession(context: Context) {
       setLoadedEntries({});
       return;
     }
-    if (result?.status !== "listed") return;
+    if (result?.status !== "listed_recent") return;
     setThreads((current) => {
-      const ids = new Set(current.map((thread) => thread.thread_id));
-      return [...current, ...result.threads.filter((thread) => !ids.has(thread.thread_id))];
+      const byId = new Map(current.map((thread) => [thread.thread_id, thread]));
+      for (const thread of result.threads) byId.set(thread.thread_id, thread);
+      return [...byId.values()].sort(
+        (left, right) =>
+          right.last_activity_at - left.last_activity_at ||
+          (left.thread_id < right.thread_id ? -1 : left.thread_id > right.thread_id ? 1 : 0),
+      );
     });
   }, [error, result]);
   const needle = search.trim().toLocaleLowerCase();
@@ -111,7 +144,10 @@ function BridgetSession(context: Context) {
   return (
     <div className="flex min-h-0 flex-1 flex-col" aria-label="Fils Bridget">
       <div className="flex items-center justify-between gap-2 border-b px-3 py-2">
-        <span className="text-sm font-medium">Fils partagés</span>
+        <div>
+          <span className="text-sm font-medium">Fils partagés</span>
+          <p className="text-xs text-muted-foreground">Plus récents d’abord</p>
+        </div>
         <Button
           variant="ghost"
           size="icon-sm"
@@ -127,13 +163,14 @@ function BridgetSession(context: Context) {
           <RefreshCw />
         </Button>
       </div>
-      <div className="flex flex-col gap-1 px-3 pt-3">
+      <div className="flex flex-col gap-1 px-3 pt-2">
         <div className="flex items-center gap-1">
           <Input
             type="search"
             size="compact"
             aria-label="Rechercher dans les données chargées"
             placeholder="Rechercher…"
+            aria-description="Recherche locale : titres, membres, auteurs et messages chargés."
             value={search}
             onChange={(event) => setSearch(event.currentTarget.value)}
           />
@@ -148,12 +185,12 @@ function BridgetSession(context: Context) {
             </Button>
           ) : null}
         </div>
-        <p className="text-xs text-muted-foreground">
+        <p className="sr-only">
           Recherche locale dans les données chargées : titres, membres, auteurs et messages.
         </p>
       </div>
       <ScrollArea className={cn("min-h-0", selectedId ? "max-h-44 shrink-0" : "flex-1")}>
-        <div className="flex flex-col gap-1 p-3">
+        <div className="flex flex-col gap-0.5 px-2 py-2">
           {error ? (
             <p className="text-sm text-muted-foreground" role="alert">
               {error}
@@ -182,26 +219,32 @@ function BridgetSession(context: Context) {
                   onClick={() => setSelectedId(thread.thread_id)}
                   aria-pressed={selectedId === thread.thread_id}
                   className={cn(
-                    "flex cursor-pointer flex-col gap-1 rounded-md px-2 py-2 text-left hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    "flex min-w-0 cursor-pointer flex-col gap-1 rounded-md px-2 py-2 text-left hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                     selectedId === thread.thread_id && "bg-accent text-foreground",
                   )}
                   aria-label={`Ouvrir ${thread.title}`}
                 >
-                  <span className="truncate text-sm">{thread.title}</span>
-                  <span className="text-xs text-muted-foreground">
+                  <span className="flex w-full min-w-0 items-baseline justify-between gap-3">
+                    <span className="truncate text-sm font-medium">{thread.title}</span>
+                    <span className="shrink-0 text-2xs text-muted-foreground">
+                      {thread.last_seq === 0 ? "Créé · " : null}
+                      <BridgetDate seconds={thread.last_activity_at} />
+                    </span>
+                  </span>
+                  <span className="w-full truncate text-xs text-muted-foreground">
                     {thread.members.map((member) => member.name ?? member.agent_id).join(" · ")}
                     {thread.state === "closed" ? " · Fermé" : ""}
                   </span>
                 </button>
               ))}
-              {result?.status === "listed" && result.next_after ? (
+              {result?.status === "listed_recent" && result.next_after ? (
                 <Button
                   size="sm"
                   variant="ghost"
                   disabled={query.isPending}
                   onClick={() => setAfter(result.next_after!)}
                 >
-                  Fils suivants
+                  Autres fils
                 </Button>
               ) : null}
             </>
@@ -235,7 +278,7 @@ function BridgetThread({
   onLoaded: (id: string, entries: History["entries"]) => void;
   onError: (detail: string) => void;
 }) {
-  const [range, setRange] = useState<{ fromSeq: number; toSeq?: number }>({ fromSeq: 1 });
+  const [range, setRange] = useState<{ beforeSeq?: number; toSeq?: number }>({});
   const [history, setHistory] = useState<History | null>(null);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const shown = useEnvironmentQuery(
@@ -255,7 +298,7 @@ function BridgetThread({
       input: {
         threadId: context.threadId,
         projectId: context.projectId,
-        action: "history",
+        action: "history_recent",
         sharedThreadId,
         limit: 50,
         ...range,
@@ -282,7 +325,7 @@ function BridgetThread({
       (shownResult.status !== "shown" || shownResult.thread_id !== sharedThreadId)) ||
     (page &&
       page.status !== "error" &&
-      (page.status !== "history" ||
+      (page.status !== "history_recent" ||
         page.thread_id !== sharedThreadId ||
         (range.toSeq !== undefined && page.snapshot_seq !== range.toSeq)));
   const error =
@@ -301,7 +344,7 @@ function BridgetThread({
     }
   }, [error, onError]);
   useEffect(() => {
-    if (error || page?.status !== "history") return;
+    if (error || page?.status !== "history_recent") return;
     setHistory((current) => {
       const sequences = new Set(current?.entries.map((entry) => entry.seq));
       return {
@@ -328,20 +371,26 @@ function BridgetThread({
     : entries;
   return (
     <div className="flex min-h-0 flex-1 flex-col border-t" aria-label="Historique du fil Bridget">
-      <div className="flex flex-col gap-1 px-3 py-3">
+      <div className="flex min-w-0 flex-col gap-1 border-b border-border/60 px-3 py-3">
         {detail ? (
           <>
             <h2 className="text-sm font-medium break-words">{detail.title}</h2>
-            <p className="text-xs text-muted-foreground">
+            <p className="truncate text-xs text-muted-foreground">
               {detail.members.map((member) => member.name ?? member.agent_id).join(" · ")}
             </p>
-            <p className="text-xs text-muted-foreground">
-              {detail.state === "closed" ? "Fermé" : "Ouvert"} ·{" "}
-              {new Date(detail.created_at * 1000).toLocaleString()}
-              {detail.closed_at !== null
-                ? ` · Fermé le ${new Date(detail.closed_at * 1000).toLocaleString()}`
-                : ""}
-            </p>
+            <details className="text-xs text-muted-foreground">
+              <summary className="cursor-pointer">Détails du fil</summary>
+              <p className="pt-1">
+                {detail.state === "closed" ? "Fermé" : "Ouvert"} · Créé le{" "}
+                <BridgetDate seconds={detail.created_at} />
+                {detail.closed_at !== null ? (
+                  <>
+                    {" "}
+                    · Fermé le <BridgetDate seconds={detail.closed_at} />
+                  </>
+                ) : null}
+              </p>
+            </details>
           </>
         ) : (
           <p className="text-sm text-muted-foreground" role="status">
@@ -350,56 +399,9 @@ function BridgetThread({
         )}
       </div>
       <ScrollArea className="min-h-0 flex-1">
-        <div className="flex flex-col gap-4 px-3 pb-4">
+        <div className="flex min-w-0 flex-col px-3 pb-4">
           {visibleEntries.map((entry) => (
-            <article
-              key={entry.seq}
-              aria-label={`Message ${entry.seq}`}
-              className="flex flex-col gap-2"
-            >
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0 text-xs text-muted-foreground">
-                  <span className="text-foreground">{entry.author_name ?? entry.author_id}</span> ·{" "}
-                  {new Date(entry.created_at * 1000).toLocaleString()}
-                  <span className="ml-2">
-                    {entry.kind
-                      ? {
-                          history: "History",
-                          action: "Action",
-                          blocker: "Blocker",
-                          decision: "Decision",
-                        }[entry.kind]
-                      : "Message"}{" "}
-                    · #{entry.seq}
-                  </span>
-                  {entry.supersedes_seq != null ? (
-                    <span> · Remplace #{entry.supersedes_seq}</span>
-                  ) : null}
-                  {entry.superseded_by_seq != null ? (
-                    <span> · Remplacé par #{entry.superseded_by_seq}</span>
-                  ) : null}
-                </div>
-                <Button
-                  size="icon-xs"
-                  variant="ghost"
-                  aria-label={`Copier le message ${entry.seq}`}
-                  onClick={() => {
-                    void writeTextToClipboard(entry.body, "message Bridget").then(
-                      (copied) =>
-                        setCopyStatus(
-                          copied ? `Message ${entry.seq} copié.` : "Ce message est vide.",
-                        ),
-                      () => setCopyStatus("Copie indisponible."),
-                    );
-                  }}
-                >
-                  <Copy />
-                </Button>
-              </div>
-              <div data-bridget-body className="whitespace-pre-wrap break-words text-sm">
-                {entry.body}
-              </div>
-            </article>
+            <BridgetMessage key={entry.seq} entry={entry} onCopyStatus={setCopyStatus} />
           ))}
           {query.isPending ? (
             <p className="text-sm text-muted-foreground" role="status">
@@ -416,16 +418,16 @@ function BridgetThread({
               Aucun résultat dans les messages chargés.
             </p>
           ) : null}
-          {history?.has_more && history.next_from_seq !== null ? (
+          {history?.has_more && history.next_before_seq !== null ? (
             <Button
               size="sm"
               variant="ghost"
               disabled={query.isPending}
               onClick={() =>
-                setRange({ fromSeq: history.next_from_seq!, toSeq: history.snapshot_seq })
+                setRange({ beforeSeq: history.next_before_seq!, toSeq: history.snapshot_seq })
               }
             >
-              Page suivante
+              Messages plus anciens
             </Button>
           ) : null}
           {copyStatus ? (
@@ -436,5 +438,112 @@ function BridgetThread({
         </div>
       </ScrollArea>
     </div>
+  );
+}
+
+function BridgetMessage({
+  entry,
+  onCopyStatus,
+}: {
+  entry: History["entries"][number];
+  onCopyStatus: (status: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [overflows, setOverflows] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  const copyRef = useRef<HTMLButtonElement>(null);
+  const bodyId = useId();
+  useEffect(() => {
+    const body = bodyRef.current;
+    if (!body || expanded || entry.body.length === 0) return;
+    const measure = () => {
+      const overflow = body.scrollHeight > body.clientHeight;
+      if (
+        !overflow &&
+        toggleRef.current !== null &&
+        body.ownerDocument?.activeElement === toggleRef.current
+      ) {
+        copyRef.current?.focus({ preventScroll: true });
+      }
+      setOverflows(overflow);
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, [expanded, entry.body]);
+  const kind = entry.kind
+    ? { history: "Historique", action: "Action", blocker: "Blocage", decision: "Décision" }[
+        entry.kind
+      ]
+    : "Message";
+  return (
+    <article
+      aria-label={`Message ${entry.seq}`}
+      className="flex min-w-0 flex-col gap-2 border-b border-border/60 py-3 last:border-b-0"
+    >
+      <div className="flex min-w-0 items-start justify-between gap-2">
+        <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <span className="min-w-0 break-words text-xs font-semibold text-foreground">
+            {entry.author_name ?? entry.author_id}
+          </span>
+          <span className="text-2xs text-muted-foreground">
+            <BridgetDate seconds={entry.created_at} />
+          </span>
+        </div>
+        <Button
+          ref={copyRef}
+          size="icon-xs"
+          variant="ghost-muted"
+          aria-label={`Copier le message ${entry.seq}`}
+          onClick={() => {
+            void writeTextToClipboard(entry.body, "message Bridget").then(
+              (copied) =>
+                onCopyStatus(copied ? `Message ${entry.seq} copié.` : "Ce message est vide."),
+              () => onCopyStatus("Copie indisponible."),
+            );
+          }}
+        >
+          <Copy />
+        </Button>
+      </div>
+      <div
+        ref={bodyRef}
+        id={bodyId}
+        data-bridget-body
+        className={cn(
+          "whitespace-pre-wrap text-sm leading-relaxed [overflow-wrap:anywhere]",
+          !expanded && "line-clamp-4",
+        )}
+      >
+        {entry.body}
+      </div>
+      {overflows || expanded ? (
+        <div>
+          <Button
+            ref={toggleRef}
+            variant="ghost-muted"
+            size="micro"
+            aria-label={`${expanded ? "Replier" : "Déplier"} le message ${entry.seq}`}
+            aria-expanded={expanded}
+            aria-controls={bodyId}
+            onClick={() => setExpanded((value) => !value)}
+          >
+            {expanded ? <ChevronUp /> : <ChevronDown />}
+            {expanded ? "Replier" : "Déplier"}
+          </Button>
+        </div>
+      ) : null}
+      <details className="min-w-0 text-2xs text-muted-foreground">
+        <summary className="cursor-pointer">Détails</summary>
+        <p className="pt-1">
+          {kind} · Message #{entry.seq}
+          {entry.supersedes_seq != null ? ` · Remplace #${entry.supersedes_seq}` : ""}
+          {entry.superseded_by_seq != null ? ` · Remplacé par #${entry.superseded_by_seq}` : ""}
+        </p>
+      </details>
+    </article>
   );
 }

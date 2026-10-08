@@ -102,6 +102,136 @@ const harness = Effect.fn("BridgetReaderTest.harness")(function* (
 });
 
 describe("BridgetReader", () => {
+  it.effect("rejects recent history bounds unrelated to the requested immutable window", () =>
+    Effect.gen(function* () {
+      for (const result of [
+        { snapshot_seq: 8, through_seq: 5 },
+        { snapshot_seq: 9, through_seq: 2 },
+        { snapshot_seq: 7, through_seq: 2 },
+      ]) {
+        const { reader } = yield* harness({
+          result: output(
+            encodeJson({
+              ...envelope,
+              result: {
+                status: "history_recent",
+                thread_id: sharedThreadId,
+                entries: [],
+                has_more: false,
+                next_before_seq: null,
+                ...result,
+              },
+            }),
+          ),
+        });
+        expect(
+          (yield* reader
+            .read({ ...input, action: "history_recent", sharedThreadId, beforeSeq: 2, toSeq: 8 })
+            .pipe(Effect.flip)).code,
+        ).toBe("invalid_output");
+      }
+    }),
+  );
+  it.effect("rejects recent list results that repeat the requested cursor position", () =>
+    Effect.gen(function* () {
+      const after = `1791331200:${sharedThreadId}`;
+      const { reader } = yield* harness({
+        result: output(
+          encodeJson({
+            ...envelope,
+            result: {
+              status: "listed_recent",
+              threads: [
+                {
+                  thread_id: sharedThreadId,
+                  title: "Recent",
+                  creator_id: threadId,
+                  state: "open",
+                  last_seq: 0,
+                  members: [],
+                  last_activity_at: 1791331200,
+                },
+              ],
+              next_after: null,
+            },
+          }),
+        ),
+      });
+      expect(
+        (yield* reader.read({ ...input, action: "list_recent", after }).pipe(Effect.flip)).code,
+      ).toBe("invalid_output");
+    }),
+  );
+  it.effect("passes recent list cursor as one fixed argument and refuses old listed output", () =>
+    Effect.gen(function* () {
+      const after = `1791331200:${sharedThreadId}`;
+      const recentEnvelope = {
+        ...envelope,
+        result: { status: "listed_recent", threads: [], next_after: null },
+      };
+      const { reader, calls } = yield* harness({ result: output(encodeJson(recentEnvelope)) });
+      expect(yield* reader.read({ ...input, action: "list_recent", after, limit: 20 })).toEqual(
+        recentEnvelope,
+      );
+      expect(calls[0]?.args.slice(-4)).toEqual(["--limit", "20", "--after", after]);
+      expect(calls[0]?.args).toContain("list_recent");
+      const legacy = yield* harness();
+      expect(
+        (yield* legacy.reader.read({ ...input, action: "list_recent" }).pipe(Effect.flip)).code,
+      ).toBe("invalid_output");
+    }),
+  );
+  it.effect(
+    "passes descending bounds without ASC flags and refuses a mismatched shared thread",
+    () =>
+      Effect.gen(function* () {
+        const recentEnvelope = {
+          ...envelope,
+          result: {
+            status: "history_recent",
+            thread_id: sharedThreadId,
+            entries: [],
+            snapshot_seq: 8,
+            through_seq: 5,
+            has_more: false,
+            next_before_seq: null,
+          },
+        };
+        const { reader, calls } = yield* harness({ result: output(encodeJson(recentEnvelope)) });
+        expect(
+          yield* reader.read({
+            ...input,
+            action: "history_recent",
+            sharedThreadId,
+            limit: 20,
+            beforeSeq: 5,
+            toSeq: 8,
+          }),
+        ).toEqual(recentEnvelope);
+        expect(calls[0]?.args.slice(-6)).toEqual([
+          "--limit",
+          "20",
+          "--before-seq",
+          "5",
+          "--to-seq",
+          "8",
+        ]);
+        expect(calls[0]?.args).not.toContain("--from-seq");
+        const forged = yield* harness({
+          result: output(
+            encodeJson({
+              ...recentEnvelope,
+              result: { ...recentEnvelope.result, thread_id: threadId },
+            }),
+          ),
+        });
+        expect(
+          (yield* forged.reader
+            .read({ ...input, action: "history_recent", sharedThreadId })
+            .pipe(Effect.flip)).code,
+        ).toBe("invalid_output");
+      }),
+  );
   it.effect("uses authoritative project root and fixed argv with bounded execution", () =>
     Effect.gen(function* () {
       const { reader, calls } = yield* harness();
