@@ -18,9 +18,9 @@ import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as Schema from "effect/Schema";
-import { RpcClientError } from "effect/unstable/rpc";
+import { RpcClientError } from "effect/rpc";
 import * as TestClock from "effect/testing/TestClock";
-import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 import {
   AVAILABLE_CONNECTION_STATE,
   PrimaryConnectionTarget,

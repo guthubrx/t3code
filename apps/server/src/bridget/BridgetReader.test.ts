@@ -5,7 +5,7 @@ import {
   ThreadId,
   BridgetReadError,
   type OrchestrationProjectShell,
-  type OrchestrationThreadShell,
+  type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { resolveCommandPath } from "@t3tools/shared/shell";
@@ -20,10 +20,11 @@ import * as Option from "effect/Option";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
-import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
-import type * as ChildProcess from "effect/unstable/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import type * as ChildProcess from "effect/process/ChildProcess";
 import * as ProcessRunner from "../processRunner.ts";
-import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ProjectionStoreV2 } from "../orchestration-v2/ProjectionStore.ts";
+import { ProjectStoreV2 } from "../orchestration-v2/ProjectStore.ts";
 import * as BridgetReader from "./BridgetReader.ts";
 
 const threadId = ThreadId.make("8b09a229-dc14-4b38-91b5-2bf0e2a294ac");
@@ -88,17 +89,19 @@ const harness = Effect.fn("BridgetReaderTest.harness")(function* (
         }),
     ),
   );
-  const snapshots = ProjectionSnapshotQuery.of({
-    getThreadShellById: () =>
+  const snapshots = ProjectionStoreV2.of({
+    getThreadShell: () =>
       Effect.succeed(
         options.missingThread
-          ? Option.none()
-          : Option.some({
+          ? null
+          : ({
               id: threadId,
               projectId: options.differentProject ? ProjectId.make("another-project") : projectId,
-            } as OrchestrationThreadShell),
+            } as OrchestrationV2ThreadShell),
       ),
-    getProjectShellById: () =>
+  } as unknown as ProjectionStoreV2["Service"]);
+  const projects = ProjectStoreV2.of({
+    getShell: () =>
       Effect.succeed(
         options.missingProject
           ? Option.none()
@@ -107,7 +110,7 @@ const harness = Effect.fn("BridgetReaderTest.harness")(function* (
               workspaceRoot: "/project with spaces/$(forged); é",
             } as OrchestrationProjectShell),
       ),
-  } as unknown as ProjectionSnapshotQuery["Service"]);
+  } as unknown as ProjectStoreV2["Service"]);
   const runner = ProcessRunner.ProcessRunner.of({
     run: (request) => {
       calls.push(request);
@@ -119,7 +122,8 @@ const harness = Effect.fn("BridgetReaderTest.harness")(function* (
   const reader = yield* BridgetReader.BridgetReader.pipe(
     Effect.provide(
       BridgetReader.layer.pipe(
-        Layer.provide(Layer.succeed(ProjectionSnapshotQuery, snapshots)),
+        Layer.provide(Layer.succeed(ProjectionStoreV2, snapshots)),
+        Layer.provide(Layer.succeed(ProjectStoreV2, projects)),
         Layer.provide(Layer.succeed(ProcessRunner.ProcessRunner, runner)),
         Layer.provide(
           Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, options.watchSpawner ?? spawner),
@@ -603,24 +607,16 @@ describe("BridgetReader", () => {
       ]);
     }),
   );
-  for (const scenario of [
-    { missingThread: true },
-    { missingProject: true },
-    { differentProject: true },
-  ]) {
-    it.effect(
-      `rejects missing or mismatched environment-local context ${JSON.stringify(scenario)} before spawn`,
-      () =>
-        Effect.gen(function* () {
-          const { reader, calls } = yield* harness(scenario);
-          const error = yield* reader.read(input).pipe(Effect.flip);
-          expect(error.code).toBe(
-            scenario.differentProject ? "project_mismatch" : "context_missing",
-          );
-          expect(calls).toHaveLength(0);
-        }),
-    );
-  }
+  it.effect.each([{ missingThread: true }, { missingProject: true }, { differentProject: true }])(
+    "rejects missing or mismatched environment-local context %j before spawn",
+    (scenario) =>
+      Effect.gen(function* () {
+        const { reader, calls } = yield* harness(scenario);
+        const error = yield* reader.read(input).pipe(Effect.flip);
+        expect(error.code).toBe(scenario.differentProject ? "project_mismatch" : "context_missing");
+        expect(calls).toHaveLength(0);
+      }),
+  );
   it.effect("rejects injected authority even through a direct service call", () =>
     Effect.gen(function* () {
       const { reader, calls } = yield* harness();
@@ -653,7 +649,7 @@ describe("BridgetReader", () => {
       expect(encodeJson(view)).not.toContain("private diagnostic");
     }),
   );
-  for (const [name, result, code] of [
+  it.effect.each([
     ["JSON", output("invalid json"), "invalid_output"],
     ["version", output(encodeJson({ ...envelope, version: 2 })), "unsupported_version"],
     ["UTF-8", { ...output(), stdoutInvalidUtf8: true }, "invalid_output"],
@@ -661,17 +657,15 @@ describe("BridgetReader", () => {
     ["oversized projection", output(" ".repeat(128 * 1024 + 1)), "output_limit"],
     ["process exit", output("", 1), "command_failed"],
     ["absent daemon", output("", 3), "unavailable"],
-  ] as const) {
-    it.effect(`refuses ${name} and sanitizes diagnostics`, () =>
-      Effect.gen(function* () {
-        const { reader } = yield* harness({ result });
-        const error = yield* reader.read(input).pipe(Effect.flip);
-        expect(error.code).toBe(code);
-        expect(error.message).not.toContain("private diagnostic");
-        expect(encodeJson(error)).not.toContain("private diagnostic");
-      }),
-    );
-  }
+  ] as const)("refuses %s and sanitizes diagnostics", ([_name, result, code]) =>
+    Effect.gen(function* () {
+      const { reader } = yield* harness({ result });
+      const error = yield* reader.read(input).pipe(Effect.flip);
+      expect(error.code).toBe(code);
+      expect(error.message).not.toContain("private diagnostic");
+      expect(encodeJson(error)).not.toContain("private diagnostic");
+    }),
+  );
   it.effect("maps timeout and process output limit to distinct fixed errors", () =>
     Effect.gen(function* () {
       for (const [error, code] of [
@@ -727,42 +721,40 @@ describe("BridgetReader", () => {
       }
     }),
   );
-  for (const source of ["configured", "user", "PATH"] as const) {
-    it.effect(
-      `rejects Windows PATHEXT cmd resolution from ${source} before starting a process`,
-      () =>
-        Effect.gen(function* () {
-          const fs = yield* FileSystem.FileSystem;
-          const path = yield* Path.Path;
-          const home = yield* fs.makeTempDirectoryScoped();
-          const directory = source === "user" ? path.join(home, ".local", "bin") : home;
-          yield* fs.makeDirectory(directory, { recursive: true });
-          const command = path.join(directory, "bridget");
-          yield* fs.symlink("/usr/bin/true", `${command}.CMD`);
-          const environment = {
-            PATHEXT: ".CMD",
-            ...(source === "configured" ? { T3CODE_BRIDGET_EXECUTABLE: command } : {}),
-            ...(source === "user" ? { HOME: home } : {}),
-            ...(source === "PATH" ? { PATH: home } : {}),
-          };
-          expect(
-            yield* resolveCommandPath(source === "PATH" ? "bridget" : command, {
-              env: environment,
-            }),
-          ).toBe(`${command}.CMD`);
-          const { reader, calls } = yield* harness({ environment });
-          const outcome = yield* reader.read(input).pipe(
-            Effect.match({
-              onFailure: (error) => error.code,
-              onSuccess: () => "success",
-            }),
-          );
-          expect(calls).toHaveLength(0);
-          expect(outcome).toBe("unavailable");
-        }).pipe(
-          Effect.provideService(HostProcessPlatform, "win32"),
-          Effect.provide(NodeServices.layer),
-        ),
-    );
-  }
+  it.effect.each(["configured", "user", "PATH"] as const)(
+    "rejects Windows PATHEXT cmd resolution from %s before starting a process",
+    (source) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const home = yield* fs.makeTempDirectoryScoped();
+        const directory = source === "user" ? path.join(home, ".local", "bin") : home;
+        yield* fs.makeDirectory(directory, { recursive: true });
+        const command = path.join(directory, "bridget");
+        yield* fs.symlink("/usr/bin/true", `${command}.CMD`);
+        const environment = {
+          PATHEXT: ".CMD",
+          ...(source === "configured" ? { T3CODE_BRIDGET_EXECUTABLE: command } : {}),
+          ...(source === "user" ? { HOME: home } : {}),
+          ...(source === "PATH" ? { PATH: home } : {}),
+        };
+        expect(
+          yield* resolveCommandPath(source === "PATH" ? "bridget" : command, {
+            env: environment,
+          }),
+        ).toBe(`${command}.CMD`);
+        const { reader, calls } = yield* harness({ environment });
+        const outcome = yield* reader.read(input).pipe(
+          Effect.match({
+            onFailure: (error) => error.code,
+            onSuccess: () => "success",
+          }),
+        );
+        expect(calls).toHaveLength(0);
+        expect(outcome).toBe("unavailable");
+      }).pipe(
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.provide(NodeServices.layer),
+      ),
+  );
 });

@@ -72,8 +72,15 @@ export function normalizeProviderAccentColor(value: string | undefined): string 
 
 /** Instance icons use their accent color directly instead of an initials badge. */
 export function shouldShowInstanceBadge(
-  entry: { readonly driverKind: ProviderDriverKind; readonly accentColor?: string | undefined },
-  entries: Iterable<{ readonly driverKind: ProviderDriverKind }>,
+  entry: {
+    readonly driverKind: ProviderDriverKind;
+    readonly accentColor?: string | undefined;
+    readonly acpRegistryAgentId?: string | undefined;
+  },
+  entries: Iterable<{
+    readonly driverKind: ProviderDriverKind;
+    readonly acpRegistryAgentId?: string | undefined;
+  }>,
 ): boolean {
   void entry;
   void entries;

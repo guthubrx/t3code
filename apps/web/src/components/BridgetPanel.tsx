@@ -3,7 +3,7 @@ import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
 import type { BridgetReadInput } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult } from "effect/reactivity";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { environmentCatalog } from "~/connection/catalog";
 import { useRightPanelStore } from "~/rightPanelStore";

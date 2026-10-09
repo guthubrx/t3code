@@ -5,6 +5,7 @@ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { act, type ComponentProps } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
+import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { selectThreadRightPanelState, useRightPanelStore } from "~/rightPanelStore";
 
@@ -104,6 +105,15 @@ function tabsElement(
   return (
     <RightPanelTabs
       mode="inline"
+      keybindings={DEFAULT_RESOLVED_KEYBINDINGS}
+      getShortcutContext={() => ({
+        terminalFocus: false,
+        terminalOpen: false,
+        previewFocus: false,
+        previewOpen: false,
+        isWeb: true,
+        isDesktop: false,
+      })}
       surfaces={second ? [previewSurface, secondSurface] : [previewSurface]}
       environmentId={null}
       activeSurfaceId={previewSurface.id}
@@ -128,17 +138,14 @@ function tabsElement(
       onAddPullRequests={() => undefined}
       onAddDiff={() => undefined}
       onAddFiles={() => undefined}
-      onAddAgents={() => undefined}
       onAddBridget={() => undefined}
       onAddDevice={() => undefined}
-      liveAgentCount={0}
       browserAvailable
       terminalAvailable={false}
       diffAvailable={false}
       filesAvailable={false}
       pullRequestAvailable={false}
       pullRequestsAvailable={false}
-      agentsAvailable={false}
       bridgetAvailable={false}
       deviceAvailable={false}
       {...overrides}

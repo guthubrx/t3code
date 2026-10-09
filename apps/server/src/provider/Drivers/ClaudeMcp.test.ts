@@ -149,74 +149,70 @@ describe("SPEC147 Claude MCP policy", () => {
     ),
   );
 
-  for (const status of ["connected", "failed", "disabled", "pending", "needs-auth"] as const) {
-    for (const scope of ["user", "project", "plugin", "managed"]) {
-      it.effect(`keeps homonymous ${scope}/${status} server`, () =>
-        Effect.scoped(
-          Effect.gen(function* () {
-            const f = yield* fixture();
-            f.setStatuses([{ name: "bridget", status, scope }]);
-            assert.equal((yield* prepareClaudeMcp(f.input)).code, "user_server");
-            assert.equal(f.calls.length, 0);
-          }).pipe(Effect.provide(NodeServices.layer)),
-        ),
-      );
-    }
-  }
+  it.effect.each(
+    (["connected", "failed", "disabled", "pending", "needs-auth"] as const).flatMap((status) =>
+      ["user", "project", "plugin", "managed"].map((scope) => ({ status, scope })),
+    ),
+  )("keeps homonymous $scope/$status server", ({ status, scope }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        f.setStatuses([{ name: "bridget", status, scope }]);
+        assert.equal((yield* prepareClaudeMcp(f.input)).code, "user_server");
+        assert.equal(f.calls.length, 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
 
-  for (const flag of ["strict-mcp-config", "mcp-config"]) {
-    it.effect(`respects explicit ${flag}`, () =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          const f = yield* fixture();
-          assert.equal(
-            (yield* prepareClaudeMcp({ ...f.input, extraArgs: { [flag]: null } })).code,
-            "explicit_config",
-          );
-          assert.equal(f.calls.length, 0);
-        }).pipe(Effect.provide(NodeServices.layer)),
-      ),
-    );
-  }
-  for (const key of ["BRIDGET_AGENT_ID_FILE", "BRIDGET_AGENT_INSTANCE_ID"]) {
-    for (const value of ["foreign-identity", "   "]) {
-      it.effect(`refuses inherited ${key}/${value.length}`, () =>
-        Effect.scoped(
-          Effect.gen(function* () {
-            const f = yield* fixture();
-            const environment: NodeJS.ProcessEnv = { ...f.input.environment, [key]: value };
-            assert.equal(
-              (yield* prepareClaudeMcp({ ...f.input, environment })).code,
-              "inherited_identity",
-            );
-            assert.equal(environment[key], value);
-            assert.equal(f.calls.length, 0);
-          }).pipe(Effect.provide(NodeServices.layer)),
-        ),
-      );
-    }
-  }
-  for (const contents of [
+  it.effect.each(["strict-mcp-config", "mcp-config"])("respects explicit %s", (flag) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        assert.equal(
+          (yield* prepareClaudeMcp({ ...f.input, extraArgs: { [flag]: null } })).code,
+          "explicit_config",
+        );
+        assert.equal(f.calls.length, 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  it.effect.each(
+    ["BRIDGET_AGENT_ID_FILE", "BRIDGET_AGENT_INSTANCE_ID"].flatMap((key) =>
+      ["foreign-identity", "   "].map((value) => ({ key, value })),
+    ),
+  )("refuses inherited $key/$value", ({ key, value }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const environment: NodeJS.ProcessEnv = { ...f.input.environment, [key]: value };
+        assert.equal(
+          (yield* prepareClaudeMcp({ ...f.input, environment })).code,
+          "inherited_identity",
+        );
+        assert.equal(environment[key], value);
+        assert.equal(f.calls.length, 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  it.effect.each([
     '{"disabledMcpjsonServers":["bridget"]}',
     '{"disabledMcpServers":["bridget"]}',
     '{"disabledMcpServers":false}',
     "{broken",
-  ]) {
-    it.effect(`fails closed on disabled or malformed metadata ${contents.length}`, () =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          const f = yield* fixture();
-          yield* f.fs.writeFileString(f.path.join(f.home, "settings.json"), contents);
-          const result = yield* prepareClaudeMcp(f.input);
-          assert.equal(
-            result.code,
-            contents.includes('["bridget"]') ? "disabled" : "metadata_unavailable",
-          );
-          assert.equal(f.calls.length, 0);
-        }).pipe(Effect.provide(NodeServices.layer)),
-      ),
-    );
-  }
+  ])("fails closed on disabled or malformed metadata %s", (contents) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.fs.writeFileString(f.path.join(f.home, "settings.json"), contents);
+        const result = yield* prepareClaudeMcp(f.input);
+        assert.equal(
+          result.code,
+          contents.includes('["bridget"]') ? "disabled" : "metadata_unavailable",
+        );
+        assert.equal(f.calls.length, 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
   it.effect("does not bypass a profile's local .claude.json opt-out", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -263,22 +259,20 @@ describe("SPEC147 Claude MCP policy", () => {
       }).pipe(Effect.provide(NodeServices.layer)),
     ),
   );
-  for (const contents of [
+  it.effect.each([
     '{"deniedMcpServers":[{"serverName":"bridget"}]}',
     '{"allowedMcpServers":[]}',
     '{"allowedMcpServers":[{"serverName":"other"}]}',
-  ]) {
-    it.effect(`respects explicit MCP permission metadata ${contents.length}`, () =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          const f = yield* fixture();
-          yield* f.fs.writeFileString(f.path.join(f.home, "settings.json"), contents);
-          assert.equal((yield* prepareClaudeMcp(f.input)).code, "disabled");
-          assert.equal(f.calls.length, 0);
-        }).pipe(Effect.provide(NodeServices.layer)),
-      ),
-    );
-  }
+  ])("respects explicit MCP permission metadata %s", (contents) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.fs.writeFileString(f.path.join(f.home, "settings.json"), contents);
+        assert.equal((yield* prepareClaudeMcp(f.input)).code, "disabled");
+        assert.equal(f.calls.length, 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
   it.effect("fails closed on settings read refusal, not only malformed JSON", () =>
     Effect.scoped(
       Effect.gen(function* () {

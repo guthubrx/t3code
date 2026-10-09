@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Cause from "effect/Cause";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult } from "effect/reactivity";
 import { EnvironmentId, ThreadId, type ScopedThreadRef } from "@t3tools/contracts";
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
@@ -11,26 +11,7 @@ import {
   type SidebarThreadDrop,
   type SidebarSection,
 } from "./Sidebar.logic";
-import type { SidebarThreadSummary } from "../types";
-
-function makeThreadFixture(ref: { id: ThreadId; environmentId: EnvironmentId }) {
-  return {
-    ...ref,
-    latestTurn: null,
-    session: null,
-    hasPendingApprovals: false,
-    hasPendingUserInput: false,
-    archivedAt: null as string | null,
-    pinnedAt: null as string | null,
-    pinOrderKey: null as string | null,
-    activeOrderKey: null as string | null,
-    snoozedAt: null as string | null,
-    snoozedUntil: null as string | null,
-    settledAt: null as string | null,
-    unsettledAt: null as string | null,
-    settledOverride: null as SidebarThreadSummary["settledOverride"],
-  };
-}
+import { makeThreadFixture } from "../test-fixtures";
 
 const now = "2026-10-03T05:00:00.000Z";
 const success = AsyncResult.success(undefined);

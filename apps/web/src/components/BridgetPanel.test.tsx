@@ -16,7 +16,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { Atom, AtomRegistry, AsyncResult } from "effect/unstable/reactivity";
+import { Atom, AtomRegistry, AsyncResult } from "effect/reactivity";
 import { act, cloneElement, useSyncExternalStore, type ReactElement, type ReactNode } from "react";
 import { create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -740,7 +740,7 @@ describe("Bridget native reader", () => {
               },
             } as unknown as RpcSession),
           );
-          const supervisor = EnvironmentSupervisor.of({
+          const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
             target: new PrimaryConnectionTarget({
               environmentId: context.environmentId,
               label: "Native burst",
@@ -757,17 +757,20 @@ describe("Bridget native reader", () => {
             disconnect: Effect.void,
             retryNow: Effect.void,
           });
-          const run: EnvironmentRegistry["Service"]["run"] = (_id, effect) =>
-            Effect.provideService(effect, EnvironmentSupervisor, supervisor);
-          const followStream: EnvironmentRegistry["Service"]["followStream"] = (_id, stream) =>
-            Stream.provideService(stream, EnvironmentSupervisor, supervisor);
-          const service = EnvironmentRegistry.of({
+          const run: EnvironmentRegistry.EnvironmentRegistry["Service"]["run"] = (_id, effect) =>
+            Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+          const followStream: EnvironmentRegistry.EnvironmentRegistry["Service"]["followStream"] = (
+            _id,
+            stream,
+          ) =>
+            Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+          const service = EnvironmentRegistry.EnvironmentRegistry.of({
             run,
             followStream,
             stateChanges: () => SubscriptionRef.changes(supervisor.state),
-          } as unknown as EnvironmentRegistry["Service"]);
+          } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
           const atoms = createOrchestrationEnvironmentAtoms(
-            Atom.runtime(Layer.succeed(EnvironmentRegistry, service)),
+            Atom.runtime(Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, service)),
           );
           nativeRegistry = AtomRegistry.make();
           nativeWatch = (target) => atoms.bridgetWatch(target);

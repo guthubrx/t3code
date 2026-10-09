@@ -15,10 +15,11 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import * as ChildProcess from "effect/unstable/process/ChildProcess";
-import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import * as ChildProcess from "effect/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as ProcessRunner from "../processRunner.ts";
-import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import { resolveBridgetExecutable } from "./BridgetExecutable.ts";
 
 const decodeInput = Schema.decodeUnknownEffect(BridgetReadInput);
@@ -69,7 +70,8 @@ export class BridgetReader extends Context.Service<
 >()("t3/bridget/BridgetReader") {}
 
 const make = Effect.gen(function* () {
-  const snapshots = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+  const snapshots = yield* ProjectionStore.ProjectionStoreV2;
+  const projects = yield* ProjectStore.ProjectStoreV2;
   const runner = yield* ProcessRunner.ProcessRunner;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const environment = yield* HostProcessEnvironment;
@@ -84,13 +86,13 @@ const make = Effect.gen(function* () {
     input: BridgetWatchInput,
   ) {
     const thread = yield* snapshots
-      .getThreadShellById(input.threadId)
+      .getThreadShell(input.threadId)
       .pipe(Effect.mapError(() => new BridgetReadError({ code: "storage_unavailable" })));
-    if (Option.isNone(thread)) return yield* new BridgetReadError({ code: "context_missing" });
-    if (thread.value.projectId !== input.projectId)
+    if (thread === null) return yield* new BridgetReadError({ code: "context_missing" });
+    if (thread.projectId !== input.projectId)
       return yield* new BridgetReadError({ code: "project_mismatch" });
-    const project = yield* snapshots
-      .getProjectShellById(thread.value.projectId)
+    const project = yield* projects
+      .getShell(thread.projectId)
       .pipe(Effect.mapError(() => new BridgetReadError({ code: "storage_unavailable" })));
     if (Option.isNone(project)) return yield* new BridgetReadError({ code: "context_missing" });
     return project.value;
