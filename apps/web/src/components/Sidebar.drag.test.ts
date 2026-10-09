@@ -68,6 +68,81 @@ function preview(
   );
 }
 
+describe("sidebar multi-selection preview", () => {
+  it.each(["a", "c"])("previews an intermediate target independently of pickup %s", (active) => {
+    const items = [
+      pinnedHeader,
+      divider,
+      thread("a", "active"),
+      thread("b", "active"),
+      thread("c", "active"),
+      thread("d", "active"),
+      settledHeader,
+    ];
+    const args = layout(items, active, "b");
+    const transforms = preview(
+      { items, movingKeys: ["a", "c"], settledOrder: [], settledExpanded: true },
+      active,
+      "b",
+    );
+    // The lifted row follows the pointer. Its peers occupy the block's planned slots.
+    const peer = active === "a" ? "c" : "a";
+    const top = (key: string) =>
+      args.rects[items.findIndex((item) => sidebarListItemId(item) === key)]!.top +
+      transforms.get(key)!.y;
+    expect(top(peer) - top("b")).toBe(peer === "a" ? 83 : 166);
+    expect(top("d") > top(peer)).toBe(true);
+  });
+
+  it("previews the same destination order as a multi-row drop", () => {
+    const items = [
+      pinnedHeader,
+      divider,
+      thread("a", "active"),
+      thread("b", "active"),
+      thread("c", "active"),
+      thread("d", "active"),
+      settledHeader,
+    ];
+    const transforms = preview(
+      { items, movingKeys: ["a", "c"], settledOrder: [], settledExpanded: true },
+      "a",
+      "d",
+    );
+    const args = layout(items, "a", "d");
+    const top = (key: string) =>
+      args.rects[items.findIndex((item) => sidebarListItemId(item) === key)]!.top +
+      transforms.get(key)!.y;
+    expect(top("b") < top("d") && top("d") < top("c")).toBe(true);
+    // One full slot for each moved row, including the row following the pointer.
+    expect(top("c") - top("d")).toBe(166);
+  });
+
+  it("removes every selected snoozed row and the empty snooze header", () => {
+    const items = [
+      pinnedHeader,
+      divider,
+      thread("a", "active"),
+      marker("snoozed-header"),
+      thread("s1", "snoozed"),
+      thread("s2", "snoozed"),
+      settledHeader,
+    ];
+    const transforms = preview(
+      {
+        items,
+        movingKeys: ["s1", "s2"],
+        snoozedThreadCount: 2,
+        settledOrder: [],
+        settledExpanded: true,
+      },
+      "s1",
+      "a",
+    );
+    expect(transforms.get(sidebarMarkerId("snoozed-header"))?.scaleY).toBe(0);
+  });
+});
+
 describe("sidebar collision detection", () => {
   function collisionArgs(blockedAboveSource = false) {
     const rows = [thread("source", "active"), thread("blocked", "active")];

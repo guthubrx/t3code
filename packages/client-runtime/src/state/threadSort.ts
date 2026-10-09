@@ -257,7 +257,8 @@ export function generateSpreadPinOrderKeys(count: number): string[] {
  * the moved thread. When a neighbor is keyless (threads pinned before
  * reordering shipped), the whole section gets fresh spread keys — a
  * one-time materialization; every move after that is single-write. Active
- * reordering uses the same planner with activeOrderKey values.
+ * reordering uses the same planner with activeOrderKey values. A selected
+ * block receives keys between its unchanged neighbors in one planning pass.
  */
 export function planPinnedReorder(input: {
   /** Thread ids in the desired visual order (after the move). */
@@ -265,24 +266,42 @@ export function planPinnedReorder(input: {
   /** Include retained keys from hidden rows; only orderedIds receive writes. */
   readonly keysById: ReadonlyMap<string, string | null | undefined>;
   readonly movedId: string;
+  readonly movedIds?: readonly string[];
 }): ReadonlyArray<{ readonly id: string; readonly orderKey: string }> {
   const { orderedIds, keysById, movedId } = input;
+  const movedIds = new Set(input.movedIds ?? [movedId]);
   const visibleIds = new Set(orderedIds);
   const reservedKeys = new Set(
     [...keysById].flatMap(([id, key]) => (!visibleIds.has(id) && key != null ? [key] : [])),
   );
-  const movedIndex = orderedIds.indexOf(movedId);
+  const movedIndex = orderedIds.findIndex((id) => movedIds.has(id));
   if (movedIndex === -1) return [];
+  let blockEnd = movedIndex;
+  while (blockEnd + 1 < orderedIds.length && movedIds.has(orderedIds[blockEnd + 1]!)) blockEnd += 1;
   const beforeId = movedIndex > 0 ? orderedIds[movedIndex - 1] : null;
-  const afterId = movedIndex < orderedIds.length - 1 ? orderedIds[movedIndex + 1] : null;
+  const afterId = blockEnd < orderedIds.length - 1 ? orderedIds[blockEnd + 1] : null;
   const beforeKey = beforeId != null ? (keysById.get(beforeId) ?? null) : null;
   const afterKey = afterId != null ? (keysById.get(afterId) ?? null) : null;
   const beforeUsable = beforeId === null || beforeKey != null;
   const afterUsable = afterId === null || afterKey != null;
-  if (beforeUsable && afterUsable) {
-    let key = pinOrderKeyBetween(beforeKey, afterKey);
-    while (key !== null && reservedKeys.has(key)) key = pinOrderKeyBetween(key, afterKey);
-    if (key !== null) return [{ id: movedId, orderKey: key }];
+  if (beforeUsable && afterUsable && blockEnd - movedIndex + 1 === movedIds.size) {
+    const assignments: Array<{ id: string; orderKey: string }> = [];
+    // Balanced subdivision keeps key depth logarithmic in the block size.
+    const assign = (
+      start: number,
+      end: number,
+      before: string | null,
+      after: string | null,
+    ): boolean => {
+      if (start > end) return true;
+      const middle = Math.floor((start + end) / 2);
+      let key = pinOrderKeyBetween(before, after);
+      while (key !== null && reservedKeys.has(key)) key = pinOrderKeyBetween(key, after);
+      if (key === null || !assign(start, middle - 1, before, key)) return false;
+      assignments.push({ id: orderedIds[middle]!, orderKey: key });
+      return assign(middle + 1, end, key, after);
+    };
+    if (assign(movedIndex, blockEnd, beforeKey, afterKey)) return assignments;
   }
   // Keyless neighbor (or corrupt keys): rewrite the section in the new order.
   const keys = generateSpreadPinOrderKeys(orderedIds.length + reservedKeys.size)

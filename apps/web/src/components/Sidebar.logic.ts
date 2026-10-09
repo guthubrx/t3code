@@ -3,10 +3,12 @@ import * as React from "react";
 import { defaultAnimateLayoutChanges, type AnimateLayoutChanges } from "@dnd-kit/sortable";
 import {
   isAtomCommandInterrupted,
+  squashAtomCommandFailure,
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
 import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
-import type { ContextMenuItem, EnvironmentId, ThreadId } from "@t3tools/contracts";
+import type { ContextMenuItem, EnvironmentId, ScopedThreadRef, ThreadId } from "@t3tools/contracts";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "@t3tools/contracts/settings";
 import type { AsyncResult } from "effect/unstable/reactivity";
 import { planPinnedReorder } from "@t3tools/client-runtime/state/thread-sort";
@@ -176,6 +178,20 @@ export function sidebarListItemId(item: SidebarListItem): string {
   return item.kind === "thread" ? item.key : sidebarMarkerId(item.marker);
 }
 
+/** Freeze a drag's visible selection in display order (O(n)). An unselected
+ * pickup remains independent of the current selection. */
+export function resolveSidebarDragKeys(
+  items: readonly SidebarListItem[],
+  activeKey: string,
+  selectedKeys: ReadonlySet<string>,
+): readonly string[] {
+  return selectedKeys.has(activeKey)
+    ? items.flatMap((item) =>
+        item.kind === "thread" && selectedKeys.has(item.key) ? [item.key] : [],
+      )
+    : [activeKey];
+}
+
 /** The section a slot belongs to, read off the markers around it: from
     the top down, everything before the pinned divider is pinned, then the
     inbox until the first shelf header, each shelf until the next header,
@@ -205,13 +221,29 @@ export function resolveSidebarDropTarget(
   items: readonly SidebarListItem[],
   activeKey: string,
   overId: string,
+  movingKeys: readonly string[] = [activeKey],
 ): SidebarDropTarget | null {
   const activeIndex = items.findIndex((item) => sidebarListItemId(item) === activeKey);
   const overIndex = items.findIndex((item) => sidebarListItemId(item) === overId);
   if (activeIndex === -1 || overIndex === -1 || items[activeIndex]?.kind !== "thread") return null;
-  const moved = items.filter((_, index) => index !== activeIndex);
-  moved.splice(overIndex, 0, items[activeIndex]!);
-  const section = sectionAtSidebarSlot(moved, overIndex);
+  const moving = new Set(movingKeys);
+  if (moving.size > 1 && moving.has(overId)) return null;
+  const block: SidebarListItem[] = [];
+  const moved: SidebarListItem[] = [];
+  let removedBeforeTarget = 0;
+  let blockStartIndex = activeIndex;
+  for (const [index, item] of items.entries()) {
+    if (item.kind === "thread" && moving.has(item.key)) {
+      if (block.length === 0) blockStartIndex = index;
+      block.push(item);
+      if (index < overIndex) removedBeforeTarget += 1;
+    } else moved.push(item);
+  }
+  if (!moving.has(activeKey) || block.length !== moving.size) return null;
+  // A shared reference makes intermediate targets independent of the picked-up member.
+  const destinationIndex = overIndex - removedBeforeTarget + (blockStartIndex < overIndex ? 1 : 0);
+  moved.splice(destinationIndex, 0, ...block);
+  const section = sectionAtSidebarSlot(moved, destinationIndex);
   if (section === "working" || section === "snoozed") return null;
   const pinnedOrder: string[] = [];
   const activeOrder: string[] = [];
@@ -259,6 +291,205 @@ export type SidebarThreadDropPlan =
     }
   | { readonly kind: "settle" };
 
+export type SidebarThreadDrop = {
+  readonly sourceSections: ReadonlyMap<string, SidebarSection>;
+  readonly writesPending: boolean;
+  readonly section: "pinned" | "active" | "settled";
+  readonly occurredAt: string;
+  readonly clearsSnooze: boolean;
+  /** Full destination order and the keys before/after the planned writes. */
+  readonly order: readonly string[] | null;
+  readonly keysAtDrop: ReadonlyMap<string, string | null>;
+  readonly assignedKeys: ReadonlyMap<string, string>;
+};
+
+type SidebarDropAction = (ref: ScopedThreadRef) => Promise<AtomCommandResult<unknown, unknown>>;
+
+/** Execute the existing commands in order, stopping on the first failure.
+ * O(k + a) commands for k members and a key assignments; no cross-server rollback.
+ * Kept outside React so partial failures and receipt timing use the real executor in tests. */
+export async function executeSidebarThreadDrop(input: {
+  readonly drop: SidebarThreadDrop;
+  readonly movingThreads: ReadonlyArray<{
+    readonly key: string;
+    readonly section: SidebarSection;
+    readonly pinned: boolean;
+    readonly settled: boolean;
+  }>;
+  readonly threadByKey: ReadonlyMap<string, Pick<Thread, "environmentId" | "id">>;
+  readonly assignments: ReadonlyArray<{ readonly id: string; readonly orderKey: string }>;
+  readonly settlingThreadKeys: Set<string>;
+  readonly setOptimisticDrop: (
+    update: (current: SidebarThreadDrop | null) => SidebarThreadDrop | null,
+  ) => void;
+  readonly reportFailure: (title: string, error: unknown) => void;
+  readonly onSuccess: () => void;
+  readonly actions: {
+    readonly settleThread: SidebarDropAction;
+    readonly unpinThread: SidebarDropAction;
+    readonly unsettleThread: SidebarDropAction;
+    readonly unsnoozeThread: SidebarDropAction;
+    readonly pinThread: (
+      ref: ScopedThreadRef,
+      options: { readonly orderKey?: string },
+    ) => Promise<AtomCommandResult<unknown, unknown>>;
+    readonly reorderActiveThread: (
+      ref: ScopedThreadRef,
+      orderKey: string,
+    ) => Promise<AtomCommandResult<unknown, unknown>>;
+    readonly reorderPinnedThread: (
+      ref: ScopedThreadRef,
+      orderKey: string,
+    ) => Promise<AtomCommandResult<unknown, unknown>>;
+  };
+}): Promise<void> {
+  const { drop, actions } = input;
+  const clearPreview = () =>
+    input.setOptimisticDrop((current) =>
+      current?.sourceSections === drop.sourceSections ? null : current,
+    );
+  const run = async (operation: Promise<AtomCommandResult<unknown, unknown>>, title: string) => {
+    const result = await operation;
+    if (result._tag === "Success") return true;
+    clearPreview();
+    if (!isAtomCommandInterrupted(result)) {
+      input.reportFailure(title, squashAtomCommandFailure(result));
+    }
+    return false;
+  };
+  const movingKeys = new Set(input.movingThreads.map(({ key }) => key));
+  const pinnedWithKey = new Set<string>();
+  if (drop.section === "settled") {
+    for (const key of movingKeys) input.settlingThreadKeys.add(key);
+  }
+  try {
+    for (const member of input.movingThreads) {
+      const thread = input.threadByKey.get(member.key);
+      if (thread === undefined) continue;
+      const ref = scopeThreadRef(thread.environmentId, thread.id);
+      if (drop.section === "settled") {
+        if (
+          member.section !== "settled" &&
+          !(await run(actions.settleThread(ref), "Failed to settle selected threads"))
+        )
+          return;
+      } else if (drop.section === "active") {
+        if (member.pinned && !(await run(actions.unpinThread(ref), "Failed to unpin thread")))
+          return;
+        if (
+          member.settled &&
+          !(await run(actions.unsettleThread(ref), "Failed to un-settle thread"))
+        )
+          return;
+        if (
+          member.section === "snoozed" &&
+          !(await run(actions.unsnoozeThread(ref), "Failed to wake thread"))
+        )
+          return;
+      } else if (member.section !== "pinned") {
+        const orderKey = drop.assignedKeys.get(member.key);
+        if (
+          !(await run(
+            actions.pinThread(ref, orderKey === undefined ? {} : { orderKey }),
+            "Failed to pin thread",
+          ))
+        )
+          return;
+        if (!member.pinned && orderKey !== undefined) pinnedWithKey.add(member.key);
+      }
+    }
+    for (const assignment of input.assignments) {
+      if (pinnedWithKey.has(assignment.id)) continue;
+      const thread = input.threadByKey.get(assignment.id);
+      if (thread === undefined) continue;
+      if (
+        !(await run(
+          (drop.section === "active" ? actions.reorderActiveThread : actions.reorderPinnedThread)(
+            scopeThreadRef(thread.environmentId, thread.id),
+            assignment.orderKey,
+          ),
+          drop.section === "active"
+            ? "Failed to reorder active threads"
+            : "Failed to reorder pinned threads",
+        ))
+      )
+        return;
+    }
+    input.onSuccess();
+  } catch (error) {
+    clearPreview();
+    input.reportFailure("Failed to move selected threads", error);
+  } finally {
+    if (drop.section === "settled") {
+      for (const key of movingKeys) input.settlingThreadKeys.delete(key);
+    }
+    input.setOptimisticDrop((current) =>
+      current?.sourceSections === drop.sourceSections
+        ? { ...current, writesPending: false }
+        : current,
+    );
+  }
+}
+
+/** O(n + k + a): release only after all members/keys land, or a conflicting
+ * state invalidates the placement. Receipts can precede shell subscriptions. */
+export function shouldReleaseSidebarThreadDrop(input: {
+  readonly drop: SidebarThreadDrop;
+  readonly threadByKey: ReadonlyMap<
+    string,
+    ThreadSnoozeShell &
+      Pick<
+        SidebarThreadSummary,
+        "archivedAt" | "settledOverride" | "pinnedAt" | "pinOrderKey" | "activeOrderKey"
+      >
+  >;
+  readonly pinnedKeys: readonly string[];
+  readonly activeKeys: readonly string[];
+  readonly now: string;
+}): boolean {
+  const { drop, threadByKey } = input;
+  if (drop.writesPending) return false;
+  let allMembersLanded = true;
+  for (const [key, sourceSection] of drop.sourceSections) {
+    const thread = threadByKey.get(key);
+    if (thread === undefined || thread.archivedAt !== null) return true;
+    const canonicalSection = effectiveSnoozed(thread, { now: input.now })
+      ? "snoozed"
+      : thread.settledOverride === "settled"
+        ? "settled"
+        : thread.pinnedAt != null
+          ? "pinned"
+          : "active";
+    if (canonicalSection !== sourceSection && canonicalSection !== drop.section) return true;
+    allMembersLanded &&=
+      canonicalSection === drop.section &&
+      (sourceSection === drop.section ||
+        ((drop.section === "pinned" || thread.pinnedAt == null) &&
+          (!drop.clearsSnooze || thread.snoozedUntil == null)));
+  }
+  if (!allMembersLanded) return false;
+  if (drop.order === null) return true;
+  const destinationKeys = drop.section === "pinned" ? input.pinnedKeys : input.activeKeys;
+  const heldKeys = new Set(drop.order);
+  const membershipChanged =
+    destinationKeys.length !== drop.order.length ||
+    destinationKeys.some((key) => !heldKeys.has(key));
+  const orderKey = (key: string) => {
+    const thread = threadByKey.get(key);
+    return (drop.section === "pinned" ? thread?.pinOrderKey : thread?.activeOrderKey) ?? null;
+  };
+  const foreignKeyLanded = destinationKeys.some((key) => {
+    const currentKey = orderKey(key);
+    return (
+      currentKey !== (drop.keysAtDrop.get(key) ?? null) && currentKey !== drop.assignedKeys.get(key)
+    );
+  });
+  const allAssignmentsLanded = [...drop.assignedKeys].every(
+    ([key, expected]) => orderKey(key) === expected,
+  );
+  return membershipChanged || foreignKeyLanded || allAssignmentsLanded;
+}
+
 /** What dropping in `to` does to a thread lifted from `from`, for the badge
     on the lifted row. Null while reordering inside one section and for the
     working and snoozed shelves, which cannot be drop targets. */
@@ -283,6 +514,14 @@ export function planSidebarThreadDrop(input: {
   readonly activePinned?: boolean;
   readonly activeSettled?: boolean;
   readonly supportsSettlement?: boolean;
+  /** The frozen selection, including each member's underlying lifecycle. */
+  readonly movingThreads?: ReadonlyArray<{
+    readonly key: string;
+    readonly section: SidebarSection;
+    readonly pinned: boolean;
+    readonly settled: boolean;
+    readonly supportsSettlement: boolean;
+  }>;
   readonly target: SidebarDropTarget;
   /** All pinned keys in displayed order before the drop. */
   readonly pinnedOrder: readonly string[];
@@ -307,15 +546,34 @@ export function planSidebarThreadDrop(input: {
     activeKeysById,
     activeReorderableKeys,
   } = input;
-  if (input.supportsSettlement === false && (target.section === "settled" || activeSettled)) {
+  const movingThreads = input.movingThreads ?? [
+    {
+      key: activeKey,
+      section: activeSection,
+      pinned: activePinned,
+      settled: activeSettled,
+      supportsSettlement: input.supportsSettlement !== false,
+    },
+  ];
+  if (
+    movingThreads.length === 0 ||
+    movingThreads.some(
+      (thread) =>
+        thread.section === "working" ||
+        (reorderableKeys !== undefined && !reorderableKeys.has(thread.key)) ||
+        (!thread.supportsSettlement && (target.section === "settled" || thread.settled)),
+    )
+  ) {
     return { kind: "none" };
   }
+  const alreadyInDestination = movingThreads.every((thread) => thread.section === target.section);
+  const movedIds = movingThreads.map((thread) => thread.key);
   switch (target.section) {
     case "active": {
       // Like the settled tail: threads can enter a time-ordered inbox, but
       // not be arranged inside it.
       if (input.activeTimeOrdered) {
-        return activeSection === "active"
+        return alreadyInDestination
           ? { kind: "none" }
           : {
               kind: "move-active",
@@ -328,7 +586,7 @@ export function planSidebarThreadDrop(input: {
       }
       const order = target.activeOrder;
       if (
-        activeSection === "active" &&
+        alreadyInDestination &&
         order.length === activeOrder.length &&
         order.every((key, index) => key === activeOrder[index])
       ) {
@@ -338,6 +596,7 @@ export function planSidebarThreadDrop(input: {
         orderedIds: order,
         keysById: activeKeysById,
         movedId: activeKey,
+        movedIds,
       });
       if (activeReorderableKeys && assignments.some(({ id }) => !activeReorderableKeys.has(id))) {
         return { kind: "none" };
@@ -352,12 +611,12 @@ export function planSidebarThreadDrop(input: {
       };
     }
     case "settled":
-      return activeSection === "settled" ? { kind: "none" } : { kind: "settle" };
+      return alreadyInDestination ? { kind: "none" } : { kind: "settle" };
     case "pinned": {
       const order = target.pinnedOrder;
       // Dropped back where it started: nothing to write.
       if (
-        activeSection === "pinned" &&
+        alreadyInDestination &&
         order.length === pinnedOrder.length &&
         order.every((key, index) => key === pinnedOrder[index])
       ) {
@@ -367,11 +626,12 @@ export function planSidebarThreadDrop(input: {
         orderedIds: order,
         keysById: pinnedKeysById,
         movedId: activeKey,
+        movedIds,
       });
       if (reorderableKeys && assignments.some(({ id }) => !reorderableKeys.has(id))) {
         return { kind: "none" };
       }
-      if (activeSection === "pinned") {
+      if (alreadyInDestination) {
         return assignments.length === 0
           ? { kind: "none" }
           : { kind: "reorder-pinned", order, assignments };
