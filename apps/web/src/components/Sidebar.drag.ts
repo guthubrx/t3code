@@ -37,6 +37,7 @@ export function createSidebarCollisionDetection(
   options: {
     items?: readonly SidebarListItem[];
     activationY?: number | null;
+    movingKeys?: readonly string[] | undefined;
   } = {},
 ): CollisionDetection {
   const validity = new Map<string, boolean>();
@@ -74,7 +75,8 @@ export function createSidebarCollisionDetection(
             if (!sections.has(id)) {
               sections.set(
                 id,
-                resolveSidebarDropTarget(items, String(args.active.id), id)?.section ?? null,
+                resolveSidebarDropTarget(items, String(args.active.id), id, options.movingKeys)
+                  ?.section ?? null,
               );
             }
             return sections.get(id) === boundarySection;
@@ -99,6 +101,7 @@ export function createSidebarCollisionDetection(
  * A zero scaleY marks rows/markers to hide while retaining their measured nodes. */
 export function createSidebarSortingStrategy(input: {
   items: readonly SidebarListItem[];
+  movingKeys?: readonly string[] | undefined;
   /** Suspend the reorder preview while the thread is dragged out as context. */
   enabled?: boolean;
   settledOrder: readonly string[];
@@ -124,7 +127,10 @@ export function createSidebarSortingStrategy(input: {
     const active = items[activeIndex];
     const over = items[overIndex] ?? active;
     if (active?.kind !== "thread" || !over || !rects[0]) return [];
-    const target = resolveSidebarDropTarget(items, active.key, sidebarListItemId(over));
+    const moving = new Set(input.movingKeys ?? [active.key]);
+    const target = resolveSidebarDropTarget(items, active.key, sidebarListItemId(over), [
+      ...moving,
+    ]);
     if (!target) return [];
     const groups: Record<SidebarSection, ThreadItem[]> = {
       pinned: [],
@@ -136,6 +142,7 @@ export function createSidebarSortingStrategy(input: {
     let cardHeight = input.cardHeight;
     let slimHeight = input.slimHeight;
     let headerScale: number | undefined;
+    let movedSnoozedCount = 0;
     for (const [index, item] of items.entries()) {
       if (item.kind === "marker") {
         if (isShelfHeader(item)) {
@@ -147,7 +154,8 @@ export function createSidebarSortingStrategy(input: {
       if (item.section === "pinned" || item.section === "active" || item.section === "working")
         cardHeight ??= rects[index]?.height;
       else slimHeight ??= rects[index]?.height;
-      if (item.key !== active.key) groups[item.section].push(item);
+      if (!moving.has(item.key)) groups[item.section].push(item);
+      else if (item.section === "snoozed") movedSnoozedCount += 1;
     }
     // Cards are 4.875rem + 0.25rem padding; slim rows/placeholders are h-9.
     const scale =
@@ -163,14 +171,21 @@ export function createSidebarSortingStrategy(input: {
           ? input.settledOrder
           : (input.activeOrder ?? target.activeOrder);
     const ranks = new Map(order.map((key, index) => [key, index]));
-    const rank = ranks.get(active.key) ?? Number.POSITIVE_INFINITY;
-    const index = group.findIndex(
-      (item) => (ranks.get(item.key) ?? Number.POSITIVE_INFINITY) > rank,
+    group.push(
+      ...items.flatMap((item) =>
+        item.kind === "thread" && moving.has(item.key)
+          ? [{ ...item, section: target.section }]
+          : [],
+      ),
     );
-    group.splice(index < 0 ? group.length : index, 0, { ...active, section: target.section });
+    group.sort(
+      (left, right) =>
+        (ranks.get(left.key) ?? Number.POSITIVE_INFINITY) -
+        (ranks.get(right.key) ?? Number.POSITIVE_INFINITY),
+    );
     const settledOrder = (
       input.settledOrder.length > 0 ? input.settledOrder : groups.settled.map((item) => item.key)
-    ).filter((key) => key !== active.key || target.section === "settled");
+    ).filter((key) => !moving.has(key) || target.section === "settled");
     const visible = input.settledExpanded
       ? settledOrder.slice(0, input.settledVisibleCount ?? settledOrder.length)
       : [];
@@ -195,7 +210,7 @@ export function createSidebarSortingStrategy(input: {
     }
     if (
       groups.snoozed.length > 0 ||
-      ((active.section !== "snoozed" || (input.snoozedThreadCount ?? 0) > 1) &&
+      ((movedSnoozedCount === 0 || (input.snoozedThreadCount ?? 0) > movedSnoozedCount) &&
         items.some((item) => item.kind === "marker" && item.marker === "snoozed-header"))
     ) {
       marker("snoozed-header");
@@ -211,7 +226,7 @@ export function createSidebarSortingStrategy(input: {
         (item.section === "pinned" || item.section === "active" || item.section === "working")
           ? cardHeight
           : slimHeight;
-      const moved = item.kind === "thread" && item.key === active.key;
+      const moved = item.kind === "thread" && moving.has(item.key);
       return item.kind === "marker" &&
         (item.marker === "pinned-header" || item.marker === "pinned-divider")
         ? labelHeight

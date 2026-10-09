@@ -274,6 +274,65 @@ describe("getLatestThreadForProject", () => {
   );
 });
 
+describe("planPinnedReorder for a moved block", () => {
+  it("assigns a large block without deep keys or neighbor writes", () => {
+    const selected = Array.from({ length: 1024 }, (_, index) => `selected-${index}`);
+    const assignments = planPinnedReorder({
+      orderedIds: ["before", ...selected, "after"],
+      movedId: selected[0]!,
+      movedIds: selected,
+      keysById: new Map([
+        ["before", "f"],
+        ["after", "t"],
+      ]),
+    });
+    expect(assignments.map(({ id }) => id)).toEqual(selected);
+    expect(Math.max(...assignments.map(({ orderKey }) => orderKey.length))).toBeLessThan(12);
+    const keys = ["f", ...assignments.map(({ orderKey }) => orderKey), "t"];
+    expect(keys.every((key, index) => index === 0 || keys[index - 1]! < key)).toBe(true);
+  });
+
+  it("only writes the selected keys, in their requested order", () => {
+    const assignments = planPinnedReorder({
+      orderedIds: ["b", "a", "c", "d"],
+      movedId: "c",
+      movedIds: ["a", "c"],
+      keysById: new Map([
+        ["a", "b"],
+        ["b", "f"],
+        ["c", "m"],
+        ["d", "t"],
+      ]),
+    });
+    expect(assignments.map(({ id }) => id)).toEqual(["a", "c"]);
+    const [first, second] = assignments;
+    expect(
+      "f" < first!.orderKey && first!.orderKey < second!.orderKey && second!.orderKey < "t",
+    ).toBe(true);
+  });
+
+  it("reserves hidden keys and materializes keyless neighbors", () => {
+    const assignments = planPinnedReorder({
+      orderedIds: ["b", "a", "c", "d"],
+      movedId: "a",
+      movedIds: ["a", "c"],
+      keysById: new Map([
+        ["a", null],
+        ["b", null],
+        ["c", null],
+        ["d", "t"],
+        ["hidden", "m"],
+      ]),
+    });
+    expect(assignments.map(({ orderKey }) => orderKey)).not.toContain("m");
+    expect(assignments.map(({ id }) => id)).not.toContain("hidden");
+    const keys = new Map(assignments.map(({ id, orderKey }) => [id, orderKey]));
+    expect(
+      ["b", "a", "c", "d"].toSorted((a, b) => keys.get(a)!.localeCompare(keys.get(b)!)),
+    ).toEqual(["b", "a", "c", "d"]);
+  });
+});
+
 describe("planPinnedReorder with hidden rows", () => {
   it("keeps hidden slots available when inserting between visible neighbors", () => {
     const midpoint = pinOrderKeyBetween("f", "t")!;

@@ -47,6 +47,7 @@ import {
   sortLogicalProjectsForSidebar,
   sortInboxThreadsByReturn,
   resolveSidebarDropTarget,
+  resolveSidebarDragKeys,
   planSidebarThreadDrop,
   sortPinnedThreadsForSidebar,
   sortProjectsForSidebar,
@@ -73,6 +74,206 @@ import {
 import { makeThreadFixture, type ThreadFixtureOverrides } from "../test-fixtures";
 
 const localEnvironmentId = EnvironmentId.make("environment-local");
+
+describe("sidebar multi-selection drag", () => {
+  const marker = (marker: SidebarListMarker): SidebarListItem => ({ kind: "marker", marker });
+  const row = (key: string, section: SidebarSection = "active"): SidebarListItem => ({
+    kind: "thread",
+    key,
+    section,
+  });
+  const items = [
+    marker("pinned-header"),
+    marker("pinned-divider"),
+    row("a"),
+    row("b"),
+    row("c"),
+    row("d"),
+    marker("settled-header"),
+  ];
+  const selected = new Set(["c", "hidden", "a"]);
+
+  it("captures visible selections in display order, not click order", () => {
+    expect(resolveSidebarDragKeys(items, "c", selected)).toEqual(["a", "c"]);
+    expect(resolveSidebarDragKeys(items, "b", selected)).toEqual(["b"]);
+  });
+
+  it.each(["a", "c"])("moves the same block when picking up %s", (active) => {
+    expect(resolveSidebarDropTarget(items, active, "d", ["a", "c"])).toEqual({
+      section: "active",
+      pinnedOrder: [],
+      activeOrder: ["b", "d", "a", "c"],
+    });
+  });
+
+  it.each(["a", "c"])("uses the same intermediate target when picking up %s", (active) => {
+    expect(resolveSidebarDropTarget(items, active, "b", ["a", "c"])?.activeOrder).toEqual([
+      "b",
+      "a",
+      "c",
+      "d",
+    ]);
+  });
+
+  it.each(["a", "c"])("uses the same intermediate target within Pins from %s", (active) => {
+    const pinned = [
+      marker("pinned-header"),
+      ...["a", "b", "c", "d"].map((key) => row(key, "pinned")),
+      marker("pinned-divider"),
+      marker("settled-header"),
+    ];
+    expect(resolveSidebarDropTarget(pinned, active, "b", ["a", "c"])?.pinnedOrder).toEqual([
+      "b",
+      "a",
+      "c",
+      "d",
+    ]);
+  });
+
+  it("moves a block upwards and rejects dropping onto itself", () => {
+    expect(resolveSidebarDropTarget(items, "d", "a", ["b", "d"])?.activeOrder).toEqual([
+      "b",
+      "d",
+      "a",
+      "c",
+    ]);
+    expect(resolveSidebarDropTarget(items, "a", "c", ["a", "c"])).toBeNull();
+  });
+
+  it("moves the whole block into empty Pins", () => {
+    expect(
+      resolveSidebarDropTarget(items, "c", "sidebar-marker-pinned-header", ["a", "c"]),
+    ).toEqual({ section: "pinned", pinnedOrder: ["a", "c"], activeOrder: ["b", "d"] });
+  });
+
+  const base = {
+    activeKey: "a",
+    activeSection: "settled" as const,
+    pinnedOrder: [],
+    pinnedKeysById: new Map<string, string>(),
+    activeOrder: ["b", "d"],
+    activeKeysById: new Map([
+      ["b", "f"],
+      ["d", "t"],
+    ]),
+    movingThreads: [
+      {
+        key: "a",
+        section: "settled" as const,
+        pinned: false,
+        settled: true,
+        supportsSettlement: true,
+      },
+      {
+        key: "c",
+        section: "active" as const,
+        pinned: false,
+        settled: false,
+        supportsSettlement: true,
+      },
+    ],
+  };
+
+  it("settles active peers even when the picked-up row is already settled", () => {
+    expect(
+      planSidebarThreadDrop({
+        ...base,
+        target: { section: "settled", pinnedOrder: [], activeOrder: ["b", "d"] },
+      }),
+    ).toEqual({ kind: "settle" });
+  });
+
+  it("rejects the whole group if a peer cannot perform the lifecycle change", () => {
+    expect(
+      planSidebarThreadDrop({
+        ...base,
+        movingThreads: [
+          base.movingThreads[0]!,
+          { ...base.movingThreads[1]!, supportsSettlement: false },
+        ],
+        target: { section: "settled", pinnedOrder: [], activeOrder: ["b", "d"] },
+      }),
+    ).toEqual({ kind: "none" });
+  });
+
+  it("assigns both moved keys between unchanged neighbors", () => {
+    const plan = planSidebarThreadDrop({
+      ...base,
+      target: { section: "active", pinnedOrder: [], activeOrder: ["b", "a", "c", "d"] },
+    });
+    expect(plan.kind).toBe("move-active");
+    if (plan.kind !== "move-active") return;
+    expect(plan.assignments.map(({ id }) => id)).toEqual(["a", "c"]);
+    const keys = new Map(plan.assignments.map(({ id, orderKey }) => [id, orderKey]));
+    expect("f" < keys.get("a")! && keys.get("a")! < keys.get("c")! && keys.get("c")! < "t").toBe(
+      true,
+    );
+  });
+
+  it.each(["working", "active"] as const)(
+    "rejects a %s peer without drag permission",
+    (section) => {
+      expect(
+        planSidebarThreadDrop({
+          ...base,
+          movingThreads: [base.movingThreads[0]!, { ...base.movingThreads[1]!, section }],
+          reorderableKeys: new Set(["a"]),
+          target: { section: "pinned", pinnedOrder: ["a", "c"], activeOrder: ["b", "d"] },
+        }),
+      ).toEqual({ kind: "none" });
+    },
+  );
+
+  it("does not manually reorder a group already in a time-ordered inbox", () => {
+    expect(
+      planSidebarThreadDrop({
+        ...base,
+        movingThreads: base.movingThreads.map((thread) => ({
+          ...thread,
+          section: "active",
+          settled: false,
+        })),
+        activeTimeOrdered: true,
+        target: { section: "active", pinnedOrder: [], activeOrder: ["b", "d", "a", "c"] },
+      }),
+    ).toEqual({ kind: "none" });
+  });
+
+  it.each(["active", "pinned"] as const)(
+    "moves the group past a keyless offline neighbor in %s",
+    (section) => {
+      const plan = planSidebarThreadDrop({
+        ...base,
+        activeKeysById: new Map(),
+        activeReorderableKeys: new Set(["a", "c", "d"]),
+        reorderableKeys: new Set(["a", "c", "d"]),
+        target: {
+          section,
+          pinnedOrder: section === "pinned" ? ["b", "a", "c", "d"] : [],
+          activeOrder: section === "active" ? ["b", "a", "c", "d"] : [],
+        },
+      });
+      expect(plan.kind).toBe(section === "active" ? "move-active" : "pin");
+      if (plan.kind === "none" || plan.kind === "settle") return;
+      const writes = plan.kind === "pin" ? plan.extraAssignments : plan.assignments;
+      expect(writes.some(({ id }) => id === "b")).toBe(false);
+      const assigned = new Map(writes.map(({ id, orderKey }) => [id, orderKey]));
+      if (plan.kind === "pin") assigned.set("a", plan.orderKey!);
+      expect(assigned.get("a")! < assigned.get("c")!).toBe(true);
+      expect(assigned.get("c")! < assigned.get("d")!).toBe(true);
+    },
+  );
+
+  it("refuses a manual active move when any selected peer is read-only", () => {
+    expect(
+      planSidebarThreadDrop({
+        ...base,
+        activeReorderableKeys: new Set(["a", "b", "d"]),
+        target: { section: "active", pinnedOrder: [], activeOrder: ["b", "a", "c", "d"] },
+      }),
+    ).toEqual({ kind: "none" });
+  });
+});
 
 describe("resolveSidebarRowAccessibility", () => {
   it.each([
