@@ -1,7 +1,12 @@
-import { EnvironmentId, type ThreadPullRequestLink } from "@t3tools/contracts";
+// @vitest-environment jsdom
+import { EnvironmentId, ThreadId, type ThreadPullRequestLink } from "@t3tools/contracts";
 import type { DesktopPreviewFavicon, PreviewSessionSnapshot } from "@t3tools/contracts";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { act, type ComponentProps } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
+import { selectThreadRightPanelState, useRightPanelStore } from "~/rightPanelStore";
 
 import {
   RightPanelTabs,
@@ -89,13 +94,14 @@ function overlay(
   };
 }
 
-function renderTabs(
+function tabsElement(
   first: DesktopPreviewFavicon | null,
   second?: DesktopPreviewFavicon,
   audio?: { audible?: boolean; audioMuted?: boolean },
   previewRuntimeTabId: ((tabId: string) => string) | null = (tabId) => `runtime:${tabId}`,
+  overrides?: Partial<ComponentProps<typeof RightPanelTabs>>,
 ) {
-  return renderToStaticMarkup(
+  return (
     <RightPanelTabs
       mode="inline"
       surfaces={second ? [previewSurface, secondSurface] : [previewSurface]}
@@ -123,6 +129,7 @@ function renderTabs(
       onAddDiff={() => undefined}
       onAddFiles={() => undefined}
       onAddAgents={() => undefined}
+      onAddBridget={() => undefined}
       onAddDevice={() => undefined}
       liveAgentCount={0}
       browserAvailable
@@ -132,12 +139,107 @@ function renderTabs(
       pullRequestAvailable={false}
       pullRequestsAvailable={false}
       agentsAvailable={false}
+      bridgetAvailable={false}
       deviceAvailable={false}
+      {...overrides}
     >
       <div>content</div>
-    </RightPanelTabs>,
+    </RightPanelTabs>
   );
 }
+
+function renderTabs(...args: Parameters<typeof tabsElement>) {
+  return renderToStaticMarkup(tabsElement(...args));
+}
+
+describe("Bridget native surface navigation", () => {
+  it("opens by keyboard, reuses the singleton from the plus menu and closes its native tab", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("matchMedia", () => ({
+      matches: false,
+      addEventListener() {},
+      removeEventListener() {},
+    }));
+    const originalGetAnimations = Element.prototype.getAnimations;
+    Element.prototype.getAnimations = () => [];
+    const ref = scopeThreadRef(EnvironmentId.make("native-bridget"), ThreadId.make("native-chat"));
+    useRightPanelStore.setState({ byThreadKey: {}, userActionRevisionByThreadKey: {} });
+    const root = createRoot(host);
+    const draw = () => {
+      const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, ref);
+      root.render(
+        tabsElement(null, undefined, undefined, null, {
+          mode: "sheet",
+          surfaces: state.surfaces,
+          activeSurfaceId: state.activeSurfaceId,
+          browserAvailable: false,
+          bridgetAvailable: true,
+          onAddBridget: () => {
+            useRightPanelStore.getState().open(ref, "bridget");
+            draw();
+          },
+          onCloseSurface: (surface) => {
+            useRightPanelStore.getState().closeSurface(ref, surface.id);
+            draw();
+          },
+        }),
+      );
+    };
+    try {
+      await act(async () => draw());
+      const launcher = document.querySelector<HTMLElement>("[aria-label='Open a surface']")!;
+      launcher.focus();
+      expect(document.activeElement).toBe(launcher);
+      await act(async () =>
+        launcher.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })),
+      );
+      await act(async () =>
+        launcher.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })),
+      );
+      expect(
+        selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, ref).surfaces,
+      ).toEqual([{ id: "bridget", kind: "bridget" }]);
+      const tab = document.querySelector<HTMLElement>("[data-active-tab='true']")!;
+      expect(tab.textContent).toBe("Bridget");
+      const icon = tab.querySelector<HTMLElement>("span.bg-current")!;
+      expect(icon.style.maskImage).not.toBe("");
+      expect(icon.classList.contains("bg-current")).toBe(true);
+      await act(async () =>
+        document
+          .querySelector<HTMLButtonElement>("button[aria-label='Add panel surface']")!
+          .click(),
+      );
+      const item = [...document.querySelectorAll<HTMLElement>("[role='menuitem']")].find((node) =>
+        node.textContent?.includes("Bridget"),
+      )!;
+      await act(async () => item.click());
+      expect(
+        selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, ref).surfaces,
+      ).toHaveLength(1);
+      await act(async () =>
+        document.querySelector<HTMLButtonElement>("button[aria-label='Close Bridget']")!.click(),
+      );
+      expect(
+        selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, ref).surfaces,
+      ).toEqual([]);
+    } finally {
+      await act(async () => root.unmount());
+      host.remove();
+      Element.prototype.getAnimations = originalGetAnimations;
+      vi.unstubAllGlobals();
+    }
+  });
+});
 
 describe("RightPanelTabs preview favicon", () => {
   it("prefers a live capture and never asks Google about a private hostname", () => {
@@ -163,6 +265,16 @@ describe("RightPanelTabs preview favicon", () => {
 });
 
 describe("surface shortcuts", () => {
+  it("allows the Bridget launcher letter without taking modified shortcuts", () => {
+    const bridget = { shortcut: "R", available: true, label: "Bridget" };
+    expect(surfaceShortcutActionForKey([bridget], shortcutEvent("r"))).toBe(bridget);
+    expect(
+      surfaceShortcutActionForKey([bridget], shortcutEvent("r", { ctrlKey: true })),
+    ).toBeNull();
+    expect(
+      surfaceShortcutActionForKey([{ ...bridget, available: false }], shortcutEvent("r")),
+    ).toBeNull();
+  });
   const actions = [
     { shortcut: "B", available: true, label: "Browser" },
     { shortcut: "D", available: false, label: "Diff" },

@@ -70,10 +70,13 @@ function writeTextWithExecCommand(
 
   const previouslyFocused = document.activeElement;
   const copy = (event: ClipboardEvent) => {
-    if (!extraFlavors || !event.clipboardData) return;
+    if (!event.clipboardData) return;
+    // The textarea normalizes line endings; write the unmodified source instead.
     event.clipboardData.setData("text/plain", value);
-    for (const [type, data] of Object.entries(extraFlavors))
-      event.clipboardData.setData(type, data);
+    if (extraFlavors) {
+      for (const [type, data] of Object.entries(extraFlavors))
+        event.clipboardData.setData(type, data);
+    }
     event.preventDefault();
   };
   document.body.appendChild(textarea);

@@ -2114,6 +2114,7 @@ function PullRequestsRouteView() {
             onAddPullRequest={() => undefined}
             onAddPullRequests={() => undefined}
             onAddAgents={() => undefined}
+            onAddBridget={() => undefined}
             onAddDevice={() => undefined}
             browserAvailable={false}
             terminalAvailable={false}
@@ -2122,6 +2123,7 @@ function PullRequestsRouteView() {
             pullRequestAvailable={false}
             pullRequestsAvailable={false}
             agentsAvailable={false}
+            bridgetAvailable={false}
             deviceAvailable={false}
             liveAgentCount={0}
             pullRequestStatusSeeds={listedPullRequestTabStatuses}
