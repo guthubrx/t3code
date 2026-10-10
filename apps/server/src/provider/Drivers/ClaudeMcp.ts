@@ -12,7 +12,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
-import { bridgetMcpServer } from "../../bridget/BridgetMcp.ts";
+import { refreshBridgetMcpServer } from "../../bridget/BridgetMcp.ts";
 import type { McpProviderSessionConfig } from "@t3tools/provider-core/server/mcpSession";
 import { resolveClaudeHomePath } from "./ClaudeHome.ts";
 import { claudeSettingsPaths, findRepositoryRoot } from "./ClaudeSettingsPaths.ts";
@@ -54,7 +54,7 @@ export function claudeBridgetReadOnlySettings(
   } as Pick<Settings, "permissions">;
 }
 
-type MetadataCode = "disabled" | "user_server" | "metadata_unavailable";
+type MetadataCode = "disabled" | "metadata_unavailable";
 const McpPolicyEntry = Schema.Struct({
   serverName: Schema.optional(Schema.String),
   serverCommand: Schema.optional(Schema.Array(Schema.String)),
@@ -98,6 +98,7 @@ const metadataPolicy = Effect.fn("ClaudeMcp.metadataPolicy")(function* (
     ...(cwd ? [path.join(cwd, ".mcp.json")] : []),
     ...(root && root !== cwd ? [path.join(root, ".mcp.json")] : []),
   ];
+  const definitions: unknown[] = [];
   for (const file of files) {
     const stat = yield* fs
       .stat(file)
@@ -137,10 +138,10 @@ const metadataPolicy = Effect.fn("ClaudeMcp.metadataPolicy")(function* (
       )
         return "disabled" as const;
       if (entry.mcpServers && Object.hasOwn(entry.mcpServers, "bridget"))
-        return "user_server" as const;
+        definitions.push(entry.mcpServers.bridget);
     }
   }
-  return undefined;
+  return definitions;
 });
 
 /**
@@ -185,11 +186,15 @@ export const prepareClaudeMcp = Effect.fn("prepareClaudeMcp")(function* (input: 
     const policy = yield* metadataPolicy(input.config, input.cwd, input.environment).pipe(
       Effect.catch(() => Effect.succeed("metadata_unavailable" as MetadataCode)),
     );
-    if (policy) return { code: policy };
+    if (typeof policy === "string") return { code: policy };
     const current = yield* sdk(() => input.query.mcpServerStatus());
-    if (current.some((server) => server.name === "bridget"))
-      return { code: "user_server" as const };
-    const mount = yield* bridgetMcpServer(input.environment, input.session);
+    const existing = current.find((server) => server.name === "bridget");
+    if (existing?.status === "disabled") return { code: "disabled" as const };
+    const mount = yield* refreshBridgetMcpServer(input.environment, input.session, [
+      ...policy,
+      ...(input.servers && Object.hasOwn(input.servers, "bridget") ? [input.servers.bridget] : []),
+      ...(existing ? [existing.config] : []),
+    ]);
     if (mount.code !== "ready") return { code: mount.code };
     const result = yield* sdk(() =>
       input.query.setMcpServers({
@@ -205,11 +210,12 @@ export const prepareClaudeMcp = Effect.fn("prepareClaudeMcp")(function* (input: 
         (server) =>
           server.name === "bridget" &&
           server.status === "connected" &&
+          server.source === "dynamic" &&
           server.tools?.some((tool) => tool.name === "bridget_thread"),
       )
     )
       return yield* new ClaudeMcpError({ code: "catalogue_unavailable" });
-    // Only our newly mounted executable earns these two exact read approvals.
+    // Only the verified local executable earns these two exact read approvals.
     // Custom/disabled/explicit servers return above. Native deny/ask rules still apply.
     if (input.readOnlySettings !== undefined) {
       const tools = mounted.find((server) => server.name === "bridget")?.tools;

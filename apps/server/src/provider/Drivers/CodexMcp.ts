@@ -1,7 +1,7 @@
 import type { McpProviderSessionConfig } from "@t3tools/provider-core/server/mcpSession";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { bridgetMcpServer } from "../../bridget/BridgetMcp.ts";
+import { refreshBridgetMcpServer } from "../../bridget/BridgetMcp.ts";
 
 const decodeConfig = Schema.decodeUnknownEffect(
   Schema.Struct({
@@ -21,9 +21,11 @@ export const prepareCodexBridgetMcp = Effect.fn("prepareCodexBridgetMcp")(functi
   return yield* Effect.gen(function* () {
     const config = yield* input.readConfig().pipe(Effect.flatMap(decodeConfig));
     const servers = config.config.mcp_servers ?? {};
-    // A user's definition (including enabled=false) is never replaced.
-    if (Object.hasOwn(servers, "bridget")) return undefined;
-    const mount = yield* bridgetMcpServer(input.environment, input.session);
+    const mount = yield* refreshBridgetMcpServer(
+      input.environment,
+      input.session,
+      Object.hasOwn(servers, "bridget") ? [servers.bridget] : [],
+    );
     if (mount.code !== "ready") return undefined;
     const { type: _type, ...server } = mount.server;
     return server satisfies Schema.Json;

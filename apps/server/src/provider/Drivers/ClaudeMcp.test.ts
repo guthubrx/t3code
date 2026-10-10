@@ -22,7 +22,14 @@ const fixture = Effect.fn(function* () {
     mcpServerStatus: async () => statuses,
     setMcpServers: async (servers: Record<string, McpServerConfig>) => {
       calls.push(servers);
-      statuses = [{ name: "bridget", status: "connected", tools: [{ name: "bridget_thread" }] }];
+      statuses = [
+        {
+          name: "bridget",
+          status: "connected",
+          source: "dynamic",
+          tools: [{ name: "bridget_thread" }],
+        },
+      ];
       return { added: ["bridget"], removed: [], errors: {} };
     },
   };
@@ -139,6 +146,7 @@ describe("SPEC147 Claude MCP policy", () => {
               {
                 name: "bridget",
                 status: "connected",
+                source: "dynamic",
                 tools: [
                   { name: "bridget_thread" },
                   { name: "bridget_capabilities" },
@@ -330,7 +338,11 @@ describe("SPEC147 Claude MCP policy", () => {
       Effect.gen(function* () {
         const f = yield* fixture();
         f.setStatuses([{ name: "bridget", status, scope }]);
-        assert.equal((yield* prepareClaudeMcp(f.input)).code, "user_server");
+        // A disabled homonym is a refusal by the user; any other one has no proof of origin.
+        assert.equal(
+          (yield* prepareClaudeMcp(f.input)).code,
+          status === "disabled" ? "disabled" : "user_server",
+        );
         assert.equal(f.calls.length, 0);
       }).pipe(Effect.provide(NodeServices.layer)),
     ),
@@ -504,3 +516,448 @@ describe("SPEC147 Claude MCP policy", () => {
 });
 // @effect-diagnostics nodeBuiltinImport:off - Opt-in native CLI metadata proof; no query/model.
 import * as NodeChildProcess from "node:child_process";
+
+/** Real user case: the global Bridget server is the official binary behind a symlink. */
+const officialFixture = Effect.fn(function* () {
+  const f = yield* fixture();
+  const executable = Effect.fn(function* (...segments: ReadonlyArray<string>) {
+    const file = f.path.join(f.home, ...segments);
+    yield* f.fs.makeDirectory(f.path.dirname(file), { recursive: true });
+    yield* f.fs.writeFileString(file, "#!/bin/sh\nexit 0\n");
+    yield* f.fs.chmod(file, 0o755);
+    return file;
+  });
+  const real = yield* executable("real", "bridget");
+  const other = yield* executable("other", "bridget");
+  const bin = f.path.join(f.home, ".local", "bin");
+  yield* f.fs.makeDirectory(bin, { recursive: true });
+  const link = f.path.join(bin, "bridget");
+  yield* f.fs.symlink(real, link);
+  const foreignLink = f.path.join(bin, "foreign");
+  yield* f.fs.symlink(other, foreignLink);
+  const input = {
+    ...f.input,
+    environment: { ...f.input.environment, T3CODE_BRIDGET_EXECUTABLE: real },
+  };
+  const official = {
+    type: "stdio" as const,
+    command: link,
+    args: ["mcp"],
+    env: {},
+  };
+  return { ...f, input, real, other, bin, link, foreignLink, official };
+});
+type Official = Effect.Success<ReturnType<typeof officialFixture>>;
+const fullCatalogue: McpServerStatus["tools"] = [
+  { name: "bridget_thread" },
+  { name: "bridget_capabilities" },
+  { name: "bridget_task_status" },
+];
+/** Final mount is canonical: absolute real path, fixed args, only the six identity keys. */
+const canonicalEnv = (f: Official, session = f.input.session) => ({
+  HOME: f.home,
+  BRIDGET_HOME: f.path.join(f.home, ".cache", "bridget-core"),
+  BRIDGET_SOCKET: f.path.join(f.home, ".cache", "bridget-core", "bridget.sock"),
+  T3CODE_HOME: f.home,
+  BRIDGET_T3_MCP_ENDPOINT: session.endpoint,
+  BRIDGET_T3_MCP_AUTHORIZATION: session.authorizationHeader,
+});
+const mountedServer = (f: Official, index = 0) => {
+  const server = f.calls[index]?.bridget as unknown as {
+    command: string;
+    args: string[];
+    env: Record<string, string>;
+    [key: string]: unknown;
+  };
+  return server;
+};
+
+describe("SPEC149 Claude official global Bridget refresh", () => {
+  it.effect.each(["profile", "status", "sdk-servers", "mcp-json"] as const)(
+    "refreshes the official server declared in %s with a canonical mount",
+    (source) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* officialFixture();
+          const profile = f.path.join(f.home, ".claude.json");
+          if (source === "profile")
+            yield* f.fs.writeFileString(
+              profile,
+              JSON.stringify({ mcpServers: { bridget: f.official } }),
+            );
+          if (source === "mcp-json")
+            yield* f.fs.writeFileString(
+              f.path.join(f.home, ".mcp.json"),
+              JSON.stringify({ mcpServers: { bridget: f.official } }),
+            );
+          if (source === "status")
+            f.setStatuses([
+              {
+                name: "bridget",
+                status: "connected",
+                scope: "user",
+                config: f.official,
+                tools: [],
+              },
+            ]);
+          const input =
+            source === "sdk-servers"
+              ? { ...f.input, servers: { ...f.input.servers, bridget: f.official } }
+              : f.input;
+          const fileBefore = source === "profile" ? yield* f.fs.readFileString(profile) : undefined;
+          assert.equal((yield* prepareClaudeMcp(input)).code, "mounted");
+          const server = mountedServer(f);
+          assert.deepEqual(server.args, ["mcp"]);
+          assert.deepEqual(server.env, canonicalEnv(f));
+          // Pinned to the canonical absolute path, never the user's string (symlink).
+          assert.equal(server.command, yield* f.fs.realPath(f.real));
+          assert.notEqual(server.command, f.link);
+          assert.deepEqual(f.calls[0]?.["t3-code"], f.input.servers["t3-code"]);
+          // No credential mutation: the user's file never receives the session proof.
+          if (fileBefore !== undefined) {
+            assert.equal(yield* f.fs.readFileString(profile), fileBefore);
+          }
+          assert.notInclude(JSON.stringify(f.official), "private-session-a");
+          assert.equal("BRIDGET_T3_MCP_AUTHORIZATION" in f.input.environment, false);
+        }).pipe(Effect.provide(NodeServices.layer)),
+      ),
+  );
+  it.effect("rotates the proof for a second session and never leaks the first", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* officialFixture();
+        const global = {
+          ...f.official,
+          env: {
+            ...f.official.env,
+            BRIDGET_T3_MCP_ENDPOINT: "http://127.0.0.1:1/stale",
+            BRIDGET_T3_MCP_AUTHORIZATION: "Bearer stale",
+          },
+        };
+        yield* f.fs.writeFileString(
+          f.path.join(f.home, ".claude.json"),
+          JSON.stringify({ mcpServers: { bridget: global } }),
+        );
+        const sessionB = {
+          ...f.input.session,
+          providerSessionId: "provider-b",
+          endpoint: "http://127.0.0.1:43124/mcp",
+          authorizationHeader: "Bearer private-session-b",
+        };
+        assert.equal((yield* prepareClaudeMcp(f.input)).code, "mounted");
+        f.setStatuses([]);
+        assert.equal((yield* prepareClaudeMcp({ ...f.input, session: sessionB })).code, "mounted");
+        assert.equal(
+          mountedServer(f, 0).env.BRIDGET_T3_MCP_AUTHORIZATION,
+          "Bearer private-session-a",
+        );
+        assert.equal(
+          mountedServer(f, 1).env.BRIDGET_T3_MCP_AUTHORIZATION,
+          "Bearer private-session-b",
+        );
+        assert.equal(mountedServer(f, 1).env.BRIDGET_T3_MCP_ENDPOINT, "http://127.0.0.1:43124/mcp");
+        assert.deepEqual(mountedServer(f, 1).env, canonicalEnv(f, sessionB));
+        assert.notInclude(JSON.stringify(f.calls[1]), "private-session-a");
+        assert.notInclude(JSON.stringify(f.calls[0]), "stale");
+        const file = yield* f.fs.readFileString(f.path.join(f.home, ".claude.json"));
+        assert.notInclude(file, "private-session");
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  it.effect(
+    "approves exactly the two read tools only after the refreshed catalogue is verified",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* officialFixture();
+          yield* f.fs.writeFileString(
+            f.path.join(f.home, ".claude.json"),
+            JSON.stringify({ mcpServers: { bridget: f.official } }),
+          );
+          const settings = claudeBridgetReadOnlySettings({ permissions: { deny: ["Bash"] } })!;
+          const applied: unknown[] = [];
+          const query = {
+            ...f.input.query,
+            setMcpServers: async (servers: Record<string, McpServerConfig>) => {
+              const result = await f.input.query.setMcpServers(servers);
+              f.setStatuses([
+                { name: "bridget", status: "connected", source: "dynamic", tools: fullCatalogue },
+              ]);
+              return result;
+            },
+            applyFlagSettings: async (value: unknown) => {
+              applied.push(value);
+            },
+          };
+          assert.equal(
+            (yield* prepareClaudeMcp({ ...f.input, query, readOnlySettings: settings })).code,
+            "mounted",
+          );
+          assert.deepEqual(applied, [settings]);
+          assert.deepEqual(
+            (settings.permissions?.allow ?? []).filter((rule) => rule.includes("bridget")),
+            [...CLAUDE_BRIDGET_READ_ONLY_TOOLS],
+          );
+        }).pipe(Effect.provide(NodeServices.layer)),
+      ),
+  );
+  it.effect.each([
+    { name: "user", source: "user" },
+    { name: "project", source: "project" },
+    { name: "local", source: "local" },
+    { name: "plugin", source: "plugin" },
+    { name: "managed", source: "managed" },
+    { name: "absent", source: undefined },
+  ])(
+    "is not ready when the catalogue comes from the $name source, not a dynamic mount",
+    ({ source }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* officialFixture();
+          yield* f.fs.writeFileString(
+            f.path.join(f.home, ".claude.json"),
+            JSON.stringify({ mcpServers: { bridget: f.official } }),
+          );
+          let applied = 0;
+          const query = {
+            ...f.input.query,
+            // The SDK still reports the user's definition: connected, tools present, no proof.
+            setMcpServers: async (servers: Record<string, McpServerConfig>) => {
+              const result = await f.input.query.setMcpServers(servers);
+              f.setStatuses([
+                {
+                  name: "bridget",
+                  status: "connected",
+                  ...(source === undefined ? {} : { source }),
+                  config: f.official,
+                  tools: fullCatalogue,
+                },
+              ]);
+              return result;
+            },
+            applyFlagSettings: async () => void (applied += 1),
+          };
+          const failure = yield* prepareClaudeMcp({
+            ...f.input,
+            query,
+            readOnlySettings: claudeBridgetReadOnlySettings(undefined),
+          }).pipe(Effect.flip);
+          assert.equal(failure.code, "catalogue_unavailable");
+          assert.equal(applied, 0);
+        }).pipe(Effect.provide(NodeServices.layer)),
+      ),
+  );
+  it.effect("is ready only when the mounted catalogue comes from the dynamic source", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* officialFixture();
+        yield* f.fs.writeFileString(
+          f.path.join(f.home, ".claude.json"),
+          JSON.stringify({ mcpServers: { bridget: f.official } }),
+        );
+        assert.equal((yield* prepareClaudeMcp(f.input)).code, "mounted");
+        assert.equal(f.calls.length, 1);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  it.effect.each([
+    { DYLD_INSERT_LIBRARIES: "/tmp/evil.dylib" },
+    { LD_PRELOAD: "/tmp/evil.so" },
+    { NODE_OPTIONS: "--require /tmp/evil.js" },
+    { UNKNOWN_USER_VARIABLE: "1" },
+  ])("never mounts the session token next to unknown user env %j", (extra) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* officialFixture();
+        yield* f.fs.writeFileString(
+          f.path.join(f.home, ".claude.json"),
+          JSON.stringify({ mcpServers: { bridget: { ...f.official, env: extra } } }),
+        );
+        const outcome = yield* prepareClaudeMcp(f.input).pipe(Effect.result);
+        // Refusal and canonical-only mount are both safe; carrying the variable is not.
+        if (f.calls.length > 0) {
+          assert.deepEqual(mountedServer(f).env, canonicalEnv(f));
+          assert.notInclude(JSON.stringify(f.calls), Object.keys(extra)[0]!);
+        } else {
+          assert.notEqual(outcome._tag === "Success" ? outcome.success.code : "", "mounted");
+        }
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  const refusals: ReadonlyArray<{
+    readonly name: string;
+    readonly expected: string;
+    readonly build: (f: Official) => unknown;
+  }> = [
+    {
+      name: "another binary",
+      expected: "user_server",
+      build: (f) => ({ ...f.official, command: f.other }),
+    },
+    {
+      name: "symlink to another binary",
+      expected: "user_server",
+      build: (f) => ({ ...f.official, command: f.foreignLink }),
+    },
+    {
+      name: "extra argument",
+      expected: "user_server",
+      build: (f) => ({ ...f.official, args: ["mcp", "-v"] }),
+    },
+    { name: "empty args", expected: "user_server", build: (f) => ({ ...f.official, args: [] }) },
+    {
+      name: "custom url",
+      expected: "user_server",
+      build: () => ({ type: "http", url: "http://private.invalid/mcp" }),
+    },
+    {
+      name: "enabled false",
+      expected: "disabled",
+      build: (f) => ({ ...f.official, enabled: false }),
+    },
+    { name: "non-record", expected: "user_server", build: () => "bridget" },
+    {
+      name: "non-string env",
+      expected: "user_server",
+      build: (f) => ({ ...f.official, env: { A: 1 } }),
+    },
+    {
+      name: "inherited identity",
+      expected: "inherited_identity",
+      build: (f) => ({ ...f.official, env: { BRIDGET_AGENT_ID_FILE: "/private/id" } }),
+    },
+    ...["HOME", "BRIDGET_HOME", "BRIDGET_SOCKET", "T3CODE_HOME"].map((key) => ({
+      name: `foreign ${key}`,
+      expected: "namespace_unavailable",
+      build: (f: Official) => ({ ...f.official, env: { [key]: "/foreign" } }),
+    })),
+    {
+      name: "missing executable",
+      expected: "executable_unavailable",
+      build: (f) => ({ ...f.official, command: `${f.home}/missing/bridget` }),
+    },
+  ];
+  it.effect.each(refusals)(
+    "refuses a profile definition and mounts nothing: $name",
+    ({ build, expected }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* officialFixture();
+          const profile = f.path.join(f.home, ".claude.json");
+          yield* f.fs.writeFileString(
+            profile,
+            JSON.stringify({ mcpServers: { bridget: build(f) } }),
+          );
+          const before = yield* f.fs.readFileString(profile);
+          let applied = 0;
+          const result = yield* prepareClaudeMcp({
+            ...f.input,
+            readOnlySettings: claudeBridgetReadOnlySettings(undefined),
+            query: { ...f.input.query, applyFlagSettings: async () => void (applied += 1) },
+          });
+          assert.equal(result.code, expected);
+          assert.equal(f.calls.length, 0);
+          assert.equal(applied, 0);
+          assert.equal(yield* f.fs.readFileString(profile), before);
+        }).pipe(Effect.provide(NodeServices.layer)),
+      ),
+  );
+  it.effect("refuses when ANY declaration is foreign, even if another is official", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* officialFixture();
+        yield* f.fs.writeFileString(
+          f.path.join(f.home, ".claude.json"),
+          JSON.stringify({ mcpServers: { bridget: f.official } }),
+        );
+        f.setStatuses([
+          {
+            name: "bridget",
+            status: "connected",
+            scope: "project",
+            config: { ...f.official, command: f.other },
+            tools: [],
+          },
+        ]);
+        assert.equal((yield* prepareClaudeMcp(f.input)).code, "user_server");
+        assert.equal(f.calls.length, 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  it.effect.each(["disabledMcpServers", "disabledMcpjsonServers"])(
+    "keeps the user's %s opt-out over an official definition",
+    (key) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* officialFixture();
+          yield* f.fs.writeFileString(
+            f.path.join(f.home, ".claude.json"),
+            JSON.stringify({ mcpServers: { bridget: f.official }, [key]: ["bridget"] }),
+          );
+          assert.equal((yield* prepareClaudeMcp(f.input)).code, "disabled");
+          assert.equal(f.calls.length, 0);
+        }).pipe(Effect.provide(NodeServices.layer)),
+      ),
+  );
+  it.effect("keeps a disabled SDK status over an official definition", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* officialFixture();
+        yield* f.fs.writeFileString(
+          f.path.join(f.home, ".claude.json"),
+          JSON.stringify({ mcpServers: { bridget: f.official } }),
+        );
+        f.setStatuses([{ name: "bridget", status: "disabled", scope: "user", config: f.official }]);
+        assert.equal((yield* prepareClaudeMcp(f.input)).code, "disabled");
+        assert.equal(f.calls.length, 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  it.effect("still refuses explicit config, inherited process identity and revoked session", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* officialFixture();
+        yield* f.fs.writeFileString(
+          f.path.join(f.home, ".claude.json"),
+          JSON.stringify({ mcpServers: { bridget: f.official } }),
+        );
+        assert.equal(
+          (yield* prepareClaudeMcp({ ...f.input, extraArgs: { "mcp-config": "x" } })).code,
+          "explicit_config",
+        );
+        assert.equal(
+          (yield* prepareClaudeMcp({
+            ...f.input,
+            environment: { ...f.input.environment, BRIDGET_AGENT_INSTANCE_ID: "agent" },
+          })).code,
+          "inherited_identity",
+        );
+        assert.equal(
+          (yield* prepareClaudeMcp({ ...f.input, session: undefined })).code,
+          "identity_unavailable",
+        );
+        assert.equal(f.calls.length, 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  it.effect("fails closed when the refreshed server never exposes the catalogue", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* officialFixture();
+        yield* f.fs.writeFileString(
+          f.path.join(f.home, ".claude.json"),
+          JSON.stringify({ mcpServers: { bridget: f.official } }),
+        );
+        const failure = yield* prepareClaudeMcp({
+          ...f.input,
+          query: {
+            ...f.input.query,
+            setMcpServers: async () => ({ added: [], removed: [], errors: {} }),
+            mcpServerStatus: async () => [],
+          },
+        }).pipe(Effect.flip);
+        assert.equal(failure.code, "catalogue_unavailable");
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+});
