@@ -723,6 +723,16 @@ const make = Effect.gen(function* () {
             .thread({ projectId: input.projectId })
             .pipe(Effect.mapError(mapError(input, "create-thread"))));
 
+        const existingShell = yield* threads
+          .getThreadShell(candidateThreadId)
+          .pipe(Effect.mapError(mapError(input, "update-thread", candidateThreadId)));
+        if (existingShell?.bridgetTaskRef !== undefined)
+          return yield* mapError(
+            input,
+            "update-thread",
+            candidateThreadId,
+          )("Native Bridget tasks are read-only.");
+
         if (reusableLaunchReceipt !== undefined) {
           const shell = yield* threads
             .getThreadShell(candidateThreadId)

@@ -1,3 +1,4 @@
+import { bridgetTaskStatus, type BridgetLineageTask } from "@t3tools/contracts";
 import { projectTurnItemForWire } from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
 import { makeThreadFind, findProjectedThreadItems } from "./ThreadFind.ts";
@@ -336,6 +337,10 @@ export interface ProjectionStoreV2Shape {
   readonly searchThread: (
     input: OrchestrationV2SearchThreadInput,
   ) => Effect.Effect<OrchestrationV2SearchThreadResult, ProjectionStoreV2Error>;
+  readonly getBridgetTaskThreads: (
+    rootThreadId: ThreadId,
+    candidateIds?: ReadonlyArray<ThreadId>,
+  ) => Effect.Effect<ReadonlyArray<OrchestrationV2AppThread>, ProjectionStoreV2Error>;
   readonly getThreadAttachmentIds: (
     threadId: ThreadId,
   ) => Effect.Effect<ReadonlyArray<string>, ProjectionStoreV2Error>;
@@ -1369,6 +1374,11 @@ function secretRequestAsPendingInput(
   };
 }
 
+function nativeShellStatus(task: BridgetLineageTask): OrchestrationV2ShellThreadStatus {
+  const status = bridgetTaskStatus(task.status);
+  return status === "pending" ? "preparing" : status;
+}
+
 export function threadShellFromProjection(
   projection: OrchestrationV2ThreadProjection,
 ): OrchestrationV2ThreadShell {
@@ -1453,6 +1463,15 @@ export function threadShellFromProjection(
       ? {}
       : { activeOrderKey: projection.thread.activeOrderKey }),
     lineage: projection.thread.lineage,
+    ...(projection.thread.bridgetTaskRef === undefined
+      ? {}
+      : { bridgetTaskRef: projection.thread.bridgetTaskRef }),
+    ...(projection.thread.bridgetTask === undefined
+      ? {}
+      : { bridgetTask: projection.thread.bridgetTask }),
+    ...(projection.thread.bridgetLineage === undefined
+      ? {}
+      : { bridgetLineage: projection.thread.bridgetLineage }),
     forkedFrom: projection.thread.forkedFrom,
     activeProviderThreadId: projection.thread.activeProviderThreadId,
     ...(projection.thread.historyOrigin === undefined
@@ -1466,7 +1485,10 @@ export function threadShellFromProjection(
     activityRunStatus: activityRun?.status ?? null,
     activityRunStartedAt:
       activityRun === null ? null : orchestrationV2RunWorkStartedAt(activityRun),
-    status: latestRun?.status ?? "idle",
+    status:
+      projection.thread.bridgetTask === undefined
+        ? (latestRun?.status ?? "idle")
+        : nativeShellStatus(projection.thread.bridgetTask),
     ...threadErrorSummary(
       latestRootProviderFailure(latestRun, projection.turnItems),
       providerSession?.lastError ?? null,
@@ -1721,6 +1743,15 @@ function shellFromState(input: {
       ? {}
       : { activeOrderKey: input.state.thread.activeOrderKey }),
     lineage: input.state.thread.lineage,
+    ...(input.state.thread.bridgetTaskRef === undefined
+      ? {}
+      : { bridgetTaskRef: input.state.thread.bridgetTaskRef }),
+    ...(input.state.thread.bridgetTask === undefined
+      ? {}
+      : { bridgetTask: input.state.thread.bridgetTask }),
+    ...(input.state.thread.bridgetLineage === undefined
+      ? {}
+      : { bridgetLineage: input.state.thread.bridgetLineage }),
     forkedFrom: input.state.thread.forkedFrom,
     activeProviderThreadId: input.state.thread.activeProviderThreadId,
     ...(input.state.thread.historyOrigin === undefined
@@ -1733,7 +1764,10 @@ function shellFromState(input: {
     activeRunId: input.state.activeRunId,
     activityRunStatus: input.state.activityRunStatus,
     activityRunStartedAt: input.state.activityRunStartedAt,
-    status: input.state.latestRunStatus,
+    status:
+      input.state.thread.bridgetTask === undefined
+        ? input.state.latestRunStatus
+        : nativeShellStatus(input.state.thread.bridgetTask),
     lastError: input.state.lastError,
     lastErrorClass: input.state.lastErrorClass,
     usageLimitResetAt: input.state.usageLimitResetAt,
@@ -4241,6 +4275,27 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         ),
       );
 
+    const getBridgetTaskThreads: ProjectionStoreV2Shape["getBridgetTaskThreads"] = (
+      rootThreadId,
+      candidateIds = [],
+    ) =>
+      Effect.gen(function* () {
+        const rows = yield* sql<PayloadRow>`
+          SELECT payload_json FROM orchestration_v2_projection_threads
+          WHERE json_extract(payload_json, '$.bridgetTaskRef.rootThreadId') = ${rootThreadId}
+            ${candidateIds.length === 0 ? sql`` : sql`OR thread_id IN ${sql.in(candidateIds)}`}
+          ORDER BY thread_id LIMIT 4097
+        `;
+        if (rows.length > 4096)
+          return yield* new ProjectionStoreReadError({
+            threadId: rootThreadId,
+            cause: "Native projection limit exceeded.",
+          });
+        return yield* Effect.forEach(rows, (row) => decodeThreadPayload(row.payload_json));
+      }).pipe(
+        Effect.mapError((cause) => new ProjectionStoreReadError({ threadId: rootThreadId, cause })),
+      );
+
     const requireThread = (threadId: ThreadId) =>
       Effect.gen(function* () {
         const rows = yield* sql<{ readonly thread_id: string }>`
@@ -5463,6 +5518,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               AND json_extract(t.payload_json, '$.settledOverride') IS NULL
               AND json_extract(t.payload_json, '$.pinnedAt') IS NULL
               AND json_extract(t.payload_json, '$.autoSettleDisabledAt') IS NULL
+              AND json_type(t.payload_json, '$.bridgetTaskRef') IS NULL
               AND NOT EXISTS (
                 SELECT 1 FROM orchestration_v2_projection_runs active
                 WHERE active.thread_id = t.thread_id
@@ -5901,6 +5957,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       readShellSnapshot,
       getThreadShell,
       getThread,
+      getBridgetTaskThreads,
       getSettlementCandidates,
       getThreadsWithPullRequests,
       getThreadProjection,
@@ -6016,6 +6073,18 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
           }
           return projection.thread;
         }),
+      getBridgetTaskThreads: (rootThreadId, candidateIds = []) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) => {
+            const candidates = new Set(candidateIds);
+            return [...state.projections.values()]
+              .map((projection) => projection.thread)
+              .filter(
+                (thread) =>
+                  thread.bridgetTaskRef?.rootThreadId === rootThreadId || candidates.has(thread.id),
+              );
+          }),
+        ),
       getSettlementCandidates: (threadId) =>
         Effect.gen(function* () {
           const projections = (yield* Ref.get(replayState)).projections;
@@ -6028,6 +6097,7 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                 thread.settledOverride === null &&
                 thread.pinnedAt == null &&
                 thread.autoSettleDisabledAt == null &&
+                thread.bridgetTaskRef === undefined &&
                 !runs.some(isActivityRunForShell) &&
                 !runtimeRequests.some((request) => request.status === "pending"),
             )

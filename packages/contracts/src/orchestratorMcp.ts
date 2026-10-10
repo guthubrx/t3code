@@ -1,3 +1,4 @@
+import { BridgetTaskRef } from "./bridgetLineage.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
@@ -303,6 +304,7 @@ export const OrchestratorMcpThreadListInput = Schema.Struct({
 export type OrchestratorMcpThreadListInput = typeof OrchestratorMcpThreadListInput.Type;
 
 export const OrchestratorMcpThreadListItem = Schema.Struct({
+  bridgetTaskRef: Schema.optional(BridgetTaskRef),
   threadId: ThreadId,
   title: Schema.String,
   createdBy: OrchestrationV2Actor,
@@ -350,6 +352,7 @@ export const OrchestratorMcpThreadReadInput = Schema.Struct({
 export type OrchestratorMcpThreadReadInput = typeof OrchestratorMcpThreadReadInput.Type;
 
 export const OrchestratorMcpThreadDetail = Schema.Struct({
+  bridgetTaskRef: Schema.optional(BridgetTaskRef),
   threadId: ThreadId,
   projectId: ProjectId,
   title: Schema.String,
@@ -648,6 +651,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     code: Schema.Literals([
       "capability_denied",
       "parent_not_active",
+      "permission_attestation_unavailable",
       "provider_unavailable",
       "model_unavailable",
       "runtime_mode_escalation_denied",

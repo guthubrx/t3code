@@ -227,6 +227,7 @@ it.effect(
           getThreadAttachmentIds: () => Effect.die("Unused attachment lookup"),
           searchThread: () => Effect.die("unused"),
           searchThreadStream: () => Stream.empty,
+          getBridgetTaskThreads: () => Effect.succeed([]),
           getThreadHistoryPage: () => Effect.die("unused"),
           getTimelinePage: () => Effect.die("Unused timeline read"),
           getMessageCount: () => Effect.die("unused message count"),

@@ -4,6 +4,16 @@ import {
   BridgetReadInput,
   BridgetWatchInput,
   BridgetWatchEvent,
+  BridgetLineageSnapshot,
+  BridgetLineageDetail,
+  BridgetLineageJournal,
+  BridgetLineageError,
+  BridgetLineageErrorCode,
+  BridgetLineageCancelResult,
+  type BridgetLineageWatchInput,
+  type BridgetLineageReadInput,
+  type BridgetLineageCancelInput,
+  type BridgetLineageJournalInput,
 } from "@t3tools/contracts";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import * as Context from "effect/Context";
@@ -63,6 +73,21 @@ export class BridgetReader extends Context.Service<
   BridgetReader,
   {
     readonly read: (input: BridgetReadInput) => Effect.Effect<BridgetHumanView, BridgetReadError>;
+    readonly lineageSnapshot: (
+      input: BridgetLineageWatchInput,
+    ) => Effect.Effect<BridgetLineageSnapshot, BridgetLineageError>;
+    readonly lineageRead: (
+      input: Exclude<BridgetLineageReadInput, { readonly action: "list" }>,
+    ) => Effect.Effect<BridgetLineageDetail | BridgetLineageJournal, BridgetLineageError>;
+    readonly lineageWatch: (
+      input: BridgetLineageWatchInput,
+    ) => Stream.Stream<BridgetWatchEvent, BridgetLineageError>;
+    readonly lineageJournal: (
+      input: BridgetLineageJournalInput,
+    ) => Stream.Stream<BridgetLineageJournal, BridgetLineageError>;
+    readonly lineageCancel: (
+      input: BridgetLineageCancelInput,
+    ) => Effect.Effect<BridgetLineageCancelResult, BridgetLineageError>;
     readonly watch: (
       input: BridgetWatchInput,
     ) => Stream.Stream<BridgetWatchEvent, BridgetReadError>;
@@ -84,11 +109,16 @@ const make = Effect.gen(function* () {
 
   const resolveContext = Effect.fn("BridgetReader.resolveContext")(function* (
     input: BridgetWatchInput,
+    nativeContext = false,
   ) {
     const thread = yield* snapshots
       .getThreadShell(input.threadId)
       .pipe(Effect.mapError(() => new BridgetReadError({ code: "storage_unavailable" })));
-    if (thread === null) return yield* new BridgetReadError({ code: "context_missing" });
+    if (
+      thread === null ||
+      (nativeContext && (thread.deletedAt !== null || thread.bridgetTaskRef !== undefined))
+    )
+      return yield* new BridgetReadError({ code: "context_missing" });
     if (thread.projectId !== input.projectId)
       return yield* new BridgetReadError({ code: "project_mismatch" });
     const project = yield* projects
@@ -352,7 +382,396 @@ const make = Effect.gen(function* () {
         );
       }),
     );
-  return BridgetReader.of({ read, watch });
+  const refusal = Schema.Struct({
+    version: Schema.Literal(1),
+    status: Schema.Literal("error"),
+    code: BridgetLineageErrorCode,
+    retryable: Schema.optional(Schema.Boolean),
+  });
+  const decodeRefusal = Schema.decodeUnknownEffect(refusal, { onExcessProperty: "error" });
+  const decodeLineageJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
+  const encodeJournalEvent = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+  const resolveLineageContext = (input: BridgetLineageWatchInput) =>
+    resolveContext(input, true).pipe(
+      Effect.mapError(
+        (error) =>
+          new BridgetLineageError({
+            code: error.code === "project_mismatch" ? "project_mismatch" : "binding_unavailable",
+          }),
+      ),
+    );
+  const lineageArgs = (input: BridgetLineageWatchInput, workspaceRoot: string) => [
+    "--t3-thread",
+    input.threadId,
+    "--project-root",
+    workspaceRoot,
+  ];
+  const decodeNativeJson = Effect.fn("BridgetReader.decodeNativeJson")(function* (output: string) {
+    const value = yield* decodeLineageJson(output).pipe(
+      Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+    );
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      "status" in value &&
+      value.status === "error"
+    ) {
+      const rejected = yield* decodeRefusal(value).pipe(
+        Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+      );
+      return yield* new BridgetLineageError({ code: rejected.code });
+    }
+    return value;
+  });
+  const runLineage = Effect.fn("BridgetReader.runLineage")(function* (
+    args: string[],
+    maxBytes: number,
+  ) {
+    const command = yield* resolveExecutable.pipe(
+      Effect.mapError(() => new BridgetLineageError({ code: "unavailable" })),
+    );
+    const output = yield* runner
+      .run({
+        command,
+        args,
+        timeout: "6 seconds",
+        maxOutputBytes: maxBytes + 1024,
+        outputMode: "error",
+      })
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new BridgetLineageError({
+              code:
+                error._tag === "ProcessTimeoutError"
+                  ? "timeout"
+                  : error._tag === "ProcessOutputLimitError"
+                    ? "output_limit"
+                    : error._tag === "ProcessSpawnError"
+                      ? "unavailable"
+                      : "command_failed",
+            }),
+        ),
+      );
+    if (output.timedOut) return yield* new BridgetLineageError({ code: "timeout" });
+    if (
+      output.stdoutTruncated ||
+      output.stderrTruncated ||
+      Buffer.byteLength(output.stdout, "utf8") > maxBytes
+    )
+      return yield* new BridgetLineageError({ code: "output_limit" });
+    if (output.stdoutInvalidUtf8) return yield* new BridgetLineageError({ code: "invalid_output" });
+    const decoded = yield* decodeNativeJson(output.stdout);
+    if (output.code !== 0)
+      return yield* new BridgetLineageError({
+        code: output.code === 3 ? "unavailable" : "command_failed",
+      });
+    return decoded;
+  });
+  // O(n): each bounded page is decoded once; no mutation or provider operation.
+  const lineageSnapshotPages = Effect.fn("BridgetReader.lineageSnapshot")(function* (
+    input: BridgetLineageWatchInput,
+  ) {
+    const project = yield* resolveLineageContext(input);
+    let head: BridgetLineageSnapshot | undefined;
+    const tasks: BridgetLineageSnapshot["tasks"][number][] = [];
+    const cursors = new Set<string>();
+    let cursor: string | null = null;
+    do {
+      const raw: unknown = yield* runLineage(
+        [
+          "lineage",
+          "inspect",
+          ...lineageArgs(input, project.workspaceRoot),
+          "--action",
+          "list",
+          "--limit",
+          "100",
+          ...(cursor === null ? [] : ["--cursor", cursor]),
+          "--json",
+        ],
+        128 * 1024,
+      );
+      const page: BridgetLineageSnapshot = yield* Schema.decodeUnknownEffect(
+        BridgetLineageSnapshot,
+        { onExcessProperty: "error" },
+      )(raw).pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })));
+      if (
+        page.tasks.length > 100 ||
+        (head !== undefined &&
+          (page.seq !== head.seq ||
+            page.generation !== head.generation ||
+            page.root_owner_agent_id !== head.root_owner_agent_id))
+      )
+        return yield* new BridgetLineageError({ code: "snapshot_changed" });
+      head ??= page;
+      tasks.push(...page.tasks);
+      if (tasks.length > 4096) return yield* new BridgetLineageError({ code: "resource_limit" });
+      cursor = page.next_cursor;
+      if (cursor !== null) {
+        if (cursors.has(cursor) || page.tasks.length === 0)
+          return yield* new BridgetLineageError({ code: "invalid_output" });
+        cursors.add(cursor);
+      }
+    } while (cursor !== null);
+    return { ...head!, tasks, next_cursor: null };
+  });
+  const lineageSnapshot = (input: BridgetLineageWatchInput) =>
+    lineageSnapshotPages(input).pipe(
+      Effect.timeoutOrElse({
+        duration: "30 seconds",
+        orElse: () => Effect.fail(new BridgetLineageError({ code: "timeout" })),
+      }),
+    );
+  // Native pages budget serialized JournalEntry bodies separately from the envelope.
+  // The wire margin covers metadata and delimiters for up to 100 events.
+  const journalContentBytes = 16 * 1024;
+  const journalEnvelopeBytes = 24 * 1024;
+  const validateJournal = (journal: BridgetLineageJournal, taskId: string, afterSeq: number) =>
+    Effect.gen(function* () {
+      if (
+        journal.task_id !== taskId ||
+        journal.next_seq < afterSeq ||
+        (journal.gap !== null && journal.gap.to_seq < journal.gap.from_seq)
+      )
+        return yield* new BridgetLineageError({ code: "invalid_output" });
+      let previous = afterSeq;
+      let contentBytes = 0;
+      for (const event of journal.events) {
+        if (event.seq <= previous || event.seq > journal.next_seq)
+          return yield* new BridgetLineageError({ code: "invalid_output" });
+        const encoded = yield* encodeJournalEvent(event).pipe(
+          Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+        );
+        contentBytes += Buffer.byteLength(encoded, "utf8");
+        if (contentBytes > journalContentBytes)
+          return yield* new BridgetLineageError({ code: "output_limit" });
+        previous = event.seq;
+      }
+      return journal;
+    });
+  const lineageRead = Effect.fn("BridgetReader.lineageRead")(function* (
+    input: Exclude<BridgetLineageReadInput, { readonly action: "list" }>,
+  ) {
+    const project = yield* resolveLineageContext(input);
+    const args = [
+      "lineage",
+      "inspect",
+      ...lineageArgs(input, project.workspaceRoot),
+      "--action",
+      input.action,
+      "--task",
+      input.taskId,
+      "--json",
+    ];
+    if (input.limit !== undefined) args.push("--limit", String(input.limit));
+    if (input.action === "show" && input.offset !== undefined)
+      args.push("--offset", String(input.offset));
+    if (input.action === "journal" && input.afterSeq !== undefined)
+      args.push("--after-seq", String(input.afterSeq));
+    const raw = yield* runLineage(args, input.action === "show" ? 24 * 1024 : journalEnvelopeBytes);
+    if (input.action === "show") {
+      const detail = yield* Schema.decodeUnknownEffect(BridgetLineageDetail, {
+        onExcessProperty: "error",
+      })(raw).pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })));
+      const resultBytes = Buffer.byteLength(detail.result ?? "", "utf8");
+      if (
+        detail.task.task_id !== input.taskId ||
+        detail.result_offset !== (input.offset ?? 0) ||
+        resultBytes > (input.limit ?? 16384) ||
+        detail.result_offset + resultBytes > detail.result_total_bytes ||
+        (detail.result_next_offset !== null &&
+          (detail.result_next_offset !== detail.result_offset + resultBytes || resultBytes === 0))
+      )
+        return yield* new BridgetLineageError({ code: "invalid_output" });
+      return detail;
+    }
+    const journal = yield* Schema.decodeUnknownEffect(BridgetLineageJournal, {
+      onExcessProperty: "error",
+    })(raw).pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })));
+    return yield* validateJournal(journal, input.taskId, input.afterSeq ?? 0);
+  });
+  const lineageCancel = Effect.fn("BridgetReader.lineageCancel")(function* (
+    input: BridgetLineageCancelInput,
+  ) {
+    const project = yield* resolveLineageContext(input);
+    const raw = yield* runLineage(
+      [
+        "lineage",
+        "cancel",
+        ...lineageArgs(input, project.workspaceRoot),
+        "--task",
+        input.taskId,
+        "--request-id",
+        input.requestId,
+        "--json",
+      ],
+      4096,
+    );
+    const receipt = yield* Schema.decodeUnknownEffect(BridgetLineageCancelResult, {
+      onExcessProperty: "error",
+    })(raw).pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })));
+    if (receipt.task_id !== input.taskId)
+      return yield* new BridgetLineageError({ code: "invalid_output" });
+    return receipt;
+  });
+
+  // This private framing helper shares only CLI NDJSON handling, not state or authority.
+  const lineageLines = (input: BridgetLineageWatchInput, tail: string[], maxLine: number) =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        const project = yield* resolveLineageContext(input);
+        const command = yield* resolveExecutable.pipe(
+          Effect.mapError(() => new BridgetLineageError({ code: "unavailable" })),
+        );
+        const child = yield* spawner
+          .spawn(
+            ChildProcess.make(
+              command,
+              [
+                "lineage",
+                ...tail.slice(0, 1),
+                ...lineageArgs(input, project.workspaceRoot),
+                ...tail.slice(1),
+                "--json",
+              ],
+              { shell: false, stdin: "ignore", stderr: "ignore" },
+            ),
+          )
+          .pipe(Effect.mapError(() => new BridgetLineageError({ code: "unavailable" })));
+        const ready = yield* Deferred.make<void>();
+        const partial = new Uint8Array(maxLine);
+        let length = 0;
+        const parse = Effect.fn("BridgetReader.lineageLines.parse")(function* (chunk: Uint8Array) {
+          const values: unknown[] = [];
+          for (const byte of chunk) {
+            if (byte === 10) {
+              const line = yield* Effect.try({
+                try: () =>
+                  new TextDecoder("utf-8", { fatal: true }).decode(partial.subarray(0, length)),
+                catch: () => new BridgetLineageError({ code: "invalid_output" }),
+              });
+              length = 0;
+              values.push(yield* decodeNativeJson(line));
+              yield* Deferred.succeed(ready, undefined);
+            } else {
+              if (length === partial.length)
+                return yield* new BridgetLineageError({ code: "output_limit" });
+              partial[length++] = byte;
+            }
+          }
+          return values;
+        });
+        const handshake = Deferred.await(ready).pipe(
+          Effect.timeoutOrElse({
+            duration: "6 seconds",
+            orElse: () => Effect.fail(new BridgetLineageError({ code: "timeout" })),
+          }),
+          Effect.andThen(Effect.never),
+        );
+        return child.stdout.pipe(
+          Stream.mapError(() => new BridgetLineageError({ code: "command_failed" })),
+          Stream.flatMap((chunk) =>
+            Stream.fromIterable(
+              (function* () {
+                for (let offset = 0; offset < chunk.length; offset += maxLine)
+                  yield chunk.subarray(offset, offset + maxLine);
+              })(),
+              { chunkSize: 1 },
+            ),
+          ),
+          Stream.mapEffect(parse),
+          Stream.flatMap(Stream.fromIterable),
+          Stream.concat(
+            Stream.suspend(() =>
+              Stream.fail(
+                new BridgetLineageError({
+                  code: length === 0 ? "command_failed" : "invalid_output",
+                }),
+              ),
+            ),
+          ),
+          Stream.interruptWhen(handshake),
+        );
+      }),
+    );
+  const lineageWatch = (input: BridgetLineageWatchInput) =>
+    Stream.unwrap(
+      Effect.sync(() => {
+        let generation: string | undefined;
+        let sequence = -1;
+        return lineageLines(input, ["watch"], 4096).pipe(
+          Stream.mapEffect((raw) =>
+            Effect.gen(function* () {
+              const event = yield* Schema.decodeUnknownEffect(BridgetWatchEvent, {
+                onExcessProperty: "error",
+              })(raw).pipe(
+                Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+              );
+              if (generation === undefined) {
+                if (event.status !== "ready" || event.seq !== 0)
+                  return yield* new BridgetLineageError({ code: "invalid_output" });
+                generation = event.generation;
+              } else if (
+                event.status === "ready" ||
+                (event.generation === generation && event.seq <= sequence)
+              ) {
+                return yield* new BridgetLineageError({ code: "invalid_output" });
+              } else if (event.generation !== generation && event.status !== "resync") {
+                return yield* new BridgetLineageError({ code: "invalid_output" });
+              }
+              generation = event.generation;
+              sequence = event.seq;
+              return event;
+            }),
+          ),
+        );
+      }),
+    );
+  const lineageJournal = (input: BridgetLineageJournalInput) =>
+    Stream.unwrap(
+      Effect.sync(() => {
+        let afterSeq = input.afterSeq ?? 0;
+        return lineageLines(
+          input,
+          [
+            "inspect",
+            "--action",
+            "journal",
+            "--task",
+            input.taskId,
+            "--after-seq",
+            String(afterSeq),
+            "--limit",
+            "100",
+            "--follow",
+          ],
+          journalEnvelopeBytes,
+        ).pipe(
+          Stream.mapEffect((raw) =>
+            Effect.gen(function* () {
+              const journal = yield* Schema.decodeUnknownEffect(BridgetLineageJournal, {
+                onExcessProperty: "error",
+              })(raw).pipe(
+                Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+              );
+              yield* validateJournal(journal, input.taskId, afterSeq);
+              afterSeq = journal.next_seq;
+              return journal;
+            }),
+          ),
+        );
+      }),
+    );
+  return BridgetReader.of({
+    read,
+    watch,
+    lineageSnapshot,
+    lineageRead,
+    lineageWatch,
+    lineageJournal,
+    lineageCancel,
+  });
 });
 
 export const layer = Layer.effect(BridgetReader, make);

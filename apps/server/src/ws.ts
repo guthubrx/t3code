@@ -177,6 +177,7 @@ import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as BridgetReader from "./bridget/BridgetReader.ts";
+import * as BridgetLineage from "./bridget/BridgetLineage.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import { withTerminalOutputWindow } from "./terminal/OutputProtocol.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
@@ -1285,6 +1286,7 @@ const layerWsRpc = (
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
       const bridgetReader = yield* BridgetReader.BridgetReader;
+      const bridgetLineage = yield* BridgetLineage.BridgetLineage;
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -1819,6 +1821,10 @@ const layerWsRpc = (
       const handlers = ServerWsRpcGroup.of({
         [WS_METHODS.bridgetRead]: (input) => bridgetReader.read(input),
         [WS_METHODS.bridgetWatch]: (input) => bridgetReader.watch(input),
+        [WS_METHODS.bridgetLineageRead]: (input) => bridgetLineage.read(input),
+        [WS_METHODS.bridgetLineageWatch]: (input) => bridgetLineage.watch(input),
+        [WS_METHODS.bridgetLineageJournal]: (input) => bridgetLineage.journal(input),
+        [WS_METHODS.bridgetLineageCancel]: (input) => bridgetLineage.cancel(input),
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
           Effect.annotateCurrentSpan({
             "orchestration_v2.command_id": command.commandId,
@@ -3137,6 +3143,7 @@ export const layer = Layer.unwrap(
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const pullRequests = yield* PullRequestService.PullRequestService;
     const bridgetReader = yield* BridgetReader.BridgetReader;
+    const bridgetLineage = yield* BridgetLineage.BridgetLineage;
     const sql = yield* SqlClient.SqlClient;
     return HttpRouter.add(
       "GET",
@@ -3204,6 +3211,7 @@ export const layer = Layer.unwrap(
               // mutation invalidates the HTTP diff cache that every client reads from.
               Layer.provide(Layer.succeed(PullRequestService.PullRequestService, pullRequests)),
               Layer.provide(Layer.succeed(BridgetReader.BridgetReader, bridgetReader)),
+              Layer.provide(Layer.succeed(BridgetLineage.BridgetLineage, bridgetLineage)),
               Layer.provide(
                 SourceControlDiscovery.layer.pipe(
                   Layer.provide(

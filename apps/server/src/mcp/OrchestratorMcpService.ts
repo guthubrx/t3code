@@ -1,5 +1,6 @@
 import {
   CommandId,
+  BridgetSessionIdentity,
   type RunId,
   isProviderAvailable,
   MessageId,
@@ -92,6 +93,7 @@ import {
   requireThreadScope,
 } from "./McpInvocationContext.ts";
 import * as Metrics from "../observability/Metrics.ts";
+import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
@@ -121,13 +123,9 @@ type TerminalTaskStatus = Extract<
 >;
 
 export interface OrchestratorMcpServiceShape {
-  readonly sessionIdentity: (scope: McpInvocationScope) => Effect.Effect<{
-    version: 1;
-    environmentId: string;
-    threadId: string;
-    providerSessionId: string;
-    providerInstanceId: string;
-  }, OrchestratorMcpFailure>;
+  readonly sessionIdentity: (
+    scope: McpInvocationScope,
+  ) => Effect.Effect<BridgetSessionIdentity, OrchestratorMcpFailure>;
   readonly capabilities: (
     scope: McpInvocationScope,
   ) => Effect.Effect<OrchestratorMcpCapabilitiesResult, OrchestratorMcpFailure>;
@@ -199,6 +197,7 @@ export class OrchestratorMcpService extends Context.Service<
 >()("t3/mcp/OrchestratorMcpService") {}
 
 const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
+const decodeBridgetSessionIdentity = Schema.decodeUnknownEffect(BridgetSessionIdentity);
 
 function failure(code: OrchestratorMcpFailure["code"], message: string): OrchestratorMcpFailure {
   return new OrchestratorMcpFailure({ code, message });
@@ -646,6 +645,7 @@ function listItemFromShell(
 ): OrchestratorMcpThreadListItem {
   return {
     threadId: shell.id,
+    ...(shell.bridgetTaskRef === undefined ? {} : { bridgetTaskRef: shell.bridgetTaskRef }),
     title: shell.title,
     createdBy: shell.createdBy,
     creationSource: shell.creationSource,
@@ -676,11 +676,17 @@ function threadDetail(
   const active = ThreadManagementService.latestActiveRun(projection);
   return {
     threadId: projection.thread.id,
+    ...(projection.thread.bridgetTaskRef === undefined
+      ? {}
+      : { bridgetTaskRef: projection.thread.bridgetTaskRef }),
     projectId: projection.thread.projectId,
     title: projection.thread.title,
     createdBy: projection.thread.createdBy,
     creationSource: projection.thread.creationSource,
-    status: active?.status ?? latest?.status ?? "idle",
+    status:
+      projection.thread.bridgetTaskRef === undefined
+        ? (active?.status ?? latest?.status ?? "idle")
+        : shell.status,
     latestRunId: latest?.id ?? null,
     activeRunId: active?.id ?? null,
     providerInstanceId: projection.thread.modelSelection.instanceId,
@@ -1781,13 +1787,60 @@ const make = Effect.gen(function* () {
           return yield* failure("parent_not_active", "The calling thread has been deleted.");
         }
         yield* assertLiveCaller(scope, parent);
-        return {
-          version: 1 as const,
+        const credential = McpProviderSession.readMcpProviderSession(scope.thread.threadId);
+        const activeRun = ThreadManagementService.latestActiveRun(parent);
+        if (
+          credential === undefined ||
+          activeRun === undefined ||
+          credential.environmentId !== scope.environmentId ||
+          credential.providerSessionId !== scope.thread.providerSessionId ||
+          credential.providerInstanceId !== scope.thread.providerInstanceId
+        ) {
+          return yield* failure(
+            "permission_attestation_unavailable",
+            "The current provider credential does not own this attestation.",
+          );
+        }
+        const fact = yield* Effect.promise(() =>
+          McpProviderSession.readMcpProviderPermissions(credential, activeRun.id, {
+            attemptId: activeRun.activeAttemptId,
+            providerThreadId: activeRun.providerThreadId,
+          }),
+        );
+        // Source verification does I/O. Recheck the live run and credential after it.
+        const current = yield* loadProjection(scope.thread.threadId);
+        yield* assertLiveCaller(scope, current);
+        const currentRun = ThreadManagementService.latestActiveRun(current);
+        if (
+          currentRun?.id !== activeRun.id ||
+          currentRun.activeAttemptId !== activeRun.activeAttemptId ||
+          currentRun.providerThreadId !== activeRun.providerThreadId ||
+          McpProviderSession.readMcpProviderSession(scope.thread.threadId) !== credential ||
+          fact.status === "unavailable"
+        ) {
+          return yield* failure(
+            "permission_attestation_unavailable",
+            "The provider permission fact is missing, stale or no longer owned by this run.",
+          );
+        }
+        const identity = {
           environmentId: scope.environmentId,
           threadId: scope.thread.threadId,
           providerSessionId: scope.thread.providerSessionId,
           providerInstanceId: scope.thread.providerInstanceId,
         };
+        return yield* decodeBridgetSessionIdentity(
+          fact.status === "absent"
+            ? { version: 1, ...identity }
+            : { version: 2, ...identity, permissions: fact.permissions },
+        ).pipe(
+          Effect.mapError(() =>
+            failure(
+              "permission_attestation_unavailable",
+              "The provider permission fact is unsupported.",
+            ),
+          ),
+        );
       }),
     capabilities: (scope) =>
       Effect.gen(function* () {

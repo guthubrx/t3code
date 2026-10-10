@@ -32,6 +32,16 @@ import {
   BridgetWatchInput,
   BridgetWatchEvent,
 } from "./bridget.ts";
+import {
+  BridgetLineageReadInput,
+  BridgetLineageView,
+  BridgetLineageWatchInput,
+  BridgetLineageJournalInput,
+  BridgetLineageJournal,
+  BridgetLineageCancelInput,
+  BridgetLineageCancelResult,
+  BridgetLineageError,
+} from "./bridgetLineage.ts";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   CodexAuthCallbackInput,
@@ -367,6 +377,10 @@ import { Project, ProjectMutation, ProjectMutationError } from "./project.ts";
 export const WS_METHODS = {
   bridgetRead: "bridget.read",
   bridgetWatch: "bridget.watch",
+  bridgetLineageRead: "bridget.lineage.read",
+  bridgetLineageWatch: "bridget.lineage.watch",
+  bridgetLineageJournal: "bridget.lineage.journal",
+  bridgetLineageCancel: "bridget.lineage.cancel",
   // Project registry methods
   projectsList: "projects.list",
   projectsAdd: "projects.add",
@@ -1200,6 +1214,29 @@ const WsBridgetWatchRpc = Rpc.make(WS_METHODS.bridgetWatch, {
   stream: true,
 });
 
+const WsBridgetLineageReadRpc = Rpc.make(WS_METHODS.bridgetLineageRead, {
+  payload: BridgetLineageReadInput,
+  success: BridgetLineageView,
+  error: Schema.Union([BridgetLineageError, EnvironmentAuthorizationError]),
+});
+const WsBridgetLineageWatchRpc = Rpc.make(WS_METHODS.bridgetLineageWatch, {
+  payload: BridgetLineageWatchInput,
+  success: BridgetWatchEvent,
+  error: Schema.Union([BridgetLineageError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+const WsBridgetLineageJournalRpc = Rpc.make(WS_METHODS.bridgetLineageJournal, {
+  payload: BridgetLineageJournalInput,
+  success: BridgetLineageJournal,
+  error: Schema.Union([BridgetLineageError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+const WsBridgetLineageCancelRpc = Rpc.make(WS_METHODS.bridgetLineageCancel, {
+  payload: BridgetLineageCancelInput,
+  success: BridgetLineageCancelResult,
+  error: Schema.Union([BridgetLineageError, EnvironmentAuthorizationError]),
+});
+
 const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   payload: ProjectWriteFileInput,
   success: ProjectWriteFileResult,
@@ -1833,6 +1870,10 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 export const WsRpcGroup = RpcGroup.make(
   WsBridgetReadRpc,
   WsBridgetWatchRpc,
+  WsBridgetLineageReadRpc,
+  WsBridgetLineageWatchRpc,
+  WsBridgetLineageJournalRpc,
+  WsBridgetLineageCancelRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

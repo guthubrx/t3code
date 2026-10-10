@@ -1,3 +1,5 @@
+import * as BridgetReader from "../bridget/BridgetReader.ts";
+import * as ProcessRunner from "../processRunner.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
@@ -201,10 +203,17 @@ const layerRunFinalizationServiceProvided = RunFinalizationService.layer.pipe(
   Layer.provide(Layer.merge(layerCheckpointCaptureServiceProvided, ProjectionStore.layer)),
 );
 
+export const layerBridgetReader = BridgetReader.layer.pipe(
+  Layer.provide(ProcessRunner.layer),
+  Layer.provide(ProjectionStore.layer),
+  Layer.provide(ProjectStore.layer),
+);
+
 const layerOrchestratorProvided = Orchestrator.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerCheckpointServiceProvided,
+      layerBridgetReader,
       CommandPolicy.layer,
       layerStores,
       layerEventSinkProvided,

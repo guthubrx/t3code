@@ -1,3 +1,4 @@
+import * as Crypto from "effect/Crypto";
 import type {
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
@@ -20,6 +21,10 @@ import {
   ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE,
   type ChatAttachment,
   CommandId,
+  NodeId,
+  ProviderDriverKind,
+  BridgetLineageTask,
+  bridgetTaskStatus,
   isProviderNativeSubagentThread,
   MessageId,
   type ModelSelection,
@@ -77,6 +82,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as ProjectStore from "./ProjectStore.ts";
+import * as BridgetReader from "../bridget/BridgetReader.ts";
 import {
   isCheckpointRestoreIsolated,
   SHARED_WORKSPACE_RESTORE_MESSAGE,
@@ -423,9 +429,12 @@ function isGoalCommand(message: {
 }
 
 const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLinkedPullRequest));
+const bridgetLineageTasksEqual = Schema.toEquivalence(BridgetLineageTask);
 
 function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
   switch (command.type) {
+    case "bridget.lineage.sync":
+    case "bridget.lineage.unavailable":
     case "thread.create":
     case "thread.archive":
     case "thread.unarchive":
@@ -803,6 +812,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const idAllocator = yield* IdAllocatorV2;
   const projects = yield* ProjectStore.ProjectStoreV2;
   const projectionStore = yield* ProjectionStoreV2;
+  const bridgetReader = yield* Effect.serviceOption(BridgetReader.BridgetReader);
+  const nativeCrypto = yield* Effect.serviceOption(Crypto.Crypto);
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
   const nextTurnItemOrdinal = (
     projection: Pick<OrchestrationV2ThreadProjection, "thread"> &
@@ -8310,7 +8321,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         open: {
           subagents: new Map(
             input.projection.subagents
-              .filter((task) => task.runId === run.id && task.origin !== "app_owned")
+              .filter((task) => task.runId === run.id && task.origin === "provider_native")
               .map((task) => [task.id, task]),
           ),
           nodes: new Map(
@@ -9047,6 +9058,75 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ),
         );
       if (projection.thread.deletedAt !== null) return undefined;
+      const nativeRef = projection.thread.bridgetTaskRef;
+      const nativeContext = {
+        projectId: projection.thread.projectId,
+        threadId: nativeRef?.rootThreadId ?? projection.thread.id,
+      };
+      const cancelNative = (taskId: string) =>
+        Effect.gen(function* () {
+          if (Option.isNone(nativeCrypto))
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: "Native request identity is unavailable.",
+            });
+          const requestId = yield* nativeCrypto.value.randomUUIDv4.pipe(Effect.orDie);
+          if (Option.isNone(bridgetReader))
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: "Native Bridget transport is unavailable.",
+            });
+          yield* bridgetReader.value
+            .lineageCancel({ ...nativeContext, taskId, requestId })
+            .pipe(mapDispatchError(command));
+        });
+      if (nativeRef !== undefined) {
+        yield* cancelNative(nativeRef.taskId);
+        return undefined;
+      }
+      const hasActiveNativeChildren = projection.subagents.some(
+        (task) =>
+          task.origin === "bridget_native" &&
+          ["pending", "running", "waiting"].includes(task.status),
+      );
+      if (hasActiveNativeChildren && Option.isNone(bridgetReader))
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Native Bridget transport is unavailable.",
+        });
+      const nativeSnapshot = yield* Option.isNone(bridgetReader)
+        ? Effect.succeed(null)
+        : bridgetReader.value.lineageSnapshot(nativeContext).pipe(
+            Effect.catch((error) =>
+              !hasActiveNativeChildren ? Effect.succeed(null) : Effect.fail(error),
+            ),
+            mapDispatchError(command),
+          );
+      if (nativeSnapshot !== null) {
+        const nativeTasks = new Map(nativeSnapshot.tasks.map((task) => [task.task_id, task]));
+        const activeTasks = new Set(
+          nativeSnapshot.tasks
+            .filter((task) => !["result_available", "failed", "cancelled"].includes(task.status))
+            .map((task) => task.task_id),
+        );
+        for (const task of nativeSnapshot.tasks) {
+          if (!activeTasks.has(task.task_id)) continue;
+          let ancestor = task.parent_task_id;
+          let activeAncestor = false;
+          for (let depth = 0; ancestor !== null && depth < 8; depth++) {
+            if (activeTasks.has(ancestor)) {
+              activeAncestor = true;
+              break;
+            }
+            ancestor = nativeTasks.get(ancestor)?.parent_task_id ?? null;
+          }
+          // A failed ancestor can still have an independently active descendant.
+          if (!activeAncestor) yield* cancelNative(task.task_id);
+        }
+      }
       // Queued messages never started and cannot own background work.
       const latestRun = projection.runs.findLast((run) => run.status !== "queued");
       const target =
@@ -9335,6 +9415,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const lineage = childThread.lineage;
       return lineage.relationshipToParent === "subagent" &&
         lineage.parentThreadId !== null &&
+        childThread.bridgetTaskRef === undefined &&
         childThread.forkedFrom?.type === "node"
         ? lineage.parentThreadId
         : undefined;
@@ -10120,6 +10201,280 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }),
     );
 
+  // O(n): one index plus bounded (depth <= 8) parent walks; no provider effects.
+  const dispatchBridgetLineageSync = (
+    command: Extract<OrchestrationV2ServerCommand, { readonly type: "bridget.lineage.sync" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* projectionStore
+        .getThread(command.threadId)
+        .pipe(mapDispatchError(command));
+      if (root.deletedAt !== null || root.bridgetTaskRef !== undefined)
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "A live root conversation is required.",
+        });
+      const snapshot = command.snapshot;
+      if (
+        root.bridgetLineage?.generation === snapshot.generation &&
+        root.bridgetLineage.seq > snapshot.seq
+      )
+        return;
+      const tasks = new Map(snapshot.tasks.map((task) => [task.task_id, task]));
+      if (tasks.size !== snapshot.tasks.length || snapshot.next_cursor !== null)
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "An atomic, unique native snapshot is required.",
+        });
+      for (const task of tasks.values()) {
+        const expectedParentAgent =
+          task.parent_task_id === null
+            ? snapshot.root_owner_agent_id
+            : tasks.get(task.parent_task_id)?.child_agent_id;
+        if (expectedParentAgent === undefined || expectedParentAgent !== task.parent_agent_id)
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "Invalid native parent ownership.",
+          });
+        let parent = task.parent_task_id;
+        const seen = new Set([task.task_id]);
+        let depth = 1;
+        while (parent !== null) {
+          const ancestor = tasks.get(parent);
+          if (ancestor === undefined || seen.has(parent) || ++depth > 8)
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: "Invalid native task ancestry.",
+            });
+          seen.add(parent);
+          parent = ancestor.parent_task_id;
+        }
+      }
+      const previousThreads = yield* projectionStore
+        .getBridgetTaskThreads(
+          root.id,
+          snapshot.tasks.map((task) => ThreadId.make(`thread:bridget-task:${task.task_id}`)),
+        )
+        .pipe(mapDispatchError(command));
+      const previousById = new Map(previousThreads.map((thread) => [thread.id, thread]));
+      const now = yield* DateTime.now;
+      const available = { generation: snapshot.generation, seq: snapshot.seq, available: true };
+      const emitEvent = emit(events, command);
+      for (const task of tasks.values()) {
+        const childThreadId = ThreadId.make(`thread:bridget-task:${task.task_id}`);
+        const parentThreadId =
+          task.parent_task_id === null
+            ? root.id
+            : ThreadId.make(`thread:bridget-task:${task.parent_task_id}`);
+        const taskNodeId = NodeId.make(`node:bridget-task:${task.task_id}`);
+        const parentNodeId = NodeId.make(
+          task.parent_task_id === null
+            ? `node:bridget-root:${root.id}`
+            : `node:bridget-task:${task.parent_task_id}`,
+        );
+        const previous = previousById.get(childThreadId) ?? null;
+        if (previous !== null && previous.bridgetTaskRef?.rootThreadId !== root.id)
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "Native task belongs to a different root.",
+          });
+        const taskChanged =
+          previous?.bridgetTask === undefined ||
+          !bridgetLineageTasksEqual(previous.bridgetTask, task);
+        // The root owns the snapshot watermark. An unchanged child retains its
+        // last verified marker instead of following every unrelated journal tick.
+        if (
+          !taskChanged &&
+          previous?.bridgetTaskRef?.generation === snapshot.generation &&
+          previous.bridgetLineage?.available === true
+        )
+          continue;
+        const driver = ProviderDriverKind.make(
+          task.execution_protocol === "codex_app_server" ? "codex" : "claudeAgent",
+        );
+        // Native registry names are unrestricted; the validated task UUID keeps
+        // this presentation-only instance injective and within the provider slug.
+        const providerInstanceId = ProviderInstanceId.make(`bridget-task-${task.task_id}`);
+        const modelSelection = {
+          instanceId: providerInstanceId,
+          model: task.model,
+          ...(task.effort === null
+            ? {}
+            : { options: [{ id: "reasoningEffort", value: task.effort }] }),
+        };
+        const createdAt = DateTime.makeUnsafe(task.created_at * 1000);
+        const updatedAt = DateTime.makeUnsafe(task.updated_at * 1000);
+        const child: OrchestrationV2AppThread = {
+          ...root,
+          createdBy: "agent",
+          creationSource: "server",
+          id: childThreadId,
+          title: task.title.trim() || task.agent_type,
+          providerInstanceId,
+          modelSelection,
+          activeProviderThreadId: null,
+          runtimeMode:
+            previous?.runtimeMode ??
+            (task.posture === "discovery" ? "approval-required" : root.runtimeMode),
+          interactionMode: "default",
+          worktreePath: task.cwd,
+          branch: null,
+          lineage: {
+            parentThreadId,
+            rootThreadId: root.lineage.rootThreadId,
+            relationshipToParent: "subagent",
+          },
+          bridgetTaskRef: {
+            version: 1,
+            taskId: task.task_id,
+            rootThreadId: root.id,
+            parentTaskId: task.parent_task_id,
+            generation: snapshot.generation,
+            seq: snapshot.seq,
+            status: task.status,
+          },
+          bridgetTask: task,
+          bridgetLineage: available,
+          forkedFrom: null,
+          linkedPullRequest: null,
+          pullRequests: [],
+          branchPullRequest: null,
+          createdAt,
+          updatedAt,
+          archivedAt: null,
+          deletedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          unsettledAt: null,
+          pinnedAt: null,
+          pinOrderKey: null,
+          activeOrderKey: null,
+          snoozedUntil: null,
+          snoozedAt: null,
+          autoSettleDisabledAt: null,
+          lastVisitedAt: previous?.lastVisitedAt ?? null,
+          titleRegeneration: null,
+          rollbackRequestId: undefined,
+          rollbackFailure: null,
+          limitRecovery: null,
+        };
+        yield* emitEvent({
+          type: previous === null ? "thread.created" : "thread.metadata-updated",
+          threadId: childThreadId,
+          driver,
+          providerInstanceId,
+          occurredAt: now,
+          payload: child,
+        });
+        if (!taskChanged) continue;
+        const status = bridgetTaskStatus(task.status);
+        const startedAt =
+          task.started_at === null ? null : DateTime.makeUnsafe(task.started_at * 1000);
+        const completedAt =
+          task.completed_at === null ? null : DateTime.makeUnsafe(task.completed_at * 1000);
+        yield* emitEvent({
+          type: "subagent.updated",
+          threadId: parentThreadId,
+          nodeId: taskNodeId,
+          driver,
+          providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: taskNodeId,
+            threadId: parentThreadId,
+            runId: null,
+            parentNodeId,
+            origin: "bridget_native",
+            createdBy: "agent",
+            driver,
+            providerInstanceId,
+            providerThreadId: null,
+            childThreadId,
+            nativeTaskRef: null,
+            prompt: "",
+            title: task.title,
+            model: task.model,
+            modelSelection,
+            status,
+            result: null,
+            progress: task.error ?? task.status,
+            startedAt,
+            completedAt,
+            updatedAt,
+          },
+        });
+      }
+      // Only a complete, validated snapshot can retire availability for this root.
+      // Keep the last verified task and its history when it disappears natively.
+      for (const previous of previousThreads) {
+        const ref = previous.bridgetTaskRef;
+        if (
+          ref === undefined ||
+          ref.rootThreadId !== root.id ||
+          tasks.has(ref.taskId) ||
+          previous.bridgetLineage?.available === false
+        )
+          continue;
+        yield* emitEvent({
+          type: "thread.metadata-updated",
+          threadId: previous.id,
+          occurredAt: now,
+          payload: { ...previous, bridgetLineage: { ...available, available: false } },
+        });
+      }
+      if (
+        root.bridgetLineage?.generation !== snapshot.generation ||
+        root.bridgetLineage.seq !== snapshot.seq ||
+        !root.bridgetLineage.available
+      )
+        yield* emitEvent({
+          type: "thread.metadata-updated",
+          threadId: root.id,
+          occurredAt: now,
+          payload: { ...root, bridgetLineage: available },
+        });
+    });
+
+  const dispatchBridgetLineageUnavailable = (
+    command: Extract<
+      OrchestrationV2ServerCommand,
+      { readonly type: "bridget.lineage.unavailable" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) =>
+    Effect.gen(function* () {
+      const root = yield* projectionStore
+        .getThread(command.threadId)
+        .pipe(mapDispatchError(command));
+      if (root.bridgetLineage === undefined || !root.bridgetLineage.available) return;
+      const now = yield* DateTime.now;
+      const children = yield* projectionStore
+        .getBridgetTaskThreads(root.id)
+        .pipe(mapDispatchError(command));
+      const emitEvent = emit(events, command);
+      for (const child of children) {
+        if (child.bridgetLineage?.available !== true) continue;
+        yield* emitEvent({
+          type: "thread.metadata-updated",
+          threadId: child.id,
+          occurredAt: now,
+          payload: { ...child, bridgetLineage: { ...child.bridgetLineage, available: false } },
+        });
+      }
+      yield* emitEvent({
+        type: "thread.metadata-updated",
+        threadId: root.id,
+        occurredAt: now,
+        payload: { ...root, bridgetLineage: { ...root.bridgetLineage, available: false } },
+      });
+    });
+
   const dispatchOnce = Effect.fn("orchestrationV2.dispatch.once")(function* (
     command: OrchestrationV2ServerCommand,
   ): Effect.fn.Return<
@@ -10139,6 +10494,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.thread_id": commandThreadId(command),
     });
 
+    // Every transport reaches this guard, including MCP and internal continuations.
+    if (command.type !== "bridget.lineage.sync" && command.type !== "bridget.lineage.unavailable") {
+      const targetIds =
+        command.type === "thread.fork" || command.type === "thread.merge_back"
+          ? [command.sourceThreadId, command.targetThreadId]
+          : [commandThreadId(command)];
+      for (const targetId of targetIds) {
+        const shell = yield* projectionStore
+          .getThreadShell(targetId)
+          .pipe(mapDispatchError(command));
+        if (
+          shell?.bridgetTaskRef !== undefined &&
+          command.type !== "thread.visit" &&
+          command.type !== "thread.stop"
+        )
+          return yield* new OrchestratorSubagentThreadReadOnlyError({
+            commandId: command.commandId,
+            threadId: targetId,
+          });
+      }
+    }
     const events = yield* Ref.make<Array<OrchestrationV2DomainEvent>>([]);
     const effects = yield* Ref.make<Array<PendingOrchestrationEffectV2>>([]);
     let cancelUnsettledEffects:
@@ -10148,6 +10524,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       | undefined;
     switch (command.type) {
+      case "bridget.lineage.sync":
+        yield* dispatchBridgetLineageSync(command, events);
+        break;
+      case "bridget.lineage.unavailable":
+        yield* dispatchBridgetLineageUnavailable(command, events);
+        break;
       case "thread.create":
         yield* dispatchThreadCreate(command, events);
         break;
@@ -10500,7 +10882,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         // its expected outcome, not a failure.
         planned.events.length > 0 ||
         command.type === "thread.background-work.settle" ||
-        command.type === "thread.stop"
+        command.type === "thread.stop" ||
+        command.type === "bridget.lineage.sync" ||
+        command.type === "bridget.lineage.unavailable"
           ? Effect.succeed(planned)
           : Effect.fail(
               new OrchestratorDispatchError({

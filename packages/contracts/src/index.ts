@@ -1,5 +1,6 @@
 export * from "./baseSchemas.ts";
 export * from "./bridget.ts";
+export * from "./bridgetPermissions.ts";
 export * from "./assistantCitations.ts";
 export * from "./composerContext.ts";
 export * from "./composerContextClipboard.ts";
@@ -65,3 +66,5 @@ export * from "./rpc.ts";
 export * from "./worktreeSetup.ts";
 export * from "./secretRequest.ts";
 export * from "./clientRpcPermissions.ts";
+
+export * from "./bridgetLineage.ts";

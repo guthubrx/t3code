@@ -7,6 +7,7 @@ import {
 import {
   isOrchestrationV2WorkActive,
   isProviderNativeSubagentThread,
+  bridgetTaskStatus,
   type ModelSelection,
   type OrchestrationV2NotificationSource,
   type OrchestrationV2PendingBackgroundTask,
@@ -134,6 +135,20 @@ export interface ProviderSubagentStatus {
 export function deriveProviderSubagentStatus(
   projection: OrchestrationV2ThreadProjection,
 ): ProviderSubagentStatus | null {
+  if (projection.thread.bridgetTask !== undefined) {
+    const task = projection.thread.bridgetTask;
+    return {
+      status: bridgetTaskStatus(task.status),
+      startedAt:
+        task.started_at === null
+          ? null
+          : DateTime.formatIso(DateTime.makeUnsafe(task.started_at * 1000)),
+      completedAt:
+        task.completed_at === null
+          ? null
+          : DateTime.formatIso(DateTime.makeUnsafe(task.completed_at * 1000)),
+    };
+  }
   if (!isProviderNativeSubagentThread(projection.thread)) return null;
   const node = projection.nodes.findLast(
     (candidate) => candidate.kind === "root_turn" && candidate.runId === null,

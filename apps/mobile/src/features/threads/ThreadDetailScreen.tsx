@@ -1,3 +1,4 @@
+import { BridgetTaskJournal } from "./BridgetTaskJournal";
 import { useAtomValue } from "@effect/atom-react";
 import { useThreadReportedModelSelection } from "../../state/entities";
 import { UsageLimitRecoveryCard } from "./UsageLimitRecoveryCard";
@@ -403,7 +404,9 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   const agentsSegment = resolveSubagentPillSegment(turnSubagents);
   const composerEditorRef = useRef<ComposerEditorHandle>(null);
   // A provider-native subagent shows status instead of a composer.
-  const isProviderSubagent = isProviderNativeSubagentThread(props.selectedThread.source);
+  const isProviderSubagent =
+    props.selectedThread.source.bridgetTaskRef !== undefined ||
+    isProviderNativeSubagentThread(props.selectedThread.source);
   // Entering edit mode from the queue sheet should land in a ready composer,
   // not require a second tap on a composer already holding the message.
   const editingRunId = props.queuedRunEdit?.runId ?? null;
@@ -1110,43 +1113,52 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               />
             )}
           >
-            <ThreadFeed
-              environmentId={props.environmentId}
-              threadId={props.selectedThread.id}
-              workspaceRoot={props.threadCwd}
-              feed={props.selectedThreadFeed}
-              worktreeSetup={props.worktreeSetup}
-              setupWorkingStartedAt={props.setupWorkingStartedAt}
-              queuedMessages={props.queuedMessages}
-              dispatchingMessageId={props.dispatchingMessageId}
-              // A native subagent has no composer to edit a pending message in;
-              // Cancel on the edit banner would discard it.
-              onEditPendingMessage={isProviderSubagent ? null : handleEditPendingMessage}
-              contentPresentation={props.contentPresentation}
-              agentLabel={agentLabel}
-              threadTitle={props.selectedThread.title}
-              latestRun={props.activityRun}
-              activeWorkStartedAt={props.activeWorkStartedAt}
-              runlessWorkActive={props.runlessWorkActive ?? false}
-              listRef={listRef}
-              freeze={freeze}
-              anchorMessageId={anchorMessageId}
-              submittedMessageId={submittedMessageId}
-              contentInsetEndAdjustment={combinedContentInsetEndAdjustment}
-              contentTopInset={0}
-              contentBottomInset={
-                estimatedOverlayHeight +
-                (showFloatingStatus ? FLOATING_WORKING_CONTROL_COVERAGE : 0)
-              }
-              contentMaxWidth={contentMaxWidth}
-              historyControls={props.historyControls}
-              layoutVariant={layoutVariant}
-              usesAutomaticContentInsets={props.usesAutomaticContentInsets}
-              onHeaderMaterialVisibilityChange={props.onHeaderMaterialVisibilityChange}
-              onEndFollowEnabledChange={setEndFollowEnabled}
-              skills={selectedProviderSkills}
-              onUseArtifactTemplate={handleUseArtifactTemplate}
-            />
+            {props.selectedThread.source.bridgetTaskRef !== undefined ? (
+              <BridgetTaskJournal
+                key={selectedThreadKey}
+                environmentId={props.environmentId}
+                thread={props.selectedThread.source}
+                bottomInset={estimatedOverlayHeight}
+              />
+            ) : (
+              <ThreadFeed
+                environmentId={props.environmentId}
+                threadId={props.selectedThread.id}
+                workspaceRoot={props.threadCwd}
+                feed={props.selectedThreadFeed}
+                worktreeSetup={props.worktreeSetup}
+                setupWorkingStartedAt={props.setupWorkingStartedAt}
+                queuedMessages={props.queuedMessages}
+                dispatchingMessageId={props.dispatchingMessageId}
+                // A native subagent has no composer to edit a pending message in;
+                // Cancel on the edit banner would discard it.
+                onEditPendingMessage={isProviderSubagent ? null : handleEditPendingMessage}
+                contentPresentation={props.contentPresentation}
+                agentLabel={agentLabel}
+                threadTitle={props.selectedThread.title}
+                latestRun={props.activityRun}
+                activeWorkStartedAt={props.activeWorkStartedAt}
+                runlessWorkActive={props.runlessWorkActive ?? false}
+                listRef={listRef}
+                freeze={freeze}
+                anchorMessageId={anchorMessageId}
+                submittedMessageId={submittedMessageId}
+                contentInsetEndAdjustment={combinedContentInsetEndAdjustment}
+                contentTopInset={0}
+                contentBottomInset={
+                  estimatedOverlayHeight +
+                  (showFloatingStatus ? FLOATING_WORKING_CONTROL_COVERAGE : 0)
+                }
+                contentMaxWidth={contentMaxWidth}
+                historyControls={props.historyControls}
+                layoutVariant={layoutVariant}
+                usesAutomaticContentInsets={props.usesAutomaticContentInsets}
+                onHeaderMaterialVisibilityChange={props.onHeaderMaterialVisibilityChange}
+                onEndFollowEnabledChange={setEndFollowEnabled}
+                skills={selectedProviderSkills}
+                onUseArtifactTemplate={handleUseArtifactTemplate}
+              />
+            )}
           </RenderErrorBoundary>
         </View>
       ) : (

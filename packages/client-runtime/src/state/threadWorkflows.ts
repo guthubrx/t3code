@@ -185,6 +185,7 @@ export function canForkProjectedAssistantItem(input: {
 }
 
 export function canDetachThreadProviderSession(projection: Projection): boolean {
+  if (projection.thread.bridgetTaskRef !== undefined) return false;
   const session = resolveThreadProviderSession(projection);
   return session !== null && session.status !== "stopped" && session.status !== "error";
 }

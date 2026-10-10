@@ -51,7 +51,9 @@ import {
   useThreadShells,
 } from "../../state/entities";
 import { threadEnvironment } from "../../state/threads";
+import { orchestrationEnvironment } from "../../state/orchestration";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { randomUUID } from "~/lib/utils";
 import { AgentElapsed } from "./AgentElapsed";
 import { ThreadRelationshipIcon, threadRelationshipStatusLabel } from "./ThreadRelationshipIcon";
 
@@ -239,6 +241,9 @@ export function ThreadRelationshipsPanel(props: {
   const mergeBack = useAtomCommand(threadEnvironment.mergeBack);
   const stopSession = useAtomCommand(threadEnvironment.stopSession);
   const interruptTurn = useAtomCommand(threadEnvironment.interruptTurn);
+  const cancelNative = useAtomCommand(orchestrationEnvironment.bridgetLineageCancel, {
+    reportFailure: false,
+  });
   const [busyAction, setBusyAction] = useState<"merge" | "detach" | null>(null);
   const [stoppingThreadId, setStoppingThreadId] = useState<ThreadId | null>(null);
   const latestMergeBackRun = projection === null ? null : resolveLatestMergeBackRun(projection);
@@ -319,10 +324,22 @@ export function ThreadRelationshipsPanel(props: {
   const stopSubagent = async (childThreadId: ThreadId) => {
     if (stoppingThreadId !== null) return;
     setStoppingThreadId(childThreadId);
-    const result = await interruptTurn({
-      environmentId: props.environmentId,
-      input: { threadId: childThreadId },
-    });
+    const child = graph.nodes.get(childThreadId)?.thread;
+    const result =
+      child?.bridgetTaskRef !== undefined
+        ? await cancelNative({
+            environmentId: props.environmentId,
+            input: {
+              projectId: child.projectId,
+              threadId: child.bridgetTaskRef.rootThreadId,
+              taskId: child.bridgetTaskRef.taskId,
+              requestId: randomUUID(),
+            },
+          })
+        : await interruptTurn({
+            environmentId: props.environmentId,
+            input: { threadId: childThreadId },
+          });
     setStoppingThreadId(null);
     if (result._tag === "Failure") {
       toastManager.add({ type: "error", title: "Could not stop subagent" });
@@ -337,7 +354,13 @@ export function ThreadRelationshipsPanel(props: {
   return (
     <ThreadDetailsSection
       headingId="thread-details-lineage-heading"
-      title={runningCount > 0 ? `Lineage · ${runningCount} running` : "Lineage"}
+      title={
+        currentThread?.bridgetLineage?.available === false
+          ? "Lineage · Bridget indisponible"
+          : runningCount > 0
+            ? `Lineage · ${runningCount} running`
+            : "Lineage"
+      }
       data-thread-relationships-panel
       actions={
         canDetach ? (
@@ -386,8 +409,9 @@ export function ThreadRelationshipsPanel(props: {
               );
               const failed = status === "failed" || status === "error";
               const canStop =
-                agent?.origin === "app_owned" &&
-                agent.startedAt &&
+                (agent?.origin === "app_owned" || agent?.origin === "bridget_native") &&
+                (agent.origin === "bridget_native" || agent.startedAt !== null) &&
+                node?.thread?.bridgetLineage?.available !== false &&
                 ["pending", "running", "waiting"].includes(agent.status);
               const trailingVisibilityClass = canStop
                 ? "group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:opacity-0 [@media(hover:none)]:opacity-0"

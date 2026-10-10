@@ -1,3 +1,4 @@
+import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 /**
  * Subagent status helpers shared by web and mobile, and the runtime shape the
  * web agent rows render.
@@ -110,6 +111,8 @@ export function projectedSubagentsToRuntime(
     readonly title: string | null;
     readonly prompt: string;
     readonly model: string | null;
+    readonly modelSelection?: OrchestrationV2Subagent["modelSelection"];
+    readonly origin?: OrchestrationV2Subagent["origin"];
     readonly status: OrchestrationV2Subagent["status"];
     readonly progress?: string | undefined;
     readonly result: string | null;
@@ -129,14 +132,22 @@ export function projectedSubagentsToRuntime(
         (subagent.prompt.length > 80 ? `${subagent.prompt.slice(0, 77)}...` : subagent.prompt),
       role: null,
       model: subagent.model,
-      effort: null,
+      effort:
+        getModelSelectionStringOptionValue(subagent.modelSelection, "reasoningEffort") ??
+        getModelSelectionStringOptionValue(subagent.modelSelection, "effort") ??
+        null,
       status: subagent.status,
       activationCount: 1,
       usage: null,
       progress: subagent.progress ?? null,
       lastToolName: null,
       result: subagent.result,
-      error: subagent.status === "failed" ? (subagent.result ?? null) : null,
+      error:
+        subagent.status === "failed"
+          ? subagent.origin === "bridget_native"
+            ? (subagent.progress ?? null)
+            : (subagent.result ?? null)
+          : null,
       outputFile: null,
       parentAgentId: null,
       agentIndex: null,

@@ -1,4 +1,5 @@
 import {
+  BridgetSessionIdentity,
   OrchestratorMcpCapabilitiesResult,
   OrchestratorMcpCreateThreadsInput,
   OrchestratorMcpCreateThreadsResult,
@@ -31,7 +32,6 @@ import {
   ThreadMetadataMcpUpdateResult,
 } from "@t3tools/contracts";
 import { Tool, Toolkit } from "effect/ai";
-import * as Schema from "effect/Schema";
 
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -66,13 +66,7 @@ const BridgetSessionTool = Tool.make("bridget_session", {
   description:
     "Attest the calling provider session for the Bridget connector. Takes no thread or identity argument. Refuses external clients and provider sessions that no longer own a live run. Does not launch or orchestrate agents.",
   parameters: Tool.EmptyParams,
-  success: Schema.Struct({
-    version: Schema.Literal(1),
-    environmentId: Schema.String,
-    threadId: Schema.String,
-    providerSessionId: Schema.String,
-    providerInstanceId: Schema.String,
-  }),
+  success: BridgetSessionIdentity,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies,

@@ -1802,6 +1802,10 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             yield* Ref.set(initialized, true);
           }),
         );
+        const bridgetCredentialsByThread = new Map<
+          ThreadId,
+          McpProviderSession.McpProviderSessionConfig
+        >();
         const threadRuntimeParams = (params: Parameters<typeof codexThreadRuntimeParams>[0]) =>
           Effect.gen(function* () {
             yield* ensureInitialized;
@@ -1810,8 +1814,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                 ? undefined
                 : McpProviderSession.readMcpProviderSession(params.threadId);
             const session =
-              currentSession?.providerSessionId === input.providerSessionId &&
-              currentSession.providerInstanceId === adapterOptions.instanceId
+              currentSession?.providerInstanceId === adapterOptions.instanceId
                 ? currentSession
                 : undefined;
             const cwd = params.runtimePolicy?.cwd ?? input.runtimePolicy.cwd;
@@ -1831,6 +1834,11 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             const stillCurrent =
               params.threadId !== null &&
               McpProviderSession.readMcpProviderSession(params.threadId) === session;
+            if (params.threadId !== null) {
+              if (stillCurrent && session !== undefined)
+                bridgetCredentialsByThread.set(params.threadId, session);
+              else bridgetCredentialsByThread.delete(params.threadId);
+            }
             return codexThreadRuntimeParams({
               ...params,
               mcpSession: stillCurrent ? (session ?? null) : null,
@@ -1851,6 +1859,26 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           new Map<ProviderThreadId, Extract<OrchestrationV2TurnItem, { type: "error" }>>(),
         );
         const activeTurns = yield* Ref.make(new Map<string, ActiveCodexTurnContext>());
+        const bridgetPermissionOwners = new Map<
+          ProviderAdapterV2TurnInput,
+          { owner: McpProviderSession.McpProviderSessionConfig; revision: number }
+        >();
+        const retireBridgetPermissions = (turnInput: ProviderAdapterV2TurnInput) => {
+          const fact = bridgetPermissionOwners.get(turnInput);
+          if (fact !== undefined)
+            McpProviderSession.invalidateMcpProviderPermissions(
+              fact.owner,
+              turnInput.runId,
+              fact.revision,
+            );
+          bridgetPermissionOwners.delete(turnInput);
+        };
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            for (const turnInput of bridgetPermissionOwners.keys())
+              retireBridgetPermissions(turnInput);
+          }),
+        );
         const turnTokenUsageByThread = new Map<string, CodexTurnTokenUsageState>();
         const usageStateForThread = (nativeThreadId: string) => {
           let state = turnTokenUsageByThread.get(nativeThreadId);
@@ -5763,6 +5791,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               if (current !== input.context) {
                 return false;
               }
+              if (input.context.subagent === null) retireBridgetPermissions(input.context.input);
               const providerRetry = yield* Ref.modify(providerRetries, (current) => {
                 const retry = current.get(input.context.providerTurnId);
                 if (retry === undefined) {
@@ -6246,6 +6275,36 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               else next.delete(threadId);
               return next;
             });
+            if (
+              mcpSession !== undefined &&
+              bridgetCredentialsByThread.get(turnInput.threadId) === mcpSession
+            ) {
+              const revision = McpProviderSession.publishMcpProviderPermissions(
+                mcpSession,
+                {
+                  version: 1,
+                  source: "provider_turn",
+                  run_id: turnInput.runId,
+                  provider_session_id: mcpSession.providerSessionId,
+                  provider_instance_id: mcpSession.providerInstanceId,
+                  driver: "codex_app_server",
+                  cwd: turnStartParams.cwd ?? "",
+                  runtime_mode: turnInput.runtimePolicy.runtimeMode,
+                  interaction_mode: turnInput.runtimePolicy.interactionMode,
+                  provider_policy: {
+                    kind: "codex",
+                    approval_policy: turnStartParams.approvalPolicy!,
+                    approvals_reviewer: turnStartParams.approvalsReviewer!,
+                    sandbox_policy: turnStartParams.sandboxPolicy!,
+                  },
+                },
+                { attemptId: turnInput.attemptId, providerThreadId: turnInput.providerThread.id },
+              );
+              if (revision !== undefined)
+                bridgetPermissionOwners.set(turnInput, { owner: mcpSession, revision });
+            } else if (mcpSession !== undefined) {
+              McpProviderSession.invalidateMcpProviderPermissions(mcpSession, turnInput.runId);
+            }
             const started = yield* client.request("turn/start", turnStartParams);
             yield* registerRootTurn({
               turnInput,
@@ -6254,6 +6313,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               waitForNativeStart: started.turn.startedAt === null,
             });
           }).pipe(
+            Effect.onError(() => Effect.sync(() => retireBridgetPermissions(turnInput))),
             Effect.ensuring(
               Effect.flatMap(getNativeThreadId(turnInput.providerThread), (threadId) =>
                 Ref.update(pendingRootTurns, (current) => {

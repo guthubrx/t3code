@@ -49,6 +49,8 @@ type RpcMethod<TTag extends EnvironmentRpcTag> = WsRpcProtocolClient[TTag];
 
 export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.bridgetWatch
+  | typeof WS_METHODS.bridgetLineageWatch
+  | typeof WS_METHODS.bridgetLineageJournal
   | typeof WS_METHODS.codexAuthCallbackSubscribe
   | typeof WS_METHODS.providerAuthSubscribe
   | typeof WS_METHODS.providerInstallSubscribe

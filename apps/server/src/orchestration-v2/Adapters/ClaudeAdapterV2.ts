@@ -1,3 +1,14 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
+import * as NodeOS from "node:os";
+import * as NodeCrypto from "node:crypto";
+import {
+  type BridgetClaudeLaunchContext,
+  type BridgetClaudeProviderPolicy,
+  type BridgetClaudeSettingsOverrides,
+} from "@t3tools/contracts";
+import { SpawnExecutableResolution, type SpawnExecutableResolver } from "@t3tools/shared/shell";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import {
   dynamicToolTitle,
@@ -31,7 +42,7 @@ import type {
   WebSearchOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools";
 import { parseCliArgs } from "@t3tools/shared/cliArgs";
-import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
+import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { applyClaudePromptEffortPrefix } from "@t3tools/shared/model";
 import {
   CLAUDE_RESUME_COMPACTION_NEVER_ANSWER,
@@ -330,9 +341,13 @@ export interface ClaudeAgentSdkQueryOpenInput {
   readonly options: ClaudeAgentSdkQueryOptions;
   readonly threadId: ThreadId;
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
+  /** Captured where the adapter builds the private MCP transport; never supplied by a tool. */
+  readonly bridgetCredential?: McpProviderSession.McpProviderSessionConfig;
 }
 
 export interface ClaudeAgentSdkQuerySession {
+  readonly bridgetPermissionInputs?: ClaudeBridgetPermissionInputs;
+  readonly bridgetCredential?: McpProviderSession.McpProviderSessionConfig;
   readonly messages: Stream.Stream<SDKMessage, ClaudeAgentSdkQueryRunnerError>;
   readonly offer: (message: SDKUserMessage) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly setModel: (model: string) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
@@ -341,6 +356,380 @@ export interface ClaudeAgentSdkQuerySession {
   ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly interrupt: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly close: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+}
+
+interface ClaudeBridgetPermissionInputs {
+  readonly cwd: string;
+  readonly policy: BridgetClaudeProviderPolicy;
+  readonly verify: () => Promise<boolean>;
+}
+
+const encodePermissionLaunchJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+
+function hasPermissionControlCharacters(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
+  }
+  return false;
+}
+
+const permissionSha = (bytes: Uint8Array | string) =>
+  `sha256:${NodeCrypto.createHash("sha256").update(bytes).digest("hex")}`;
+const isMissingPermissionSource = (error: unknown) =>
+  typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+
+/** O(source bytes + PATH entries), bounded to 32 sources and 256 managed fragments. No source contents escape. */
+async function claudePermissionSourceRevision(source: string): Promise<string> {
+  let stat;
+  try {
+    stat = await NodeFSP.lstat(source);
+  } catch (error) {
+    if (isMissingPermissionSource(error)) return "absent";
+    throw error;
+  }
+  if (stat.isSymbolicLink()) throw new Error("permission_source_unavailable");
+  if (stat.isDirectory()) {
+    const names = (await NodeFSP.readdir(source)).sort();
+    if (names.length > 256) throw new Error("permission_source_unavailable");
+    const revisions = [];
+    for (const name of names) {
+      const entry = NodePath.join(source, name);
+      const metadata = await NodeFSP.lstat(entry);
+      if (!metadata.isFile() || metadata.isSymbolicLink() || hasPermissionControlCharacters(name))
+        throw new Error("permission_source_unavailable");
+      revisions.push({ name, revision: await claudePermissionSourceRevision(entry) });
+    }
+    return permissionSha(JSON.stringify(revisions));
+  }
+  if (!stat.isFile() || stat.size > 4 * 1024 * 1024)
+    throw new Error("permission_source_unavailable");
+  const bytes = await NodeFSP.readFile(source);
+  // A policy helper executes inputs outside this bounded source catalogue.
+  if (source.endsWith(".json")) {
+    const settings: unknown = JSON.parse(bytes.toString("utf8"));
+    if (
+      typeof settings === "object" &&
+      settings !== null &&
+      ("policyHelper" in settings || "policyHelpers" in settings || "processWrapper" in settings)
+    )
+      throw new Error("permission_source_unavailable");
+  }
+  return permissionSha(bytes);
+}
+
+/** Revision known prompt-only plugins; executable permission hooks need another attested source. */
+async function appendClaudePermissionPluginSources(
+  configDir: string,
+  sources: Array<{ kind: "user" | "project" | "local" | "managed" | "cli"; path: string }>,
+): Promise<void> {
+  const enabled = new Set<string>();
+  const inspect = async (source: string): Promise<void> => {
+    let stat;
+    try {
+      stat = await NodeFSP.lstat(source);
+    } catch (error) {
+      if (isMissingPermissionSource(error)) return;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) throw new Error("permission_source_unavailable");
+    if (stat.isDirectory()) {
+      const names = (await NodeFSP.readdir(source)).sort();
+      if (names.length > 256) throw new Error("permission_source_unavailable");
+      for (const name of names) {
+        const child = NodePath.join(source, name);
+        const metadata = await NodeFSP.lstat(child);
+        if (!metadata.isFile() || metadata.isSymbolicLink())
+          throw new Error("permission_source_unavailable");
+        await inspect(child);
+      }
+      return;
+    }
+    if (!stat.isFile() || stat.size > 4 * 1024 * 1024)
+      throw new Error("permission_source_unavailable");
+    if (!source.endsWith(".json")) return;
+    const settings: unknown = JSON.parse(await NodeFSP.readFile(source, "utf8"));
+    if (typeof settings !== "object" || settings === null) return;
+    if (
+      "hooks" in settings ||
+      "policyHelper" in settings ||
+      "policyHelpers" in settings ||
+      "processWrapper" in settings
+    )
+      throw new Error("permission_source_unavailable");
+    if ("enabledPlugins" in settings) {
+      const plugins = settings.enabledPlugins;
+      if (typeof plugins !== "object" || plugins === null || Array.isArray(plugins))
+        throw new Error("permission_source_unavailable");
+      for (const [name, selected] of Object.entries(plugins)) {
+        if (selected === true) enabled.add(name);
+        else if (selected !== false) throw new Error("permission_source_unavailable");
+        if (enabled.size > 128) throw new Error("permission_source_unavailable");
+      }
+    }
+  };
+  for (const source of sources) await inspect(source.path);
+  if (enabled.size === 0) return;
+  const inventory = NodePath.join(configDir, "plugins/installed_plugins.json");
+  await claudePermissionSourceRevision(inventory);
+  const installed: unknown = JSON.parse(await NodeFSP.readFile(inventory, "utf8"));
+  if (
+    typeof installed !== "object" ||
+    installed === null ||
+    !("plugins" in installed) ||
+    typeof installed.plugins !== "object" ||
+    installed.plugins === null
+  )
+    throw new Error("permission_source_unavailable");
+  sources.push({ kind: "user", path: inventory });
+  for (const name of [...enabled].sort()) {
+    if (sources.length + 4 > 32) throw new Error("permission_source_unavailable");
+    const entries = (installed.plugins as Record<string, unknown>)[name];
+    if (!Array.isArray(entries) || entries.length !== 1)
+      throw new Error("permission_source_unavailable");
+    const entry: unknown = entries[0];
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      !("scope" in entry) ||
+      entry.scope !== "user" ||
+      !("installPath" in entry) ||
+      typeof entry.installPath !== "string" ||
+      !NodePath.isAbsolute(entry.installPath)
+    )
+      throw new Error("permission_source_unavailable");
+    const root = entry.installPath;
+    const cache = NodePath.join(configDir, "plugins/cache");
+    if (!root.startsWith(`${cache}/`) || (await NodeFSP.realpath(root)) !== root)
+      throw new Error("permission_source_unavailable");
+    const manifest = NodePath.join(root, ".claude-plugin/plugin.json");
+    await claudePermissionSourceRevision(manifest);
+    const plugin: unknown = JSON.parse(await NodeFSP.readFile(manifest, "utf8"));
+    if (
+      typeof plugin !== "object" ||
+      plugin === null ||
+      [
+        "hooks",
+        "settings",
+        "permissions",
+        "policyHelper",
+        "processWrapper",
+        "mcpServers",
+        "lspServers",
+      ].some((key) => key in plugin)
+    )
+      throw new Error("permission_source_unavailable");
+    sources.push({ kind: "user", path: manifest });
+    for (const relative of ["hooks/hooks.json", "settings.json", ".mcp.json"]) {
+      const source = NodePath.join(root, relative);
+      if ((await claudePermissionSourceRevision(source)) !== "absent")
+        throw new Error("permission_source_unavailable");
+      sources.push({ kind: "user", path: source });
+    }
+  }
+}
+
+async function captureClaudeLaunchContext(
+  options: ClaudeAgentSdkQueryOptions,
+  resolveExecutable: SpawnExecutableResolver,
+  platform: NodeJS.Platform,
+  appliedSettings: BridgetClaudeSettingsOverrides | undefined,
+): Promise<BridgetClaudeLaunchContext | undefined> {
+  try {
+    const env = options.env ?? process.env;
+    if (!options.cwd || !NodePath.isAbsolute(options.cwd) || platform !== "darwin")
+      return undefined;
+    if (
+      options.executable !== undefined ||
+      (options.executableArgs?.length ?? 0) > 0 ||
+      options.projectConfigRoot !== undefined ||
+      (options.plugins?.length ?? 0) > 0 ||
+      options.hooks !== undefined
+    )
+      return undefined;
+    if (env.BASH_ENV || env.ENV || Object.keys(env).some((key) => key.startsWith("BASH_FUNC_")))
+      return undefined;
+    if (
+      Object.keys(env).some(
+        (key) =>
+          (key.startsWith("CLAUDE_CODE_") &&
+            ![
+              "CLAUDE_CODE_ENTRYPOINT",
+              "CLAUDE_CODE_USE_BEDROCK",
+              "CLAUDE_CODE_USE_VERTEX",
+              "CLAUDE_CODE_USE_FOUNDRY",
+            ].includes(key)) ||
+          key.startsWith("CLAUDE_PERMISSION") ||
+          key.startsWith("CLAUDE_SANDBOX"),
+      )
+    )
+      return undefined;
+    const pathEntries = (env.PATH ?? "").split(":");
+    if (
+      pathEntries.length > 256 ||
+      pathEntries.some((entry) => !NodePath.isAbsolute(entry) || entry.trim() !== entry)
+    )
+      return undefined;
+    const selected = options.pathToClaudeCodeExecutable;
+    if (!selected) return undefined;
+    const selectedPath = resolveExecutable(selected, platform, env);
+    if (!selectedPath) return undefined;
+    const cliPath = await NodeFSP.realpath(selectedPath);
+    const bytes = await NodeFSP.readFile(cliPath);
+    let resolvedPath = cliPath;
+    if (bytes.subarray(0, 2).toString() === "#!") {
+      const script = bytes.toString("utf8");
+      // This audited launcher only supplies provider authentication/model routing,
+      // then forwards argv unchanged. Unknown shell programs are opaque inputs.
+      if (
+        permissionSha(bytes) !==
+          "sha256:dd8dee5677e46fde677f6ba940cbc07294f50ff690a76878c1883b6805872a8e" ||
+        !/^exec claude "\$@"\s*$/m.test(script)
+      )
+        return undefined;
+      const target = resolveExecutable("claude", platform, env);
+      if (!target) return undefined;
+      resolvedPath = await NodeFSP.realpath(target);
+      const targetBytes = await NodeFSP.readFile(resolvedPath);
+      if (targetBytes.subarray(0, 2).toString() === "#!") return undefined;
+    }
+    const configDir = NodePath.resolve(
+      env.CLAUDE_CONFIG_DIR || NodePath.join(env.HOME || NodeOS.homedir(), ".claude"),
+    );
+    const sources: Array<{ kind: "user" | "project" | "local" | "managed" | "cli"; path: string }> =
+      [
+        { kind: "user", path: NodePath.join(configDir, "settings.json") },
+        { kind: "managed", path: NodePath.join(configDir, "remote-settings.json") },
+        { kind: "managed", path: "/Library/Application Support/ClaudeCode/managed-settings.json" },
+        { kind: "managed", path: "/Library/Application Support/ClaudeCode/managed-settings.d" },
+      ];
+    for (const mdm of [
+      "/Library/Managed Preferences/com.anthropic.claudecode.plist",
+      NodePath.join(
+        env.HOME || NodeOS.homedir(),
+        "Library/Preferences/com.anthropic.claudecode.plist",
+      ),
+    ]) {
+      try {
+        await NodeFSP.lstat(mdm);
+        return undefined;
+      } catch (error) {
+        if (!isMissingPermissionSource(error)) return undefined;
+      }
+      sources.push({ kind: "managed", path: mdm });
+    }
+    // Include ancestor scopes conservatively, so a newly added settings file cannot widen a retry.
+    let directory = NodePath.resolve(options.cwd);
+    while (true) {
+      sources.push(
+        { kind: "project", path: NodePath.join(directory, ".claude/settings.json") },
+        { kind: "local", path: NodePath.join(directory, ".claude/settings.local.json") },
+      );
+      try {
+        await NodeFSP.lstat(NodePath.join(directory, ".git"));
+        break;
+      } catch (error) {
+        if (!isMissingPermissionSource(error)) return undefined;
+      }
+      const parent = NodePath.dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+    if (typeof options.settings === "string") {
+      try {
+        JSON.parse(options.settings);
+      } catch {
+        sources.push({ kind: "cli", path: NodePath.resolve(options.cwd, options.settings) });
+      }
+    }
+    if (sources.length > 32) return undefined;
+    // Validate sizes/symlinks before inspecting only security selection keys.
+    for (const source of sources) await claudePermissionSourceRevision(source.path);
+    await appendClaudePermissionPluginSources(configDir, sources);
+    if (sources.length > 32) return undefined;
+    const permissionSources = [];
+    for (const source of sources)
+      permissionSources.push({
+        ...source,
+        revision: await claudePermissionSourceRevision(source.path),
+      });
+    return {
+      cli_path: cliPath,
+      cli_revision: permissionSha(bytes),
+      resolved_cli_path: resolvedPath,
+      resolved_cli_revision: permissionSha(await NodeFSP.readFile(resolvedPath)),
+      config_dir: configDir,
+      settings_sources: options.settingSources ?? "provider_default",
+      permission_sources: permissionSources,
+      ...(appliedSettings === undefined ? {} : { settings_overrides: appliedSettings }),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function claudeSanitarySettings(
+  settings: ClaudeAgentSdkQueryOptions["settings"],
+): BridgetClaudeSettingsOverrides | undefined {
+  if (settings === undefined) return undefined;
+  let parsed: unknown = settings;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const representedKeys = new Set([
+    "permissions",
+    "alwaysThinkingEnabled",
+    "fastMode",
+    "ultracode",
+    "autoCompactWindow",
+    "showThinkingSummaries",
+  ]);
+  if (Object.keys(parsed).some((key) => !representedKeys.has(key)))
+    throw new Error("permission_source_unavailable");
+  if (!("permissions" in parsed)) return undefined;
+  const permissions = parsed.permissions;
+  if (
+    typeof permissions !== "object" ||
+    permissions === null ||
+    Object.keys(permissions).some(
+      (key) =>
+        ![
+          "allow",
+          "ask",
+          "deny",
+          "defaultMode",
+          "additionalDirectories",
+          "disableBypassPermissionsMode",
+        ].includes(key),
+    )
+  )
+    throw new Error("permission_source_unavailable");
+  return { permissions } as BridgetClaudeSettingsOverrides;
+}
+
+/** Only flags proven unrelated to permission/source selection may stay opaque. */
+function claudePermissionFlagsRepresented(options: ClaudeAgentSdkQueryOptions): boolean {
+  const permitted = new Set([
+    "thinking-display",
+    "verbose",
+    "debug",
+    "debug-file",
+    "max-turns",
+    "max-budget-usd",
+    "effort",
+    "model",
+    "fallback-model",
+    "output-format",
+    "include-partial-messages",
+    "betas",
+    "max-thinking-tokens",
+  ]);
+  return Object.keys(options.extraArgs ?? {}).every((flag) => permitted.has(flag));
 }
 
 type ClaudeQueryStreamExit = Exit.Exit<void, ClaudeAgentSdkQueryRunnerError>;
@@ -611,6 +1000,8 @@ export const layerQueryRunner: Layer.Layer<
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const environment = yield* HostProcessEnvironment;
+    const resolvePermissionExecutable = yield* SpawnExecutableResolution;
+    const permissionPlatform = yield* HostProcessPlatform;
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
 
     return ClaudeAgentSdkQueryRunner.of({
@@ -635,6 +1026,35 @@ export const layerQueryRunner: Layer.Layer<
           Stream.toAsyncIterable,
         );
         // Do not expose a candidate or send a prompt before its MCP catalogue is ready.
+        const permissionOptions = {
+          ...input.options,
+          env: { ...(input.options.env ?? process.env) },
+        };
+        let permissionSettings: BridgetClaudeSettingsOverrides | undefined;
+        let permissionsRepresented =
+          input.options.canUseTool !== undefined &&
+          input.options.sandbox === undefined &&
+          input.options.managedSettings === undefined &&
+          input.options.permissionPromptToolName === undefined &&
+          input.options.permissionPrompts === undefined &&
+          input.options.spawnClaudeCodeProcess === undefined &&
+          input.options.hooks === undefined &&
+          claudePermissionFlagsRepresented(permissionOptions);
+        try {
+          permissionSettings = claudeSanitarySettings(permissionOptions.settings);
+        } catch {
+          permissionsRepresented = false;
+        }
+        const initialLaunch = yield* Effect.promise(() =>
+          captureClaudeLaunchContext(
+            permissionOptions,
+            resolvePermissionExecutable,
+            permissionPlatform,
+            permissionSettings,
+          ),
+        );
+        const readOnlySettings = claudeBridgetReadOnlySettings(input.options.settings);
+        let appliedPermissionSettings = permissionSettings;
         // An interrupted preparation owns and closes only this candidate process.
         const queryRuntime = yield* Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
@@ -642,13 +1062,14 @@ export const layerQueryRunner: Layer.Layer<
               try: () => query({ prompt, options: input.options }),
               catch: (cause) => queryRunnerError(cause, "query"),
             });
-            const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-            yield* restore(
+            const mcpSession = input.bridgetCredential;
+            const preparation = yield* restore(
               prepareClaudeMcp({
                 query: candidate,
-                readOnlySettings: claudeBridgetReadOnlySettings(input.options.settings),
+                readOnlySettings,
                 session:
-                  mcpSession?.providerSessionId === input.providerSessionId
+                  mcpSession !== undefined &&
+                  McpProviderSession.readMcpProviderSession(input.threadId) === mcpSession
                     ? mcpSession
                     : undefined,
                 config: { homePath: "" },
@@ -665,9 +1086,82 @@ export const layerQueryRunner: Layer.Layer<
               Effect.mapError((cause) => queryRunnerError(cause, "prepareMcp")),
               Effect.onError(() => closeClaudeQuery(candidate).pipe(Effect.ignore)),
             );
+            if (preparation.code === "mounted" && readOnlySettings !== undefined) {
+              try {
+                appliedPermissionSettings = claudeSanitarySettings(readOnlySettings);
+              } catch {
+                permissionsRepresented = false;
+              }
+            }
             return candidate;
           }),
         ).pipe(Effect.onError(() => Queue.shutdown(promptQueue)));
+        const finalLaunch = yield* Effect.promise(() =>
+          captureClaudeLaunchContext(
+            permissionOptions,
+            resolvePermissionExecutable,
+            permissionPlatform,
+            appliedPermissionSettings,
+          ),
+        );
+        const sourceSelection = (launch: BridgetClaudeLaunchContext | undefined) =>
+          launch === undefined
+            ? undefined
+            : JSON.stringify({ ...launch, settings_overrides: undefined });
+        if (sourceSelection(initialLaunch) !== sourceSelection(finalLaunch))
+          permissionsRepresented = false;
+        const launchSnapshot =
+          finalLaunch === undefined
+            ? undefined
+            : yield* encodePermissionLaunchJson(finalLaunch).pipe(
+                Effect.catch(() => {
+                  permissionsRepresented = false;
+                  return Effect.succeed(undefined);
+                }),
+              );
+        const bridgetPermissionInputs: ClaudeBridgetPermissionInputs | undefined =
+          !permissionsRepresented
+            ? undefined
+            : {
+                cwd: permissionOptions.cwd ?? "",
+                policy: {
+                  kind: "claude",
+                  permission_mode: input.options.permissionMode,
+                  tools: input.options.tools,
+                  ...(input.options.allowedTools === undefined
+                    ? {}
+                    : { allowed_tools: [...input.options.allowedTools] }),
+                  ...(input.options.disallowedTools === undefined
+                    ? {}
+                    : { disallowed_tools: [...input.options.disallowedTools] }),
+                  ...(input.options.additionalDirectories === undefined
+                    ? {}
+                    : { additional_directories: [...input.options.additionalDirectories] }),
+                  ...(input.options.allowDangerouslySkipPermissions === undefined
+                    ? {}
+                    : {
+                        allow_dangerously_skip_permissions:
+                          input.options.allowDangerouslySkipPermissions,
+                      }),
+                  permission_callback: {
+                    kind: "t3_runtime",
+                    tool_approval: "prompt",
+                    plan_exit: "deny",
+                  },
+                  settings_sources: "provider_default",
+                  ...(finalLaunch === undefined ? {} : { launch_context: finalLaunch }),
+                },
+                verify: async () =>
+                  finalLaunch === undefined ||
+                  JSON.stringify(
+                    await captureClaudeLaunchContext(
+                      permissionOptions,
+                      resolvePermissionExecutable,
+                      permissionPlatform,
+                      appliedPermissionSettings,
+                    ),
+                  ) === launchSnapshot,
+              };
         yield* logProtocolEvent({
           direction: "outgoing",
           stage: "decoded",
@@ -678,6 +1172,10 @@ export const layerQueryRunner: Layer.Layer<
         });
 
         return {
+          ...(bridgetPermissionInputs === undefined ? {} : { bridgetPermissionInputs }),
+          ...(input.bridgetCredential === undefined
+            ? {}
+            : { bridgetCredential: input.bridgetCredential }),
           messages: Stream.fromAsyncIterable(claudeQueryMessages(queryRuntime), (cause) =>
             queryRunnerError(cause, "fromAsyncIterable"),
           ).pipe(
@@ -3103,6 +3601,90 @@ export function makeClaudeAdapterV2(
         const interruptedTurns = yield* Ref.make(new Set<OrchestrationV2ProviderTurn["id"]>());
         const steeredTurns = yield* Ref.make(new Set<OrchestrationV2ProviderTurn["id"]>());
         const queryContext = yield* Ref.make<ClaudeLiveQueryContext | null>(null);
+        const bridgetPermissionOwners = new Map<
+          ProviderAdapter.ProviderAdapterV2TurnInput,
+          { owner: McpProviderSession.McpProviderSessionConfig; revision: number }
+        >();
+        const retireBridgetPermissions = (
+          turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+        ) => {
+          const fact = bridgetPermissionOwners.get(turnInput);
+          if (fact !== undefined)
+            McpProviderSession.invalidateMcpProviderPermissions(
+              fact.owner,
+              turnInput.runId,
+              fact.revision,
+            );
+          bridgetPermissionOwners.delete(turnInput);
+        };
+        const publishBridgetPermissions = Effect.fnUntraced(function* (
+          turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+          live: ClaudeLiveQueryContext,
+        ) {
+          const credential = live.query.bridgetCredential;
+          const selected = live.query.bridgetPermissionInputs;
+          if (
+            (yield* Ref.get(activeTurn))?.input !== turnInput ||
+            (yield* Ref.get(queryContext)) !== live
+          )
+            return;
+          if (
+            credential === undefined ||
+            credential.providerInstanceId !== adapterOptions.instanceId ||
+            McpProviderSession.readMcpProviderSession(turnInput.threadId) !== credential ||
+            selected === undefined
+          ) {
+            const currentCredential = McpProviderSession.readMcpProviderSession(turnInput.threadId);
+            if (currentCredential !== undefined)
+              McpProviderSession.invalidateMcpProviderPermissions(
+                currentCredential,
+                turnInput.runId,
+              );
+            return;
+          }
+          const verified = yield* Effect.promise(() => selected.verify().catch(() => false));
+          if (
+            (yield* Ref.get(activeTurn))?.input !== turnInput ||
+            (yield* Ref.get(queryContext)) !== live ||
+            McpProviderSession.readMcpProviderSession(turnInput.threadId) !== credential
+          )
+            return;
+          if (!verified) {
+            McpProviderSession.invalidateMcpProviderPermissions(credential, turnInput.runId);
+            return;
+          }
+          const revision = McpProviderSession.publishMcpProviderPermissions(
+            credential,
+            {
+              version: 1,
+              source: "provider_turn",
+              run_id: turnInput.runId,
+              provider_session_id: credential.providerSessionId,
+              provider_instance_id: credential.providerInstanceId,
+              driver: "claude_stream_json",
+              cwd: selected.cwd,
+              runtime_mode: turnInput.runtimePolicy.runtimeMode,
+              interaction_mode: turnInput.runtimePolicy.interactionMode,
+              provider_policy: {
+                ...selected.policy,
+                permission_mode: live.permissionMode,
+                permission_callback: {
+                  kind: "t3_runtime",
+                  tool_approval: shouldInstallClaudePermissionCallback(
+                    claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy),
+                  )
+                    ? "prompt"
+                    : "allow",
+                  plan_exit: "deny",
+                },
+              },
+            },
+            { attemptId: turnInput.attemptId, providerThreadId: turnInput.providerThread.id },
+            selected.verify,
+          );
+          if (revision !== undefined)
+            bridgetPermissionOwners.set(turnInput, { owner: credential, revision });
+        });
         const openedNativeThreads = yield* Ref.make(new Set<string>());
         const latestPlanByKind = yield* Ref.make(new Map<string, OrchestrationV2PlanArtifact>());
         const planIdsByNativeItem = yield* Ref.make(
@@ -5024,6 +5606,7 @@ export function makeClaudeAdapterV2(
           readonly threadDisposition?: "reusable" | "broken";
           readonly result?: SDKResultMessage;
         }) {
+          retireBridgetPermissions(input.context.input);
           yield* reasoningDeltas.flushTurn(input.context.nativeTurnId);
           // A subagent still running in the background keeps its open calls:
           // their results arrive after this turn. One left by an earlier CLI
@@ -7289,6 +7872,7 @@ export function makeClaudeAdapterV2(
           nativeThreadId: string,
         ) {
           const queryPolicy = claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
+          const bridgetCredential = McpProviderSession.readMcpProviderSession(turnInput.threadId);
           const mcpOverrides = claudeMcpQueryOverrides({
             threadId: turnInput.threadId,
             readOnlySandbox:
@@ -7391,6 +7975,7 @@ export function makeClaudeAdapterV2(
             .open({
               threadId: turnInput.threadId,
               providerSessionId: input.providerSessionId,
+              ...(bridgetCredential === undefined ? {} : { bridgetCredential }),
               options: queryOptions,
             })
             .pipe(
@@ -7450,16 +8035,20 @@ export function makeClaudeAdapterV2(
           };
           yield* Ref.set(queryContext, context);
           yield* querySession.messages.pipe(
-            Stream.runForEach((message) => {
-              if (
-                message.type === "system" &&
-                (message.subtype === "init" || message.subtype === "status") &&
-                message.permissionMode !== undefined
-              ) {
-                context.permissionMode = message.permissionMode;
-              }
-              return handleSdkMessage({ query: querySession, message });
-            }),
+            Stream.runForEach((message) =>
+              Effect.gen(function* () {
+                if (
+                  message.type === "system" &&
+                  (message.subtype === "init" || message.subtype === "status") &&
+                  message.permissionMode !== undefined
+                ) {
+                  context.permissionMode = message.permissionMode;
+                  const turn = yield* Ref.get(activeTurn);
+                  if (turn !== null) yield* publishBridgetPermissions(turn.input, context);
+                }
+                yield* handleSdkMessage({ query: querySession, message });
+              }),
+            ),
             Effect.exit,
             Effect.flatMap(
               Effect.fnUntraced(function* (exit: ClaudeQueryStreamExit) {
@@ -7528,6 +8117,14 @@ export function makeClaudeAdapterV2(
                 detail: `Claude provider turn ${currentTurn.providerTurnId} is still active.`,
               });
             }
+            const startingCredential = McpProviderSession.readMcpProviderSession(
+              turnInput.threadId,
+            );
+            if (startingCredential !== undefined)
+              McpProviderSession.invalidateMcpProviderPermissions(
+                startingCredential,
+                turnInput.runId,
+              );
             yield* Ref.update(lastTurnRouteByNativeThread, (current) => {
               const updated = new Map(current);
               updated.set(nativeThreadId, {
@@ -7598,6 +8195,7 @@ export function makeClaudeAdapterV2(
                   });
             const querySession = yield* openQuery(turnInput, nativeThreadId);
             yield* Ref.set(activeTurn, context);
+            yield* publishBridgetPermissions(turnInput, querySession);
             yield* emitProviderEvent({
               type: "provider_turn.updated",
               driver: CLAUDE_PROVIDER,
@@ -7677,6 +8275,7 @@ export function makeClaudeAdapterV2(
           },
           (effect, turnInput) =>
             effect.pipe(
+              Effect.onError(() => Effect.sync(() => retireBridgetPermissions(turnInput))),
               Effect.mapError(
                 (cause) =>
                   new ProviderAdapter.ProviderAdapterTurnStartError({
@@ -7827,6 +8426,8 @@ export function makeClaudeAdapterV2(
         );
 
         const closeSession = Effect.fnUntraced(function* () {
+          for (const turnInput of bridgetPermissionOwners.keys())
+            retireBridgetPermissions(turnInput);
           const existing = yield* Ref.get(queryContext);
           if (existing !== null) {
             yield* existing.query.close.pipe(Effect.ignore);

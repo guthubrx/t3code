@@ -202,6 +202,10 @@ const RPC_AGGREGATES = {
   [WS_METHODS.subscribeBackgroundPolicy]: "server",
   [WS_METHODS.bridgetRead]: "bridget",
   [WS_METHODS.bridgetWatch]: "bridget",
+  [WS_METHODS.bridgetLineageRead]: "bridget",
+  [WS_METHODS.bridgetLineageWatch]: "bridget",
+  [WS_METHODS.bridgetLineageJournal]: "bridget",
+  [WS_METHODS.bridgetLineageCancel]: "bridget",
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 
 const RPC_SPAN_PREFIX = "ws.rpc";

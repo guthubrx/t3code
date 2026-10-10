@@ -2,8 +2,13 @@ import {
   ORCHESTRATION_V2_WS_METHODS,
   WS_METHODS,
   BridgetReadError,
+  BridgetLineageError,
   type BridgetWatchEvent,
   type BridgetWatchInput,
+  type BridgetLineageWatchInput,
+  type BridgetLineageJournalInput,
+  type BridgetLineageJournal,
+  type BridgetJournalEvent,
   type EnvironmentId,
 } from "@t3tools/contracts";
 import { Atom } from "effect/reactivity";
@@ -30,6 +35,14 @@ const isBridgetReadError = Schema.is(BridgetReadError);
 const isTechnicalWatchFailure = (error: unknown): boolean =>
   isBridgetReadError(error) &&
   (error.code === "unavailable" || error.code === "timeout" || error.code === "command_failed");
+
+export interface BridgetJournalState {
+  readonly events: ReadonlyArray<BridgetJournalEvent>;
+  readonly nextSeq: number;
+  readonly caughtUp: boolean;
+  readonly gap: BridgetLineageJournal["gap"];
+  readonly evicted: number;
+}
 
 export function createOrchestrationEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
@@ -73,6 +86,66 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
       }),
   });
   return {
+    bridgetLineageRead: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:bridget-lineage-read",
+      tag: WS_METHODS.bridgetLineageRead,
+      staleTimeMs: 0,
+      idleTtlMs: 0,
+    }),
+    bridgetLineageWatch: createEnvironmentSubscriptionAtomFamily(runtime, {
+      label: "environment-data:orchestration:bridget-lineage-watch",
+      idleTtlMs: 0,
+      subscribe: ({ context }: { context: BridgetLineageWatchInput; visitId: string }) =>
+        Stream.suspend(() => {
+          let retries = 0;
+          return subscribe(WS_METHODS.bridgetLineageWatch, context).pipe(
+            Stream.retry(
+              Schedule.spaced("1 second").pipe(
+                Schedule.while(
+                  ({ input }) =>
+                    Schema.is(BridgetLineageError)(input) &&
+                    ["unavailable", "timeout", "command_failed", "store_unavailable"].includes(
+                      input.code,
+                    ) &&
+                    retries++ < 3,
+                ),
+              ),
+            ),
+          );
+        }),
+    }),
+    bridgetLineageJournal: createEnvironmentSubscriptionAtomFamily(runtime, {
+      label: "environment-data:orchestration:bridget-lineage-journal",
+      idleTtlMs: 0,
+      subscribe: ({ context }: { context: BridgetLineageJournalInput; visitId: string }) =>
+        subscribe(WS_METHODS.bridgetLineageJournal, context).pipe(
+          // Preserve every envelope even when React coalesces several stream values.
+          Stream.scan<BridgetJournalState, BridgetLineageJournal>(
+            () => ({
+              events: [],
+              nextSeq: context.afterSeq ?? 0,
+              caughtUp: false,
+              gap: null,
+              evicted: 0,
+            }),
+            (previous, envelope) => {
+              const events = [...previous.events, ...envelope.events];
+              const overflow = Math.max(0, events.length - 4096);
+              return {
+                events: events.slice(overflow),
+                nextSeq: envelope.next_seq,
+                caughtUp: envelope.caught_up,
+                gap: envelope.gap ?? previous.gap,
+                evicted: previous.evicted + overflow,
+              };
+            },
+          ),
+        ),
+    }),
+    bridgetLineageCancel: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:orchestration:bridget-lineage-cancel",
+      tag: WS_METHODS.bridgetLineageCancel,
+    }),
     bridgetRead: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:orchestration:bridget-read",
       tag: WS_METHODS.bridgetRead,

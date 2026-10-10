@@ -1,3 +1,4 @@
+import { BridgetTaskRef, BridgetLineageTask, BridgetLineageSnapshot } from "./bridgetLineage.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -381,6 +382,11 @@ export const OrchestrationV2AppThread = Schema.Struct({
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
   lineage: OrchestrationV2AppThreadLineage,
+  bridgetTaskRef: Schema.optional(BridgetTaskRef),
+  bridgetTask: Schema.optional(BridgetLineageTask),
+  bridgetLineage: Schema.optional(
+    Schema.Struct({ generation: Schema.String, seq: NonNegativeInt, available: Schema.Boolean }),
+  ),
   forkedFrom: Schema.NullOr(
     Schema.Union([
       Schema.Struct({ type: Schema.Literal("run"), threadId: ThreadId, runId: RunId }),
@@ -444,6 +450,12 @@ export type OrchestrationV2AppThread = typeof OrchestrationV2AppThread.Type;
  * Cursor native subagents). The provider owns its conversation, so it cannot
  * take messages; T3 delegate_task children (`creationSource: "mcp"`) can.
  */
+export function isBridgetSubagentThread(thread: {
+  readonly bridgetTaskRef?: BridgetTaskRef;
+}): boolean {
+  return thread.bridgetTaskRef !== undefined;
+}
+
 export function isProviderNativeSubagentThread(
   thread: Pick<OrchestrationV2AppThread, "lineage" | "creationSource">,
 ): boolean {
@@ -665,7 +677,7 @@ export const OrchestrationV2Subagent = Schema.Struct({
   threadId: ThreadId,
   runId: Schema.NullOr(RunId),
   parentNodeId: NodeId,
-  origin: Schema.Literals(["provider_native", "app_owned"]),
+  origin: Schema.Literals(["provider_native", "app_owned", "bridget_native"]),
   createdBy: OrchestrationV2Actor,
   driver: ProviderDriverKind,
   providerInstanceId: ProviderInstanceId,
@@ -1556,7 +1568,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("subagent"),
     subagentId: NodeId,
-    origin: Schema.Literals(["provider_native", "app_owned"]),
+    origin: Schema.Literals(["provider_native", "app_owned", "bridget_native"]),
     driver: ProviderDriverKind,
     providerInstanceId: ProviderInstanceId,
     childThreadId: Schema.NullOr(ThreadId),
@@ -1850,6 +1862,11 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   /** Pull request discovered from the thread's current branch. */
   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
   lineage: OrchestrationV2AppThreadLineage,
+  bridgetTaskRef: Schema.optional(BridgetTaskRef),
+  bridgetTask: Schema.optional(BridgetLineageTask),
+  bridgetLineage: Schema.optional(
+    Schema.Struct({ generation: Schema.String, seq: NonNegativeInt, available: Schema.Boolean }),
+  ),
   forkedFrom: Schema.NullOr(OrchestrationV2AppThread.fields.forkedFrom),
   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
@@ -2331,7 +2348,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("subagent"),
     subagentId: NodeId,
-    origin: Schema.Literals(["provider_native", "app_owned"]),
+    origin: Schema.Literals(["provider_native", "app_owned", "bridget_native"]),
     driver: ProviderDriverKind,
     providerInstanceId: ProviderInstanceId,
     childThreadId: Schema.NullOr(ThreadId),
@@ -3060,6 +3077,17 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  * send them.
  */
 const OrchestrationV2InternalCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("bridget.lineage.sync"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    snapshot: BridgetLineageSnapshot,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("bridget.lineage.unavailable"),
+    commandId: CommandId,
+    threadId: ThreadId,
+  }),
   /**
    * Records what a pull request watch saw, and wakes the agent in the same transaction when
    * `wake` is set. Rejected once the watch started at `startedAt` has ended, and a wake is
