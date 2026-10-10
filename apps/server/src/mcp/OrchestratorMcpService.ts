@@ -121,6 +121,13 @@ type TerminalTaskStatus = Extract<
 >;
 
 export interface OrchestratorMcpServiceShape {
+  readonly sessionIdentity: (scope: McpInvocationScope) => Effect.Effect<{
+    version: 1;
+    environmentId: string;
+    threadId: string;
+    providerSessionId: string;
+    providerInstanceId: string;
+  }, OrchestratorMcpFailure>;
   readonly capabilities: (
     scope: McpInvocationScope,
   ) => Effect.Effect<OrchestratorMcpCapabilitiesResult, OrchestratorMcpFailure>;
@@ -1767,6 +1774,21 @@ const make = Effect.gen(function* () {
         return { status, secretRef: secretRef.value };
       }).pipe(Effect.withSpan("OrchestratorMcpService.requestSecret")),
 
+    sessionIdentity: (callerScope) =>
+      Effect.gen(function* () {
+        const { scope, parent } = yield* loadThreadCaller(callerScope, "bridget_session");
+        if (parent.thread.deletedAt !== null) {
+          return yield* failure("parent_not_active", "The calling thread has been deleted.");
+        }
+        yield* assertLiveCaller(scope, parent);
+        return {
+          version: 1 as const,
+          environmentId: scope.environmentId,
+          threadId: scope.thread.threadId,
+          providerSessionId: scope.thread.providerSessionId,
+          providerInstanceId: scope.thread.providerInstanceId,
+        };
+      }),
     capabilities: (scope) =>
       Effect.gen(function* () {
         const { parent, limits } = yield* loadCaller(scope);

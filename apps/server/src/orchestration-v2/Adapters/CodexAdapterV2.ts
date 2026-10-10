@@ -1,3 +1,5 @@
+import * as NodePath from "@effect/platform-node/NodePath";
+import { prepareCodexBridgetMcp } from "../../provider/Drivers/CodexMcp.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
@@ -1318,6 +1320,8 @@ export const CODEX_THREAD_CONFIG = { "tools.update_plan.enabled": true } as cons
 
 export function codexThreadRuntimeParams(input: {
   readonly threadId: ThreadId | null;
+  readonly bridgetMcpServer?: Schema.Json;
+  readonly mcpSession?: McpProviderSession.McpProviderSessionConfig | null;
   readonly modelSelection?: { readonly model: string };
   readonly runtimePolicy?: ProviderAdapterV2RuntimePolicy;
 }): {
@@ -1326,7 +1330,11 @@ export function codexThreadRuntimeParams(input: {
   readonly config: Readonly<Record<string, Schema.Json>>;
 } {
   const mcpSession =
-    input.threadId === null ? undefined : McpProviderSession.readMcpProviderSession(input.threadId);
+    input.mcpSession === undefined
+      ? input.threadId === null
+        ? undefined
+        : McpProviderSession.readMcpProviderSession(input.threadId)
+      : (input.mcpSession ?? undefined);
   return {
     ...(input.runtimePolicy?.cwd == null ? {} : { cwd: input.runtimePolicy.cwd }),
     ...(input.modelSelection === undefined ? {} : { model: input.modelSelection.model }),
@@ -1335,12 +1343,13 @@ export function codexThreadRuntimeParams(input: {
       ...(mcpSession === undefined
         ? {}
         : {
-            mcp_servers: {
-              "t3-code": {
-                url: mcpSession.endpoint,
-                http_headers: {
-                  Authorization: mcpSession.authorizationHeader,
-                },
+            ...(input.bridgetMcpServer === undefined
+              ? {}
+              : { "mcp_servers.bridget": input.bridgetMcpServer }),
+            "mcp_servers.t3-code": {
+              url: mcpSession.endpoint,
+              http_headers: {
+                Authorization: mcpSession.authorizationHeader,
               },
             },
           }),
@@ -1499,6 +1508,7 @@ function redactCodexProtocolValue(value: unknown): unknown {
 function isSensitiveCodexProtocolKey(key: string): boolean {
   const normalized = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
   return (
+    normalized === "bridgett3mcpendpoint" ||
     normalized.endsWith("authorization") ||
     normalized.endsWith("apikey") ||
     normalized.endsWith("token") ||
@@ -1792,6 +1802,41 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             yield* Ref.set(initialized, true);
           }),
         );
+        const threadRuntimeParams = (params: Parameters<typeof codexThreadRuntimeParams>[0]) =>
+          Effect.gen(function* () {
+            yield* ensureInitialized;
+            const currentSession =
+              params.threadId === null
+                ? undefined
+                : McpProviderSession.readMcpProviderSession(params.threadId);
+            const session =
+              currentSession?.providerSessionId === input.providerSessionId &&
+              currentSession.providerInstanceId === adapterOptions.instanceId
+                ? currentSession
+                : undefined;
+            const cwd = params.runtimePolicy?.cwd ?? input.runtimePolicy.cwd;
+            const bridgetMcpServer = yield* prepareCodexBridgetMcp({
+              session,
+              environment: resolvedRuntime?.environment ?? adapterOptions.environment,
+              readConfig: () =>
+                client.request("config/read", {
+                  ...(cwd == null ? {} : { cwd }),
+                  includeLayers: false,
+                }),
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provide(NodePath.layer),
+            );
+            // A rotation during policy lookup invalidates this candidate's private mount.
+            const stillCurrent =
+              params.threadId !== null &&
+              McpProviderSession.readMcpProviderSession(params.threadId) === session;
+            return codexThreadRuntimeParams({
+              ...params,
+              mcpSession: stillCurrent ? (session ?? null) : null,
+              ...(stillCurrent && bridgetMcpServer ? { bridgetMcpServer } : {}),
+            });
+          });
         const now = yield* DateTime.now;
         const session = providerSession({
           providerSessionId: input.providerSessionId,
@@ -6450,14 +6495,11 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           ensureThread: (threadInput) =>
             ensureInitialized.pipe(
               Effect.andThen(
-                client.request(
-                  "thread/start",
-                  codexThreadRuntimeParams({
-                    threadId: threadInput.threadId,
-                    modelSelection: threadInput.modelSelection,
-                    runtimePolicy: threadInput.runtimePolicy,
-                  }),
-                ),
+                threadRuntimeParams({
+                  threadId: threadInput.threadId,
+                  modelSelection: threadInput.modelSelection,
+                  runtimePolicy: threadInput.runtimePolicy,
+                }).pipe(Effect.flatMap((params) => client.request("thread/start", params))),
               ),
               Effect.map((response): OrchestrationV2ProviderThread =>
                 providerThreadFromCodexThread({
@@ -6485,7 +6527,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               const resume = client.raw.request("thread/resume", {
                 threadId: nativeThreadId,
                 excludeTurns: true,
-                ...codexThreadRuntimeParams({
+                ...(yield* threadRuntimeParams({
                   threadId: threadInput.threadId ?? threadInput.providerThread.appThreadId,
                   ...(threadInput.modelSelection === undefined
                     ? {}
@@ -6493,7 +6535,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                   ...(threadInput.runtimePolicy === undefined
                     ? {}
                     : { runtimePolicy: threadInput.runtimePolicy }),
-                }),
+                })),
               });
               const response = yield* ensureInitialized.pipe(
                 Effect.andThen(
@@ -7213,11 +7255,11 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                 yield* client.raw.request("thread/resume", {
                   threadId,
                   excludeTurns: true,
-                  ...codexThreadRuntimeParams({
+                  ...(yield* threadRuntimeParams({
                     threadId: threadInput.providerThread.appThreadId,
                     modelSelection: input.modelSelection,
                     runtimePolicy: input.runtimePolicy,
-                  }),
+                  })),
                 });
               }
               const response = yield* ensureInitialized.pipe(
@@ -7262,7 +7304,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                     ...(boundary.lastTurnId === undefined
                       ? {}
                       : { lastTurnId: boundary.lastTurnId }),
-                    ...codexThreadRuntimeParams({
+                    ...(yield* threadRuntimeParams({
                       threadId: threadInput.targetThreadId,
                       ...(threadInput.modelSelection === undefined
                         ? {}
@@ -7270,7 +7312,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                       ...(threadInput.runtimePolicy === undefined
                         ? {}
                         : { runtimePolicy: threadInput.runtimePolicy }),
-                    }),
+                    })),
                   }),
                 ),
                 Effect.mapError(

@@ -1448,6 +1448,17 @@ describe("orchestrator MCP toolkit", () => {
             expect(threadInterruptTool?.tool.annotations?.destructiveHint).toBe(true);
 
             const capabilities = yield* invoke("orchestrator_capabilities", {});
+            const bridgetSessionTool = server.tools.find(({ tool }) => tool.name === "bridget_session");
+            expect(bridgetSessionTool?.tool.annotations?.readOnlyHint).toBe(true);
+            const bridgetSession = yield* invoke("bridget_session", {});
+            expect(bridgetSession.isError).toBe(false);
+            expect(bridgetSession.structuredContent).toEqual({
+              version: 1,
+              environmentId: invocation.environmentId,
+              threadId: parentThreadId,
+              providerSessionId: invocation.thread!.providerSessionId,
+              providerInstanceId: codexInstanceId,
+            });
             expect(capabilities.isError).toBe(false);
             expect(capabilities.structuredContent).toMatchObject({
               inheritedProviderInstanceId: codexInstanceId,

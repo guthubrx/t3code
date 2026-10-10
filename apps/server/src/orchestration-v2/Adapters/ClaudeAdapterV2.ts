@@ -88,7 +88,10 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExecutable.ts";
 import { planClaudeSkillDispatch } from "../../provider/Drivers/ClaudeSkillDispatch.ts";
 import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
-import { prepareClaudeMcp } from "../../provider/Drivers/ClaudeMcp.ts";
+import {
+  claudeBridgetReadOnlySettings,
+  prepareClaudeMcp,
+} from "../../provider/Drivers/ClaudeMcp.ts";
 import { compileClaudeModelSelection } from "../../claudeModelOptions.ts";
 import * as ServerConfig from "../../config.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
@@ -639,9 +642,15 @@ export const layerQueryRunner: Layer.Layer<
               try: () => query({ prompt, options: input.options }),
               catch: (cause) => queryRunnerError(cause, "query"),
             });
+            const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
             yield* restore(
               prepareClaudeMcp({
                 query: candidate,
+                readOnlySettings: claudeBridgetReadOnlySettings(input.options.settings),
+                session:
+                  mcpSession?.providerSessionId === input.providerSessionId
+                    ? mcpSession
+                    : undefined,
                 config: { homePath: "" },
                 environment: input.options.env ?? environment,
                 ...(input.options.cwd === undefined ? {} : { cwd: input.options.cwd }),
@@ -956,6 +965,7 @@ export const CLAUDE_T3_MCP_TOOL_WILDCARD = "mcp__t3-code__*";
 // Must stay in sync with the Tool.Readonly annotations on OrchestratorToolkit;
 // ClaudeAdapterV2.test.ts cross-checks this list against the toolkit.
 export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
+  "mcp__t3-code__bridget_session",
   "mcp__t3-code__orchestrator_capabilities",
   "mcp__t3-code__list_scheduled_tasks",
   "mcp__t3-code__t3_thread_list",
@@ -1691,6 +1701,8 @@ const CLAUDE_KNOWN_TOOL_CLASSIFICATIONS: Record<
   ls: { itemType: "dynamic_tool", requestKind: "file-read" },
   monitor: { itemType: "dynamic_tool", requestKind: "command" },
   multiedit: { itemType: "file_change", requestKind: "file-change" },
+  mcpbridgetbridgetcapabilities: { itemType: "dynamic_tool", requestKind: "file-read" },
+  mcpbridgetbridgettaskstatus: { itemType: "dynamic_tool", requestKind: "file-read" },
   notebookedit: { itemType: "file_change", requestKind: "file-change" },
   read: { itemType: "dynamic_tool", requestKind: "file-read" },
   sendmessage: { itemType: "dynamic_tool", requestKind: "command" },

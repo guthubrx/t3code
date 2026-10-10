@@ -5,6 +5,8 @@ export interface McpProviderSessionConfig {
   readonly threadId: ThreadId;
   readonly providerSessionId: string;
   readonly providerInstanceId: ProviderInstanceId;
+  /** T3 runtime namespace for the private Bridget subprocess. */
+  readonly t3codeHome?: string;
   readonly endpoint: string;
   readonly authorizationHeader: string;
   /**

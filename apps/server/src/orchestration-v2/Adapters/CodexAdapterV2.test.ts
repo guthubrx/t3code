@@ -674,12 +674,10 @@ describe("CodexAdapterV2 process spawning", () => {
           model: "gpt-5.4",
           config: {
             "tools.update_plan.enabled": true,
-            mcp_servers: {
-              "t3-code": {
-                url: "http://127.0.0.1:43123/mcp",
-                http_headers: {
-                  Authorization: "Bearer secret-codex-token",
-                },
+            "mcp_servers.t3-code": {
+              url: "http://127.0.0.1:43123/mcp",
+              http_headers: {
+                Authorization: "Bearer secret-codex-token",
               },
             },
           },
@@ -1065,6 +1063,10 @@ describe("CodexAdapterV2 native protocol logging", () => {
           params: {
             id: "evt-1",
             http_headers: { Authorization: "Bearer secret-codex-token" },
+            env: {
+              BRIDGET_T3_MCP_ENDPOINT: "http://127.0.0.1:43123/mcp",
+              BRIDGET_T3_MCP_AUTHORIZATION: "Bearer private-bridge-token",
+            },
             usage: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
           },
         },
@@ -1091,6 +1093,10 @@ describe("CodexAdapterV2 native protocol logging", () => {
             params: {
               id: "evt-1",
               http_headers: { Authorization: "[REDACTED]" },
+              env: {
+                BRIDGET_T3_MCP_ENDPOINT: "[REDACTED]",
+                BRIDGET_T3_MCP_AUTHORIZATION: "[REDACTED]",
+              },
               usage: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
             },
           },
@@ -1718,6 +1724,7 @@ describe("CodexAdapterV2 session initialize", () => {
   const openReplaySession = (
     transcript: CodexReplay.CodexAppServerReplayTranscript,
     beforeEmitInbound?: CodexReplay.CodexAppServerReplayDriver["beforeEmitInbound"],
+    environment: NodeJS.ProcessEnv = {},
   ) =>
     Effect.gen(function* () {
       const driver = yield* CodexReplay.makeReplayDriver(
@@ -1728,7 +1735,7 @@ describe("CodexAdapterV2 session initialize", () => {
       const adapter = CodexAdapterV2.makeCodexAdapterV2({
         instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
         settings: DEFAULT_CODEX_SETTINGS,
-        environment: {},
+        environment,
         clientFactory: {
           open: (openInput) =>
             Layer.build(CodexReplay.layerReplayWithDriver(driver)).pipe(
@@ -1767,6 +1774,7 @@ describe("CodexAdapterV2 session initialize", () => {
         runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
       });
       return {
+        runtime,
         ensureThread: (threadId: string) =>
           runtime.ensureThread({
             threadId: ThreadId.make(threadId),
@@ -1779,6 +1787,148 @@ describe("CodexAdapterV2 session initialize", () => {
 
   const replayPreamble = (nativeThreadId: string) =>
     codexReplayPreamble({ nativeThreadId, nativeTurnId: "unused", prompt: "unused" });
+
+  it.effect("binds start, resume and fork to current identities in a shared app-server", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "148-mcp-" });
+      const scenario = "private-mcp-scope";
+      const threadId = ThreadId.make(`thread-${scenario}`);
+      const targetThreadId = ThreadId.make("thread-private-mcp-target");
+      const providerSessionId = `provider-session-${scenario}`;
+      const config = (token: string) => ({
+        ...CodexAdapterV2.CODEX_THREAD_CONFIG,
+        "mcp_servers.t3-code": {
+          url: "http://127.0.0.1:43123/mcp",
+          http_headers: { Authorization: `Bearer ${token}` },
+        },
+        "mcp_servers.bridget": {
+          command: "/usr/bin/true",
+          args: ["mcp"],
+          env: {
+            HOME: home,
+            BRIDGET_HOME: `${home}/.cache/bridget-core`,
+            BRIDGET_SOCKET: `${home}/.cache/bridget-core/bridget.sock`,
+            T3CODE_HOME: home,
+            BRIDGET_T3_MCP_ENDPOINT: "http://127.0.0.1:43123/mcp",
+            BRIDGET_T3_MCP_AUTHORIZATION: `Bearer ${token}`,
+          },
+        },
+      });
+      const rpc = (
+        id: number,
+        method: string,
+        params: unknown,
+        result: unknown,
+      ): CodexReplay.CodexAppServerReplayEntry[] => [
+        { type: "expect_outbound", label: method, frame: { id, method, params } },
+        { type: "emit_inbound", label: method, frame: { id, result } },
+      ];
+      const read = (id: number) =>
+        rpc(
+          id,
+          "config/read",
+          { cwd: "/workspace", includeLayers: false },
+          {
+            config: { mcp_servers: { other: { command: "/custom/keep", enabled: false } } },
+            origins: {},
+          },
+        );
+      const nativeResult = (nativeThreadId: string) => {
+        const frame = replayPreamble(nativeThreadId)[4]!;
+        assert.ok(frame.type === "emit_inbound" && Predicate.isObject(frame.frame));
+        return frame.type === "emit_inbound" && Predicate.isObject(frame.frame)
+          ? frame.frame.result
+          : undefined;
+      };
+      const session = yield* openReplaySession(
+        makeCodexReplayTranscript({
+          scenario,
+          entries: [
+            ...replayPreamble("scope-root").slice(0, 3),
+            ...read(2),
+            ...rpc(3, "thread/start", { config: config("scope-a") }, nativeResult("scope-root")),
+            ...read(4),
+            ...rpc(
+              5,
+              "thread/resume",
+              { threadId: "scope-root", excludeTurns: true, config: config("scope-b") },
+              { thread: { id: "scope-root", updatedAt: 1782622450 } },
+            ),
+            ...read(6),
+            ...rpc(
+              7,
+              "thread/fork",
+              { threadId: "scope-root", config: config("scope-target") },
+              nativeResult("scope-child"),
+            ),
+            ...rpc(
+              8,
+              "thread/start",
+              { config: CodexAdapterV2.CODEX_THREAD_CONFIG },
+              nativeResult("scope-foreign"),
+            ),
+            ...rpc(
+              9,
+              "thread/start",
+              { config: CodexAdapterV2.CODEX_THREAD_CONFIG },
+              nativeResult("scope-revoked"),
+            ),
+            ...read(10),
+            ...rpc(
+              11,
+              "thread/resume",
+              { threadId: "scope-root", excludeTurns: true, config: config("scope-remount") },
+              { thread: { id: "scope-root", updatedAt: 1782622450 } },
+            ),
+          ],
+        }),
+        undefined,
+        { HOME: home, PATH: "/usr/bin:/bin", T3CODE_BRIDGET_EXECUTABLE: "/usr/bin/true" },
+      );
+      const bind = (id: ThreadId, token: string, provider = providerSessionId) =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: EnvironmentId.make("scope-env"),
+          threadId: id,
+          providerSessionId: provider,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          endpoint: "http://127.0.0.1:43123/mcp",
+          authorizationHeader: `Bearer ${token}`,
+          browserToolsAvailable: false,
+          t3codeHome: home,
+        });
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          McpProviderSession.clearMcpProviderSession(threadId);
+          McpProviderSession.clearMcpProviderSession(targetThreadId);
+        }),
+      );
+      bind(threadId, "scope-a");
+      const root = yield* session.ensureThread(threadId);
+      bind(threadId, "scope-b");
+      yield* session.runtime.resumeThread({
+        providerThread: root,
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+      });
+      bind(targetThreadId, "scope-target");
+      const fork = yield* session.runtime.forkThread({
+        sourceProviderThread: root,
+        targetThreadId,
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+      });
+      assert.equal(fork.appThreadId, targetThreadId);
+      bind(threadId, "scope-foreign", "foreign-provider-session");
+      yield* session.ensureThread(threadId);
+      McpProviderSession.clearMcpProviderSession(threadId);
+      yield* session.ensureThread(threadId);
+      bind(threadId, "scope-remount");
+      yield* session.runtime.resumeThread({
+        providerThread: root,
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+      });
+      assert.equal(session.initializeRequests(), 1);
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
 
   it.effect("sends one initialize when two threads start on a fresh session at once", () =>
     Effect.gen(function* () {

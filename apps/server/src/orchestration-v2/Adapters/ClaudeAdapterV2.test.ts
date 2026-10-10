@@ -672,6 +672,20 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
 });
 
 describe("ClaudeAdapterV2 native protocol logging", () => {
+  it("classifies native Bridget reads separately while mutations keep command approval", () => {
+    for (const name of ["bridget_capabilities", "bridget_task_status"]) {
+      assert.equal(
+        ClaudeAdapterV2.classifyClaudeNativeTool(`mcp__bridget__${name}`).requestKind,
+        "file-read",
+      );
+    }
+    for (const name of ["bridget_delegate", "bridget_task_cancel"]) {
+      assert.equal(
+        ClaudeAdapterV2.classifyClaudeNativeTool(`mcp__bridget__${name}`).requestKind,
+        "command",
+      );
+    }
+  });
   it("injects thread-scoped MCP configuration without logging the credential", () => {
     const threadId = ThreadId.make("thread-claude-mcp");
     McpProviderSession.setMcpProviderSession({

@@ -1,11 +1,16 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { EnvironmentId, ThreadId, ProviderInstanceId } from "@t3tools/contracts";
 import type { McpServerConfig, McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
-import { prepareClaudeMcp } from "./ClaudeMcp.ts";
+import {
+  CLAUDE_BRIDGET_READ_ONLY_TOOLS,
+  claudeBridgetReadOnlySettings,
+  prepareClaudeMcp,
+} from "./ClaudeMcp.ts";
 
 const fixture = Effect.fn(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -27,6 +32,16 @@ const fixture = Effect.fn(function* () {
     cwd: home,
     environment: { HOME: home, T3CODE_BRIDGET_EXECUTABLE: "/usr/bin/true", PATH: "/usr/bin:/bin" },
     extraArgs: {},
+    session: {
+      environmentId: EnvironmentId.make("environment-private"),
+      threadId: ThreadId.make("thread-private"),
+      providerSessionId: "provider-private",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      endpoint: "http://127.0.0.1:43123/mcp",
+      authorizationHeader: "Bearer private-session-a",
+      browserToolsAvailable: false,
+      t3codeHome: home,
+    },
     servers: {
       "t3-code": {
         type: "http" as const,
@@ -48,6 +63,133 @@ const fixture = Effect.fn(function* () {
 });
 
 describe("SPEC147 Claude MCP policy", () => {
+  it.effect.each(["disabled", "custom", "revoked", "explicit"] as const)(
+    "does not apply session read rules when preparation is $case",
+    (reason) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          let applied = 0;
+          if (reason === "disabled")
+            yield* f.fs.writeFileString(
+              f.path.join(f.home, "settings.json"),
+              '{"disabledMcpServers":["bridget"]}',
+            );
+          if (reason === "custom")
+            f.setStatuses([
+              { name: "bridget", status: "connected", tools: [{ name: "bridget_capabilities" }] },
+            ]);
+          const result = yield* prepareClaudeMcp({
+            ...f.input,
+            session: reason === "revoked" ? undefined : f.input.session,
+            extraArgs: reason === "explicit" ? { "mcp-config": "private-config" } : {},
+            readOnlySettings: claudeBridgetReadOnlySettings(undefined),
+            query: {
+              ...f.input.query,
+              applyFlagSettings: async () => {
+                applied += 1;
+              },
+            },
+          });
+          assert.equal(
+            result.code,
+            {
+              disabled: "disabled",
+              custom: "user_server",
+              revoked: "identity_unavailable",
+              explicit: "explicit_config",
+            }[reason],
+          );
+          assert.equal(applied, 0);
+          assert.equal(f.calls.length, 0);
+        }).pipe(Effect.provide(NodeServices.layer)),
+      ),
+  );
+  it("adds only exact native read rules and preserves existing denial and ask rules", () => {
+    const permissions = {
+      allow: ["Read"],
+      deny: ["mcp__bridget__bridget_task_status"],
+      ask: ["mcp__bridget__bridget_capabilities"],
+      defaultMode: "dontAsk" as const,
+    };
+    assert.deepEqual(claudeBridgetReadOnlySettings({ permissions }), {
+      permissions: {
+        ...permissions,
+        allow: ["Read", ...CLAUDE_BRIDGET_READ_ONLY_TOOLS],
+      },
+    });
+    assert.isUndefined(claudeBridgetReadOnlySettings("/private/settings.json"));
+    assert.isFalse(
+      CLAUDE_BRIDGET_READ_ONLY_TOOLS.some(
+        (name) => name.includes("delegate") || name.includes("cancel") || name.includes("*"),
+      ),
+    );
+  });
+  it.effect("applies read approvals only after its real mount and verified catalogue", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const settings = claudeBridgetReadOnlySettings({ permissions: { deny: ["Bash"] } })!;
+        const applied: unknown[] = [];
+        const query = {
+          ...f.input.query,
+          setMcpServers: async (servers: Record<string, McpServerConfig>) => {
+            const result = await f.input.query.setMcpServers(servers);
+            f.setStatuses([
+              {
+                name: "bridget",
+                status: "connected",
+                tools: [
+                  { name: "bridget_thread" },
+                  { name: "bridget_capabilities" },
+                  { name: "bridget_task_status" },
+                ],
+              },
+            ]);
+            return result;
+          },
+          applyFlagSettings: async (value: unknown) => {
+            applied.push(value);
+          },
+        };
+        assert.equal(
+          (yield* prepareClaudeMcp({ ...f.input, query, readOnlySettings: settings })).code,
+          "mounted",
+        );
+        assert.deepEqual(applied, [settings]);
+        assert.equal(
+          (yield* prepareClaudeMcp({ ...f.input, query, readOnlySettings: settings })).code,
+          "user_server",
+        );
+        assert.equal(applied.length, 1);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+  it.effect("never changes rules on opt-out and closes a missing read catalogue", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        let applied = 0;
+        const input = {
+          ...f.input,
+          readOnlySettings: claudeBridgetReadOnlySettings(undefined),
+          query: {
+            ...f.input.query,
+            applyFlagSettings: async () => {
+              applied += 1;
+            },
+          },
+        };
+        assert.equal(
+          (yield* prepareClaudeMcp({ ...input, extraArgs: { "strict-mcp-config": null } })).code,
+          "explicit_config",
+        );
+        const failure = yield* prepareClaudeMcp(input).pipe(Effect.flip);
+        assert.equal(failure.code, "catalogue_unavailable");
+        assert.equal(applied, 0);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
   it.effect("checks explicit metadata refusal before a rejecting SDK status", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -129,7 +271,7 @@ describe("SPEC147 Claude MCP policy", () => {
         }).pipe(Effect.provide(NodeServices.layer)),
       ),
   );
-  it.effect("mounts stdio with namespace only and preserves t3-code", () =>
+  it.effect("mounts stdio with private session identity and preserves t3-code", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const f = yield* fixture();
@@ -143,8 +285,38 @@ describe("SPEC147 Claude MCP policy", () => {
             HOME: f.home,
             BRIDGET_HOME: f.path.join(f.home, ".cache", "bridget-core"),
             BRIDGET_SOCKET: f.path.join(f.home, ".cache", "bridget-core", "bridget.sock"),
+            T3CODE_HOME: f.home,
+            BRIDGET_T3_MCP_ENDPOINT: f.input.session.endpoint,
+            BRIDGET_T3_MCP_AUTHORIZATION: f.input.session.authorizationHeader,
           },
         });
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+
+  it.effect("keeps rotated sessions separate and closes identity when revoked", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const a = yield* fixture();
+        const b = yield* fixture();
+        b.input.session.authorizationHeader = "Bearer private-session-b";
+        b.input.session.providerInstanceId = ProviderInstanceId.make("claude_glm");
+        assert.equal((yield* prepareClaudeMcp(a.input)).code, "mounted");
+        assert.equal((yield* prepareClaudeMcp(b.input)).code, "mounted");
+        const aServer = a.calls[0]?.bridget;
+        const bServer = b.calls[0]?.bridget;
+        assert.ok(aServer && "env" in aServer && bServer && "env" in bServer);
+        if (aServer && "env" in aServer && bServer && "env" in bServer) {
+          assert.equal(aServer.env?.BRIDGET_T3_MCP_AUTHORIZATION, "Bearer private-session-a");
+          assert.equal(bServer.env?.BRIDGET_T3_MCP_AUTHORIZATION, "Bearer private-session-b");
+        }
+        const c = yield* fixture();
+        assert.equal(
+          (yield* prepareClaudeMcp({ ...c.input, session: undefined })).code,
+          "identity_unavailable",
+        );
+        assert.equal(c.calls.length, 0);
+        assert.equal("BRIDGET_T3_MCP_AUTHORIZATION" in a.input.environment, false);
       }).pipe(Effect.provide(NodeServices.layer)),
     ),
   );

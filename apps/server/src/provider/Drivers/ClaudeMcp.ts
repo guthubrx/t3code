@@ -2,6 +2,7 @@ import type {
   McpServerConfig,
   McpServerStatus,
   McpSetServersResult,
+  Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeSettings } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -11,13 +12,47 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
-import { resolveBridgetExecutable } from "../../bridget/BridgetExecutable.ts";
+import { bridgetMcpServer } from "../../bridget/BridgetMcp.ts";
+import type { McpProviderSessionConfig } from "@t3tools/provider-core/server/mcpSession";
 import { resolveClaudeHomePath } from "./ClaudeHome.ts";
 import { claudeSettingsPaths, findRepositoryRoot } from "./ClaudeSettingsPaths.ts";
 
 export class ClaudeMcpError extends Data.TaggedError("ClaudeMcpError")<{
   readonly code: "sdk_failed" | "timeout" | "catalogue_unavailable";
 }> {}
+
+export const CLAUDE_BRIDGET_READ_ONLY_TOOLS = [
+  "mcp__bridget__bridget_capabilities",
+  "mcp__bridget__bridget_task_status",
+] as const;
+const isSettingsRecord = Schema.is(Schema.Record(Schema.String, Schema.Unknown));
+const isPermissionAllowRules = Schema.is(Schema.Array(Schema.String));
+
+/** Session flag rules only. Preserve every existing permission field, including deny/ask.
+ * A settings-file path or an opaque permission value cannot be safely merged here. */
+export function claudeBridgetReadOnlySettings(
+  settings: Settings | string | undefined,
+): Pick<Settings, "permissions"> | undefined {
+  let current: unknown = settings ?? {};
+  if (typeof current === "string") {
+    try {
+      current = JSON.parse(current);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!isSettingsRecord(current)) return undefined;
+  const permissions = current.permissions ?? {};
+  if (!isSettingsRecord(permissions)) return undefined;
+  const allowed = permissions.allow ?? [];
+  if (!isPermissionAllowRules(allowed)) return undefined;
+  return {
+    permissions: {
+      ...permissions,
+      allow: [...new Set([...allowed, ...CLAUDE_BRIDGET_READ_ONLY_TOOLS])],
+    },
+  } as Pick<Settings, "permissions">;
+}
 
 type MetadataCode = "disabled" | "user_server" | "metadata_unavailable";
 const McpPolicyEntry = Schema.Struct({
@@ -113,7 +148,7 @@ const metadataPolicy = Effect.fn("ClaudeMcp.metadataPolicy")(function* (
  * Metadata scopes are a fixed set, with a 4 MiB/file stat guard; ancestor discovery
  * scales with cwd depth. Local work is linear in the metadata bytes and SDK
  * catalogue/config entries inspected or copied, plus executable path lookup (not O(1)).
- * At most three SDK controls run under one 6-second preparation deadline.
+ * At most four SDK controls run under one 6-second preparation deadline.
  * SDK promises may outlive that deadline; the caller owns candidate closure and
  * must prevent publication or prompts after failed/interrupted preparation.
  */
@@ -123,12 +158,15 @@ export const prepareClaudeMcp = Effect.fn("prepareClaudeMcp")(function* (input: 
     readonly setMcpServers: (
       servers: Record<string, McpServerConfig>,
     ) => Promise<McpSetServersResult>;
+    readonly applyFlagSettings?: (settings: Pick<Settings, "permissions">) => Promise<void>;
   };
   readonly config: Pick<ClaudeSettings, "homePath">;
   readonly environment: NodeJS.ProcessEnv;
   readonly cwd?: string;
   readonly extraArgs: Readonly<Record<string, unknown>>;
   readonly servers?: Record<string, McpServerConfig>;
+  readonly session?: McpProviderSessionConfig | undefined;
+  readonly readOnlySettings?: Pick<Settings, "permissions"> | undefined;
 }) {
   if (
     Object.hasOwn(input.extraArgs, "strict-mcp-config") ||
@@ -151,36 +189,12 @@ export const prepareClaudeMcp = Effect.fn("prepareClaudeMcp")(function* (input: 
     const current = yield* sdk(() => input.query.mcpServerStatus());
     if (current.some((server) => server.name === "bridget"))
       return { code: "user_server" as const };
-    const path = yield* Path.Path;
-    const home = input.environment.HOME;
-    const root =
-      input.environment.BRIDGET_HOME ??
-      (home ? path.join(home, ".cache", "bridget-core") : undefined);
-    const socket =
-      input.environment.BRIDGET_SOCKET ?? (root ? path.join(root, "bridget.sock") : undefined);
-    if (
-      !home ||
-      !root ||
-      !socket ||
-      root === path.dirname(root) ||
-      !path.isAbsolute(home) ||
-      !path.isAbsolute(root) ||
-      !path.isAbsolute(socket) ||
-      path.dirname(socket) !== root ||
-      new TextEncoder().encode(socket).length >= 104
-    )
-      return { code: "namespace_unavailable" as const };
-    const executable = yield* resolveBridgetExecutable(input.environment).pipe(Effect.result);
-    if (executable._tag === "Failure") return { code: "executable_unavailable" as const };
+    const mount = yield* bridgetMcpServer(input.environment, input.session);
+    if (mount.code !== "ready") return { code: mount.code };
     const result = yield* sdk(() =>
       input.query.setMcpServers({
         ...input.servers,
-        bridget: {
-          type: "stdio",
-          command: executable.success,
-          args: ["mcp"],
-          env: { HOME: home, BRIDGET_HOME: root, BRIDGET_SOCKET: socket },
-        },
+        bridget: mount.server,
       }),
     );
     if (Object.keys(result.errors).length > 0)
@@ -195,6 +209,20 @@ export const prepareClaudeMcp = Effect.fn("prepareClaudeMcp")(function* (input: 
       )
     )
       return yield* new ClaudeMcpError({ code: "catalogue_unavailable" });
+    // Only our newly mounted executable earns these two exact read approvals.
+    // Custom/disabled/explicit servers return above. Native deny/ask rules still apply.
+    if (input.readOnlySettings !== undefined) {
+      const tools = mounted.find((server) => server.name === "bridget")?.tools;
+      if (
+        !CLAUDE_BRIDGET_READ_ONLY_TOOLS.every((name) =>
+          tools?.some((tool) => `mcp__bridget__${tool.name}` === name),
+        )
+      )
+        return yield* new ClaudeMcpError({ code: "catalogue_unavailable" });
+      if (input.query.applyFlagSettings === undefined)
+        return yield* new ClaudeMcpError({ code: "sdk_failed" });
+      yield* sdk(() => input.query.applyFlagSettings!(input.readOnlySettings!));
+    }
     return { code: "mounted" as const };
   });
   return yield* preparation.pipe(
