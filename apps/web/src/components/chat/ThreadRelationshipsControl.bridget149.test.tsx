@@ -1,6 +1,13 @@
 import { act, cloneElement, type ReactElement, type ReactNode } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
-import { EnvironmentId, ThreadId, type OrchestrationV2AppThreadLineage } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ThreadId,
+  type OrchestrationV2AppThreadLineage,
+  type BridgetLineageTask,
+  ProviderInstanceId,
+  ProviderDriverKind,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -42,6 +49,7 @@ vi.mock("../ui/tooltip", () => ({
 }));
 
 import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
+import { SubagentTooltipContent } from "./SubagentTooltipContent";
 import { filterSidebarV2VisibleThreads } from "../Sidebar.logic";
 
 const TASK_ID = "25000000-0000-4000-8000-000000000001";
@@ -310,5 +318,84 @@ describe("Colonne de gauche — descendance Bridget masquée par la relation sub
       null,
     );
     expect(visible.map((thread) => thread.id)).toEqual(["parent", "ordinary"]);
+  });
+});
+
+describe("Lineage distant Bridget (162)", () => {
+  const remoteTask: BridgetLineageTask = {
+    task_id: TASK_ID,
+    parent_task_id: null,
+    parent_agent_id: ROOT_THREAD,
+    child_agent_id: NESTED_TASK_ID,
+    child_instance_id: null,
+    created_at: 1790000000,
+    updated_at: 1790000001,
+    started_at: null,
+    completed_at: null,
+    agent_type: "claude_glm",
+    execution_protocol: "claude_stream_json",
+    model: "glm-5.3-flash",
+    effort: null,
+    cwd: "/srv/projet",
+    posture: "development",
+    title: "Mission Bridget",
+    status: "working",
+    error: null,
+    result_available: false,
+    journal_available: true,
+    placement: {
+      machine_id: "cartae",
+      display_name: "Serveur Cartae",
+      worker_id: "worker-cartae",
+      last_contact_at: 1790000010,
+      contact_state: "connected",
+    },
+  };
+
+  it("met à jour la machine et son contact dans la relation existante sans action fournisseur", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    state.shells = [
+      { environmentId: "test", source: { ...bridgetChild, bridgetTask: remoteTask } },
+    ];
+    state.projection = parentProjection();
+    await render(panelFor("parent"));
+    expect(JSON.stringify(renderer.toJSON())).toContain("Serveur Cartae");
+    expect(JSON.stringify(renderer.toJSON())).toContain("Contact observé");
+    const lost = { ...remoteTask, placement: { ...remoteTask.placement!, contact_state: "stale" } };
+    state.shells = [{ environmentId: "test", source: { ...bridgetChild, bridgetTask: lost } }];
+    await act(async () => renderer.update(panelFor("parent")));
+    expect(JSON.stringify(renderer.toJSON())).toContain("Contact perdu");
+    expect(JSON.stringify(renderer.toJSON())).not.toContain("Lineage · Bridget indisponible");
+    expect(stopButtons()).toHaveLength(1);
+    expect(state.interrupt).not.toHaveBeenCalled();
+    expect(state.cancelNative).not.toHaveBeenCalled();
+    expect(state.navigate).not.toHaveBeenCalled();
+  });
+
+  it("montre le fournisseur natif, la machine et la date observée dans l’infobulle existante", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const instanceId = ProviderInstanceId.make("bridget-task-25000000-0000-4000-8000-000000000001");
+    await render(
+      <SubagentTooltipContent
+        title="Mission distante"
+        model={remoteTask.model}
+        providerInstanceId={instanceId}
+        origin="bridget_native"
+        driver={ProviderDriverKind.make("claudeAgent")}
+        status="running"
+        childThread={{
+          branch: null,
+          worktreePath: remoteTask.cwd,
+          modelSelection: { instanceId, model: remoteTask.model },
+          bridgetTask: remoteTask,
+        }}
+      />,
+    );
+    const visible = JSON.stringify(renderer.toJSON());
+    expect(visible).toContain("claude_glm");
+    expect(visible).toContain("Serveur Cartae");
+    expect(visible).toContain("Contact observé");
+    expect(visible).toContain(new Date(1790000010 * 1000).toLocaleString("fr-FR"));
+    expect(state.interrupt).not.toHaveBeenCalled();
   });
 });

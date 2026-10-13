@@ -23,6 +23,7 @@ import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 import { Button } from "~/components/ui/button";
 import { randomUUID } from "~/lib/utils";
+import { BridgetTaskPlacement } from "./chat/SubagentTooltipContent";
 
 type Context = { environmentId: EnvironmentId; projectId: ProjectId; threadId: ThreadId };
 
@@ -329,6 +330,7 @@ export function BridgetTaskJournal({
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <strong className="min-w-0 break-words">{task?.title ?? thread.title}</strong>
             <span className="min-w-0 break-words">
+              {task ? `${task.agent_type} · ` : null}
               {task?.model ?? thread.modelSelection.model}
               {task?.effort ? ` · ${task.effort}` : ""}
             </span>
@@ -338,6 +340,7 @@ export function BridgetTaskJournal({
                 : statusLabels[nativeStatus]}
             </span>
           </div>
+          <BridgetTaskPlacement task={task} />
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             {onOpenParent ? (
               <Button size="xs" variant="ghost" onClick={onOpenParent}>

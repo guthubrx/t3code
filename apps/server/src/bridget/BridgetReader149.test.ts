@@ -5,7 +5,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   type BridgetLineageJournal,
   type BridgetLineageSnapshot,
-  type BridgetLineageTask,
+  type BridgetLineageTaskV2,
   ProjectId,
   type OrchestrationProjectShell,
   type OrchestrationV2ThreadShell,
@@ -34,7 +34,7 @@ const projectId = ProjectId.make("project-lineage-149");
 const workspaceRoot = "/project with spaces/$(forged); é";
 const input = { threadId, projectId };
 
-const task = (overrides: Partial<BridgetLineageTask> = {}): BridgetLineageTask => ({
+const task = (overrides: Partial<BridgetLineageTaskV2> = {}): BridgetLineageTaskV2 => ({
   task_id: uuid(1),
   parent_task_id: null,
   parent_agent_id: uuid(900),
@@ -55,13 +55,14 @@ const task = (overrides: Partial<BridgetLineageTask> = {}): BridgetLineageTask =
   error: null,
   result_available: false,
   journal_available: true,
+  placement: null,
   ...overrides,
 });
 const snapshot = (
-  tasks: BridgetLineageTask[],
-  overrides: Partial<BridgetLineageSnapshot> = {},
-): BridgetLineageSnapshot => ({
-  version: 1,
+  tasks: BridgetLineageTaskV2[],
+  overrides: Partial<Extract<BridgetLineageSnapshot, { readonly version: 2 }>> = {},
+): Extract<BridgetLineageSnapshot, { readonly version: 2 }> => ({
+  version: 2,
   status: "ok",
   generation: uuid(900),
   seq: 7,
@@ -71,7 +72,7 @@ const snapshot = (
   ...overrides,
 });
 const detail = (overrides: Record<string, unknown> = {}): unknown => ({
-  version: 1,
+  version: 2,
   status: "ok",
   generation: uuid(900),
   seq: 7,
@@ -262,6 +263,8 @@ describe("BridgetReader149 lineage context", () => {
         threadId,
         "--project-root",
         workspaceRoot,
+        "--response-version",
+        "2",
         "--action",
         "list",
         "--limit",
@@ -808,6 +811,182 @@ describe("BridgetReader149 lineage journal follow", () => {
           Effect.flip,
         )).code,
       ).toBe("command_failed");
+    }),
+  );
+});
+
+describe("BridgetReader162 negotiated remote metadata", () => {
+  const placement = {
+    machine_id: "cartae",
+    display_name: "Cartae",
+    worker_id: "worker-cartae",
+    last_contact_at: 1790000010,
+    contact_state: "connected" as const,
+  };
+  const { placement: _placement, ...legacyTask } = task();
+  const legacySnapshot = { ...snapshot([]), version: 1, tasks: [legacyTask] };
+  const legacyDetail = {
+    version: 1,
+    status: "ok",
+    generation: uuid(900),
+    seq: 7,
+    root_owner_agent_id: uuid(901),
+    task: legacyTask,
+    result: null,
+    result_offset: 0,
+    result_next_offset: null,
+    result_total_bytes: 0,
+  };
+
+  it.effect("reads v2 placement once and keeps contact observations from each page", () =>
+    Effect.gen(function* () {
+      const first = snapshot([task({ placement })], { next_cursor: "next" });
+      const second = snapshot([
+        task({
+          task_id: uuid(2),
+          placement: { ...placement, last_contact_at: 1790000011 },
+        }),
+      ]);
+      const { reader, calls } = yield* harness({ results: [output(first), output(second)] });
+      const result = yield* reader.lineageSnapshot(input);
+      expect(result).toEqual({
+        ...first,
+        tasks: [...first.tasks, ...second.tasks],
+        next_cursor: null,
+      });
+      expect(calls).toHaveLength(2);
+      expect(calls.every((call) => call.args?.includes("--response-version"))).toBe(true);
+    }),
+  );
+
+  it.effect.each(["invalid_request", "unsupported_version"])(
+    "falls back exactly once to closed v1 after the structured %s refusal",
+    (code) =>
+      Effect.gen(function* () {
+        const { reader, calls } = yield* harness({
+          results: [output(refusal(code), 2), output(legacySnapshot)],
+        });
+        expect(yield* reader.lineageSnapshot(input)).toEqual(legacySnapshot);
+        expect(calls).toHaveLength(2);
+        expect(calls[0]!.args).toContain("--response-version");
+        expect(calls[1]!.args).not.toContain("--response-version");
+        expect(calls[1]!.args).not.toContain("--cursor");
+      }),
+  );
+
+  it.effect("discards every v2 page before restarting the v1 snapshot at cursor zero", () =>
+    Effect.gen(function* () {
+      const first = snapshot([task({ task_id: uuid(77), placement })], {
+        next_cursor: "v2-cursor",
+      });
+      const { reader, calls } = yield* harness({
+        results: [output(first), output(refusal("unsupported_version"), 2), output(legacySnapshot)],
+      });
+      expect(yield* reader.lineageSnapshot(input)).toEqual(legacySnapshot);
+      expect(calls).toHaveLength(3);
+      expect(calls[1]!.args).toContain("v2-cursor");
+      expect(calls[2]!.args).not.toContain("--cursor");
+      expect(calls[2]!.args).not.toContain("--response-version");
+    }),
+  );
+
+  it.effect("keeps a refused fallback closed without a third attempt", () =>
+    Effect.gen(function* () {
+      const { reader, calls } = yield* harness({
+        results: [output(refusal("invalid_request"), 2), output(refusal("unsupported_version"), 2)],
+      });
+      expect((yield* reader.lineageSnapshot(input).pipe(Effect.flip)).code).toBe(
+        "unsupported_version",
+      );
+      expect(calls).toHaveLength(2);
+    }),
+  );
+
+  it.effect.each([
+    "binding_unavailable",
+    "project_mismatch",
+    "task_unavailable",
+    "store_unavailable",
+  ])("does not downgrade another structured refusal: %s", (code) =>
+    Effect.gen(function* () {
+      const { reader, calls } = yield* harness({
+        results: [output(refusal(code), 2), output(legacySnapshot)],
+      });
+      expect((yield* reader.lineageSnapshot(input).pipe(Effect.flip)).code).toBe(code);
+      expect(calls).toHaveLength(1);
+    }),
+  );
+
+  it.effect.each([
+    { name: "implicit v1 success", response: output(legacySnapshot) },
+    { name: "future success", response: output({ ...snapshot([]), version: 3 }) },
+    { name: "malformed JSON", response: output("not JSON") },
+    { name: "missing placement", response: output({ ...snapshot([]), tasks: [legacyTask] }) },
+    { name: "non-v1 error", response: output({ ...refusal("invalid_request"), version: 2 }, 2) },
+  ])("does not downgrade $name", ({ response }) =>
+    Effect.gen(function* () {
+      const { reader, calls } = yield* harness({ results: [response, output(legacySnapshot)] });
+      expect((yield* reader.lineageSnapshot(input).pipe(Effect.flip)).code).toBe("invalid_output");
+      expect(calls).toHaveLength(1);
+    }),
+  );
+
+  it.effect("does not downgrade a timeout", () =>
+    Effect.gen(function* () {
+      const { reader, calls } = yield* harness({
+        results: [{ ...output(snapshot([])), timedOut: true }, output(legacySnapshot)],
+      });
+      expect((yield* reader.lineageSnapshot(input).pipe(Effect.flip)).code).toBe("timeout");
+      expect(calls).toHaveLength(1);
+    }),
+  );
+
+  it.effect(
+    "negotiates detail v2 and falls back once without changing the requested result window",
+    () =>
+      Effect.gen(function* () {
+        const rich = detail({ task: task({ placement }) });
+        const success = yield* harness({ results: [output(rich)] });
+        expect(
+          yield* success.reader.lineageRead({ ...input, action: "show", taskId: uuid(1) }),
+        ).toEqual(rich);
+        expect(success.calls).toHaveLength(1);
+        const fallback = yield* harness({
+          results: [output(refusal("unsupported_version"), 2), output(legacyDetail)],
+        });
+        expect(
+          yield* fallback.reader.lineageRead({
+            ...input,
+            action: "show",
+            taskId: uuid(1),
+            offset: 0,
+            limit: 12,
+          }),
+        ).toEqual(legacyDetail);
+        expect(fallback.calls).toHaveLength(2);
+        expect(fallback.calls[1]!.args).not.toContain("--response-version");
+        expect(fallback.calls[1]!.args.slice(-4)).toEqual(["--limit", "12", "--offset", "0"]);
+      }),
+  );
+
+  it.effect("does not negotiate or replay journal reads and cancellation", () =>
+    Effect.gen(function* () {
+      for (const operation of ["journal", "cancel"] as const) {
+        const { reader, calls } = yield* harness({
+          results: [output(refusal("invalid_request"), 2)],
+        });
+        const request =
+          operation === "journal"
+            ? reader
+                .lineageRead({ ...input, action: "journal", taskId: uuid(1) })
+                .pipe(Effect.asVoid)
+            : reader
+                .lineageCancel({ ...input, taskId: uuid(1), requestId: uuid(55) })
+                .pipe(Effect.asVoid);
+        expect((yield* request.pipe(Effect.flip)).code).toBe("invalid_request");
+        expect(calls).toHaveLength(1);
+        expect(calls[0]!.args).not.toContain("--response-version");
+      }
     }),
   );
 });

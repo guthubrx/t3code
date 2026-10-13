@@ -154,8 +154,8 @@ const nativeTask = (overrides: Partial<BridgetLineageTask> = {}): BridgetLineage
 });
 const nativeSnapshot = (
   tasks: BridgetLineageTask[],
-  overrides: Partial<BridgetLineageSnapshot> = {},
-): BridgetLineageSnapshot => ({
+  overrides: Partial<Extract<BridgetLineageSnapshot, { readonly version: 1 }>> = {},
+): Extract<BridgetLineageSnapshot, { readonly version: 1 }> => ({
   version: 1,
   status: "ok",
   generation: uuid(900),
@@ -704,7 +704,7 @@ describe("Orchestrator.bridget149 sync validation", () => {
     tag: string,
     tasks: BridgetLineageTask[],
     cause: string,
-    overrides: Partial<BridgetLineageSnapshot> = {},
+    overrides: Partial<Extract<BridgetLineageSnapshot, { readonly version: 1 }>> = {},
   ) => {
     const h = makeHarness();
     return Effect.gen(function* () {
@@ -1753,4 +1753,80 @@ describe("Orchestrator.bridget149 origin matrix: canonical markers", () => {
     expect(strict({ ...marker, extra: true })._tag).toBe("Failure");
     expect(strict({ ...marker, taskId: "thread:bridget-task:not-a-uuid" })._tag).toBe("Failure");
   });
+});
+
+describe("Orchestrator162 remote lineage projection", () => {
+  it.effect(
+    "persists remote metadata independently of master availability without launching a provider",
+    () => {
+      const h = makeHarness();
+      return Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const sql = yield* SqlClient.SqlClient;
+        yield* createRoot(orchestrator, rootId);
+        const placement = {
+          machine_id: "cartae",
+          display_name: "Cartae",
+          worker_id: "worker-cartae",
+          last_contact_at: 1790000010,
+          contact_state: "connected" as const,
+        };
+        const remoteTask = { ...nativeTask(), placement };
+        const first: BridgetLineageSnapshot = {
+          ...nativeSnapshot([]),
+          version: 2,
+          tasks: [remoteTask],
+        };
+        yield* sync(orchestrator, rootId, first, "162-remote");
+        const stored = yield* projections.getThread(childA);
+        expect(stored.bridgetTask).toEqual(remoteTask);
+        expect(stored.bridgetLineage?.available).toBe(true);
+        expect(stored.activeProviderThreadId).toBeNull();
+        expect(stored.lineage.parentThreadId).toBe(rootId);
+        const staleTask = {
+          ...remoteTask,
+          placement: { ...placement, contact_state: "stale" as const },
+        };
+        yield* sync(
+          orchestrator,
+          rootId,
+          { ...first, seq: 8, tasks: [staleTask] },
+          "162-lost-contact",
+        );
+        const stale = yield* projections.getThread(childA);
+        expect(stale.bridgetTask).toEqual(staleTask);
+        expect(stale.bridgetTask?.status).toBe("working");
+        expect(stale.bridgetLineage?.available).toBe(true);
+        const refreshed = {
+          ...staleTask,
+          placement: { ...placement, last_contact_at: 1790000020 },
+        };
+        yield* sync(
+          orchestrator,
+          rootId,
+          { ...first, seq: 9, tasks: [refreshed] },
+          "162-contact-restored",
+        );
+        expect((yield* projections.getThread(childA)).bridgetTask).toEqual(refreshed);
+        const replay = yield* sync(
+          orchestrator,
+          rootId,
+          { ...first, seq: 9, tasks: [refreshed] },
+          "162-reopen",
+        );
+        expect(replay.storedEvents).toEqual([]);
+        const records = yield* projections.getThreadRecords(childA, [
+          "runs",
+          "providerThreads",
+          "turnItems",
+        ]);
+        expect(records.runs).toEqual([]);
+        expect(records.providerThreads).toEqual([]);
+        expect(records.turnItems).toEqual([]);
+        const outbox = yield* sql`SELECT COUNT(*) AS n FROM orchestration_v2_effect_outbox`;
+        expect(Number((outbox[0] as { n: number | string }).n)).toBe(0);
+      }).pipe(Effect.provide(h.layer));
+    },
+  );
 });

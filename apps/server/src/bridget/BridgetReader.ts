@@ -32,6 +32,9 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import { resolveBridgetExecutable } from "./BridgetExecutable.ts";
 
+const decodeLineageSnapshot = Schema.decodeUnknownEffect(BridgetLineageSnapshot, {
+  onExcessProperty: "error",
+});
 const decodeInput = Schema.decodeUnknownEffect(BridgetReadInput);
 const decodeWatchInput = Schema.decodeUnknownEffect(BridgetWatchInput);
 const decodeWatchLine = Schema.decodeUnknownEffect(
@@ -471,6 +474,7 @@ const make = Effect.gen(function* () {
   // O(n): each bounded page is decoded once; no mutation or provider operation.
   const lineageSnapshotPages = Effect.fn("BridgetReader.lineageSnapshot")(function* (
     input: BridgetLineageWatchInput,
+    responseVersion: 1 | 2,
   ) {
     const project = yield* resolveLineageContext(input);
     let head: BridgetLineageSnapshot | undefined;
@@ -483,6 +487,7 @@ const make = Effect.gen(function* () {
           "lineage",
           "inspect",
           ...lineageArgs(input, project.workspaceRoot),
+          ...(responseVersion === 2 ? ["--response-version", "2"] : []),
           "--action",
           "list",
           "--limit",
@@ -492,10 +497,11 @@ const make = Effect.gen(function* () {
         ],
         128 * 1024,
       );
-      const page: BridgetLineageSnapshot = yield* Schema.decodeUnknownEffect(
-        BridgetLineageSnapshot,
-        { onExcessProperty: "error" },
-      )(raw).pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })));
+      const page = yield* decodeLineageSnapshot(raw).pipe(
+        Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+      );
+      if (page.version !== responseVersion)
+        return yield* new BridgetLineageError({ code: "invalid_output" });
       if (
         page.tasks.length > 100 ||
         (head !== undefined &&
@@ -514,10 +520,19 @@ const make = Effect.gen(function* () {
         cursors.add(cursor);
       }
     } while (cursor !== null);
-    return { ...head!, tasks, next_cursor: null };
+    // Decode the assembled discriminated union once more to preserve its
+    // version/task correlation; every individual page has already been bounded.
+    return yield* decodeLineageSnapshot({ ...head!, tasks, next_cursor: null }).pipe(
+      Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+    );
   });
   const lineageSnapshot = (input: BridgetLineageWatchInput) =>
-    lineageSnapshotPages(input).pipe(
+    lineageSnapshotPages(input, 2).pipe(
+      Effect.catch((error) =>
+        error.code === "unsupported_version" || error.code === "invalid_request"
+          ? lineageSnapshotPages(input, 1)
+          : Effect.fail(error),
+      ),
       Effect.timeoutOrElse({
         duration: "30 seconds",
         orElse: () => Effect.fail(new BridgetLineageError({ code: "timeout" })),
@@ -550,14 +565,16 @@ const make = Effect.gen(function* () {
       }
       return journal;
     });
-  const lineageRead = Effect.fn("BridgetReader.lineageRead")(function* (
+  const lineageReadAttempt = Effect.fn("BridgetReader.lineageRead")(function* (
     input: Exclude<BridgetLineageReadInput, { readonly action: "list" }>,
+    responseVersion: 1 | 2,
   ) {
     const project = yield* resolveLineageContext(input);
     const args = [
       "lineage",
       "inspect",
       ...lineageArgs(input, project.workspaceRoot),
+      ...(responseVersion === 2 ? ["--response-version", "2"] : []),
       "--action",
       input.action,
       "--task",
@@ -576,6 +593,7 @@ const make = Effect.gen(function* () {
       })(raw).pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })));
       const resultBytes = Buffer.byteLength(detail.result ?? "", "utf8");
       if (
+        detail.version !== responseVersion ||
         detail.task.task_id !== input.taskId ||
         detail.result_offset !== (input.offset ?? 0) ||
         resultBytes > (input.limit ?? 16384) ||
@@ -591,6 +609,16 @@ const make = Effect.gen(function* () {
     })(raw).pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })));
     return yield* validateJournal(journal, input.taskId, input.afterSeq ?? 0);
   });
+  const lineageRead = (input: Exclude<BridgetLineageReadInput, { readonly action: "list" }>) =>
+    input.action === "journal"
+      ? lineageReadAttempt(input, 1)
+      : lineageReadAttempt(input, 2).pipe(
+          Effect.catch((error) =>
+            error.code === "unsupported_version" || error.code === "invalid_request"
+              ? lineageReadAttempt(input, 1)
+              : Effect.fail(error),
+          ),
+        );
   const lineageCancel = Effect.fn("BridgetReader.lineageCancel")(function* (
     input: BridgetLineageCancelInput,
   ) {

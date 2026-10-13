@@ -4,12 +4,15 @@ import {
   BridgetLineageCancelInput,
   BridgetLineageCancelResult,
   BridgetLineageDetail,
+  BridgetLineageDetailV1,
   BridgetLineageError,
   BridgetLineageJournal,
   BridgetLineageJournalInput,
   BridgetLineageReadInput,
   BridgetLineageSnapshot,
+  BridgetLineageSnapshotV1,
   BridgetLineageTask,
+  BridgetLineageTaskV1,
   BridgetLineageView,
   BridgetLineageWatchInput,
   BridgetNativeTaskStatus,
@@ -57,6 +60,7 @@ const task = {
 const decodeTask = Schema.decodeUnknownSync(BridgetLineageTask);
 const decodeRef = Schema.decodeUnknownSync(BridgetTaskRef);
 const decodeSnapshot = Schema.decodeUnknownSync(BridgetLineageSnapshot);
+const decodeSnapshotV1 = Schema.decodeUnknownSync(BridgetLineageSnapshotV1);
 const decodeDetail = Schema.decodeUnknownSync(BridgetLineageDetail);
 const decodeJournal = Schema.decodeUnknownSync(BridgetLineageJournal);
 const decodeView = Schema.decodeUnknownSync(BridgetLineageView);
@@ -167,7 +171,7 @@ describe("S149-27 lineage snapshot, detail and journal bounds", () => {
   it("accepts an empty snapshot and closes version, status and the safe sequence", () => {
     expect(decodeSnapshot(snapshot)).toEqual(snapshot);
     expect(decodeView(snapshot)).toEqual(snapshot);
-    expect(() => decodeSnapshot({ ...snapshot, version: 2 })).toThrow();
+    expect(() => decodeSnapshotV1({ ...snapshot, version: 2 })).toThrow();
     expect(() => decodeSnapshot({ ...snapshot, status: "partial" })).toThrow();
     expect(() => decodeSnapshot({ ...snapshot, seq: maxSeq + 1 })).toThrow();
     expect(() => decodeSnapshot({ ...snapshot, generation: "gen" })).toThrow();
@@ -422,5 +426,123 @@ describe("S149-16 presentation maps native states without a configured provider"
     const allowed = new Set(["pending", "running", "waiting", "completed", "failed", "cancelled"]);
     for (const [native] of expected)
       expect(allowed.has(bridgetTaskStatus(nativeStatuses(native)))).toBe(true);
+  });
+});
+
+describe("S162 versioned remote lineage", () => {
+  const strictSnapshot = Schema.decodeUnknownSync(BridgetLineageSnapshot, {
+    onExcessProperty: "error",
+  });
+  const strictDetail = Schema.decodeUnknownSync(BridgetLineageDetail, {
+    onExcessProperty: "error",
+  });
+  const placement = {
+    machine_id: "cartae",
+    display_name: "Cartae",
+    worker_id: "worker-cartae",
+    last_contact_at: 1_800_000_001,
+    contact_state: "connected",
+  };
+  const snapshot = {
+    version: 2,
+    status: "ok",
+    generation,
+    seq: 7,
+    root_owner_agent_id: parentTaskId,
+    tasks: [{ ...task, placement }],
+    next_cursor: null,
+  };
+  const detail = {
+    version: 2,
+    status: "ok",
+    generation,
+    seq: 7,
+    root_owner_agent_id: parentTaskId,
+    task: { ...task, placement },
+    result: "résultat distant",
+    result_offset: 0,
+    result_next_offset: null,
+    result_total_bytes: 17,
+  };
+
+  it("preserves a frozen v1 task with the old strict decoder and rejects placement leakage", () => {
+    const frozenWire =
+      '{"task_id":"3f2504e0-4f89-11d3-9a0c-0305e82c3301","parent_task_id":null,"parent_agent_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","child_agent_id":"b1c2d3e4-5f60-4711-8293-a4b5c6d7e8f9","child_instance_id":null,"created_at":1800000000,"updated_at":1800000000,"started_at":null,"completed_at":null,"agent_type":"codex","execution_protocol":"codex_app_server","model":"glm-5.3-flash","effort":null,"cwd":"/tmp/project","posture":"development","title":"consigne bornée","status":"working","error":null,"result_available":false,"journal_available":false}';
+    const legacyTask = Schema.decodeUnknownSync(BridgetLineageTaskV1, {
+      onExcessProperty: "error",
+    });
+    expect(JSON.stringify(legacyTask(JSON.parse(frozenWire)))).toBe(frozenWire);
+    expect(() => legacyTask({ ...task, placement })).toThrow();
+    expect(() => strictSnapshot({ ...snapshot, version: 1 })).toThrow();
+    expect(() => strictDetail({ ...detail, version: 1 })).toThrow();
+    const legacySnapshot = Schema.decodeUnknownSync(BridgetLineageSnapshotV1, {
+      onExcessProperty: "error",
+    });
+    const legacyDetail = Schema.decodeUnknownSync(BridgetLineageDetailV1, {
+      onExcessProperty: "error",
+    });
+    expect(legacySnapshot({ ...snapshot, version: 1, tasks: [task] }).tasks).toEqual([task]);
+    expect(legacyDetail({ ...detail, version: 1, task }).task).toEqual(task);
+    expect(() => legacySnapshot(snapshot)).toThrow();
+    expect(() => legacyDetail(detail)).toThrow();
+  });
+
+  it("keeps placement through v2 list, detail and stored projection decoding", () => {
+    expect(strictSnapshot(snapshot)).toEqual(snapshot);
+    expect(strictDetail(detail)).toEqual(detail);
+    expect(decodeView(snapshot)).toEqual(snapshot);
+    expect(decodeView(detail)).toEqual(detail);
+    expect(decodeTask({ ...task, placement })).toEqual({ ...task, placement });
+    expect(decodeTask(task)).toEqual(task);
+  });
+
+  it("requires the nullable v2 placement and preserves unknown contact without inferring locality", () => {
+    expect(() => strictSnapshot({ ...snapshot, tasks: [task] })).toThrow();
+    expect(() => strictDetail({ ...detail, task })).toThrow();
+    for (const value of [
+      null,
+      { ...placement, display_name: null, last_contact_at: null, contact_state: "unknown" },
+    ]) {
+      expect(
+        strictSnapshot({ ...snapshot, tasks: [{ ...task, placement: value }] }).tasks[0],
+      ).toEqual({ ...task, placement: value });
+    }
+  });
+
+  it("closes placement fields, contact states and safe contact timestamps", () => {
+    for (const invalid of [
+      { ...placement, credential: "must-not-leak" },
+      { ...placement, contact_state: "working" },
+      { ...placement, last_contact_at: -1 },
+      { ...placement, last_contact_at: maxUnix + 1 },
+      { ...placement, last_contact_at: 1.5 },
+      { ...placement, machine_id: exact(257) },
+      { ...placement, worker_id: exact(257) },
+      { ...placement, display_name: exact(257) },
+      { ...placement, machine_id: "é".repeat(129) },
+      { ...placement, worker_id: "" },
+      { ...placement, machine_id: "cartae\nforged" },
+    ]) {
+      expect(() =>
+        strictSnapshot({ ...snapshot, tasks: [{ ...task, placement: invalid }] }),
+      ).toThrow();
+    }
+    expect(
+      strictSnapshot({
+        ...snapshot,
+        tasks: [{ ...task, placement: { ...placement, contact_state: "stale" } }],
+      }).tasks[0],
+    ).toEqual({ ...task, placement: { ...placement, contact_state: "stale" } });
+  });
+
+  it("rejects unsupported success versions and keeps errors and cancellation on v1", () => {
+    expect(() => strictSnapshot({ ...snapshot, version: 3 })).toThrow();
+    expect(() => strictDetail({ ...detail, version: 3 })).toThrow();
+    expect(decodeError({ _tag: "BridgetLineageError", code: "unsupported_version" }).code).toBe(
+      "unsupported_version",
+    );
+    expect(() =>
+      decodeCancelResult({ version: 2, task_id: taskId, status: "cancelled" }),
+    ).toThrow();
   });
 });

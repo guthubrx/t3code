@@ -21,7 +21,8 @@ export const BridgetNativeTaskStatus = Schema.Literals([
 ]);
 export type BridgetNativeTaskStatus = typeof BridgetNativeTaskStatus.Type;
 
-export const BridgetLineageTask = Schema.Struct({
+/** Frozen v1 wire fields. Enrichment must never leak into a v1 response. */
+export const BridgetLineageTaskV1 = Schema.Struct({
   task_id: Uuid,
   parent_task_id: Schema.NullOr(Uuid),
   parent_agent_id: Uuid,
@@ -47,6 +48,41 @@ export const BridgetLineageTask = Schema.Struct({
   result_available: Schema.Boolean,
   journal_available: Schema.Boolean,
 });
+export type BridgetLineageTaskV1 = typeof BridgetLineageTaskV1.Type;
+
+// Same byte/control bound as native worker identities. Keep the permissions
+// module's private validator local to its own boundary rather than exporting it.
+const WorkerIdentity = Schema.String.check(
+  Schema.makeFilter(
+    (value: string) =>
+      value.length > 0 &&
+      new TextEncoder().encode(value).length <= 256 &&
+      Array.from(value).every((character) => {
+        const code = character.charCodeAt(0);
+        return code > 0x1f && (code < 0x7f || code > 0x9f);
+      }),
+  ),
+);
+export const BridgetLineagePlacementV2 = Schema.Struct({
+  machine_id: WorkerIdentity,
+  display_name: Schema.NullOr(bounded(256)),
+  worker_id: WorkerIdentity,
+  last_contact_at: Schema.NullOr(UnixSeconds),
+  contact_state: Schema.Literals(["connected", "stale", "unknown"]),
+});
+export type BridgetLineagePlacementV2 = typeof BridgetLineagePlacementV2.Type;
+
+export const BridgetLineageTaskV2 = Schema.Struct({
+  ...BridgetLineageTaskV1.fields,
+  placement: Schema.NullOr(BridgetLineagePlacementV2),
+});
+export type BridgetLineageTaskV2 = typeof BridgetLineageTaskV2.Type;
+
+/** Stored projections may predate v2; absent placement means metadata unavailable. */
+export const BridgetLineageTask = Schema.Struct({
+  ...BridgetLineageTaskV1.fields,
+  placement: Schema.optional(Schema.NullOr(BridgetLineagePlacementV2)),
+});
 export type BridgetLineageTask = typeof BridgetLineageTask.Type;
 
 export const BridgetTaskRef = Schema.Struct({
@@ -60,29 +96,44 @@ export const BridgetTaskRef = Schema.Struct({
 });
 export type BridgetTaskRef = typeof BridgetTaskRef.Type;
 
-export const BridgetLineageSnapshot = Schema.Struct({
+export const BridgetLineageSnapshotV1 = Schema.Struct({
   version: Schema.Literal(1),
   status: Schema.Literal("ok"),
   generation: Uuid,
   seq: Sequence,
   root_owner_agent_id: Uuid,
-  tasks: Schema.Array(BridgetLineageTask).check(Schema.isMaxLength(4096)),
+  tasks: Schema.Array(BridgetLineageTaskV1).check(Schema.isMaxLength(4096)),
   next_cursor: Schema.NullOr(bounded(2048)),
 });
+export const BridgetLineageSnapshotV2 = Schema.Struct({
+  ...BridgetLineageSnapshotV1.fields,
+  version: Schema.Literal(2),
+  tasks: Schema.Array(BridgetLineageTaskV2).check(Schema.isMaxLength(4096)),
+});
+export const BridgetLineageSnapshot = Schema.Union([
+  BridgetLineageSnapshotV1,
+  BridgetLineageSnapshotV2,
+]);
 export type BridgetLineageSnapshot = typeof BridgetLineageSnapshot.Type;
 
-export const BridgetLineageDetail = Schema.Struct({
+export const BridgetLineageDetailV1 = Schema.Struct({
   version: Schema.Literal(1),
   status: Schema.Literal("ok"),
   generation: Uuid,
   seq: Sequence,
   root_owner_agent_id: Uuid,
-  task: BridgetLineageTask,
+  task: BridgetLineageTaskV1,
   result: Schema.NullOr(bounded(16384)),
   result_offset: Sequence,
   result_next_offset: Schema.NullOr(Sequence),
   result_total_bytes: Sequence.check(Schema.isLessThanOrEqualTo(256 * 1024)),
 });
+export const BridgetLineageDetailV2 = Schema.Struct({
+  ...BridgetLineageDetailV1.fields,
+  version: Schema.Literal(2),
+  task: BridgetLineageTaskV2,
+});
+export const BridgetLineageDetail = Schema.Union([BridgetLineageDetailV1, BridgetLineageDetailV2]);
 export type BridgetLineageDetail = typeof BridgetLineageDetail.Type;
 
 export const BridgetJournalEvent = Schema.Struct({

@@ -658,3 +658,90 @@ describe("BridgetTaskJournal (web, session 149) — marge basse sous la barre fl
     expect(scrollStyle()?.paddingBottom).toBe("calc(0.75rem + 0px)");
   });
 });
+
+describe("BridgetTaskJournal remote metadata (162)", () => {
+  const placement = {
+    machine_id: "cartae",
+    display_name: "Serveur Cartae",
+    worker_id: "worker-cartae",
+    last_contact_at: 1790000010,
+    contact_state: "connected",
+  };
+
+  it("actualise le contact distant sans confondre le worker avec le maître ni perdre le journal", async () => {
+    await mount(makeThread({ task: { placement, agent_type: "claude_glm" } }));
+    expect(text()).toContain("Serveur Cartae (cartae)");
+    expect(text()).toContain("claude_glm · test-model");
+    expect(text()).toContain("Contact observé");
+    expect(text()).toContain("Dernier contact observé :");
+    expect(text()).toContain(new Date(1790000010 * 1000).toLocaleString("fr-FR"));
+    await deliverJournal({
+      events: [journalEvent(7)],
+      nextSeq: 7,
+      caughtUp: true,
+      gap: null,
+      evicted: 0,
+    });
+    await act(async () =>
+      renderer!.update(
+        <BridgetTaskJournal
+          environmentId={environmentId}
+          thread={makeThread({ task: { placement: { ...placement, contact_state: "stale" } } })}
+          onOpenParent={null}
+        />,
+      ),
+    );
+    expect(text()).toContain("Contact perdu");
+    expect(text()).toContain("En cours");
+    expect(text()).not.toContain("Dernier état connu");
+    expect(text()).toContain("ligne 7");
+    expect(button("Arrêter")!.props.disabled).toBe(false);
+    await deliverJournalFailure("journal_unavailable");
+    expect(text()).toContain("Journal de la tâche indisponible");
+    expect(text()).not.toContain("Bridget indisponible");
+    expect(text()).toContain("ligne 7");
+    expect(cancelCalls).toEqual([]);
+    expect(pendingReads).toEqual([]);
+    expect(activeJournals).toBe(1);
+  });
+
+  it("distingue les métadonnées v1 absentes, le placement v2 nul et le contact inconnu", async () => {
+    await mount(makeThread());
+    expect(text()).toContain("Métadonnées distantes indisponibles");
+    expect(text()).not.toContain("Exécution locale");
+    await act(async () =>
+      renderer!.update(
+        <BridgetTaskJournal
+          environmentId={environmentId}
+          thread={makeThread({ task: { placement: null } })}
+          onOpenParent={null}
+        />,
+      ),
+    );
+    expect(text()).toContain("Aucun placement distant");
+    expect(text()).not.toContain("Métadonnées distantes indisponibles");
+    await act(async () =>
+      renderer!.update(
+        <BridgetTaskJournal
+          environmentId={environmentId}
+          thread={makeThread({
+            task: {
+              placement: {
+                ...placement,
+                display_name: null,
+                last_contact_at: null,
+                contact_state: "unknown",
+              },
+            },
+          })}
+          onOpenParent={null}
+        />,
+      ),
+    );
+    expect(text()).toContain("cartae");
+    expect(text()).toContain("Contact inconnu");
+    expect(text()).toContain("Date du contact inconnue");
+    expect(text()).not.toContain("Contact observé");
+    expect(pendingReads).toEqual([]);
+  });
+});
