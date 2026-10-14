@@ -361,10 +361,24 @@ describe("Lineage distant Bridget (162)", () => {
     await render(panelFor("parent"));
     expect(JSON.stringify(renderer.toJSON())).toContain("Serveur Cartae");
     expect(JSON.stringify(renderer.toJSON())).toContain("Contact observé");
+    const badge = () => renderer.root.findAllByProps({ "aria-label": "Bridget · Distant" })[0]!;
+    expect(badge().props.style.maskImage).toBeTruthy();
+    expect(badge().props.style.backgroundImage).toBeUndefined();
     const lost = { ...remoteTask, placement: { ...remoteTask.placement!, contact_state: "stale" } };
     state.shells = [{ environmentId: "test", source: { ...bridgetChild, bridgetTask: lost } }];
     await act(async () => renderer.update(panelFor("parent")));
     expect(JSON.stringify(renderer.toJSON())).toContain("Contact perdu");
+    expect(badge().props.style.maskImage).toBeTruthy();
+    state.shells = [
+      {
+        environmentId: "test",
+        source: { ...bridgetChild, bridgetTask: { ...remoteTask, placement: null } },
+      },
+    ];
+    await act(async () => renderer.update(panelFor("parent")));
+    const localBadge = renderer.root.findAllByProps({ "aria-label": "Bridget · Local" })[0]!;
+    expect(localBadge.props.style.backgroundImage).toBeTruthy();
+    expect(localBadge.props.style.maskImage).toBeUndefined();
     expect(JSON.stringify(renderer.toJSON())).not.toContain("Lineage · Bridget indisponible");
     expect(stopButtons()).toHaveLength(1);
     expect(state.interrupt).not.toHaveBeenCalled();
@@ -394,6 +408,9 @@ describe("Lineage distant Bridget (162)", () => {
     const visible = JSON.stringify(renderer.toJSON());
     expect(visible).toContain("claude_glm");
     expect(visible).toContain("Serveur Cartae");
+    expect(
+      renderer.root.findAllByProps({ "aria-label": "Bridget · Distant" })[0]!.props.style.maskImage,
+    ).toBeTruthy();
     expect(visible).toContain("Contact observé");
     expect(visible).toContain(new Date(1790000010 * 1000).toLocaleString("fr-FR"));
     expect(state.interrupt).not.toHaveBeenCalled();

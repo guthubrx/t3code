@@ -2,7 +2,11 @@ import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
 import { CollapsibleSectionHeader, SectionHeaderStatus } from "../ui/collapsible-section-header";
-import { BridgetTaskPlacement, SubagentTooltipContent } from "./SubagentTooltipContent";
+import {
+  BridgetTaskIcon,
+  BridgetTaskPlacement,
+  SubagentTooltipContent,
+} from "./SubagentTooltipContent";
 import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
@@ -455,6 +459,10 @@ export function ThreadRelationshipsPanel(props: {
               );
               const relationshipContent = (
                 <>
+                  {agent?.origin === "bridget_native" ||
+                  node?.thread?.bridgetTaskRef !== undefined ? (
+                    <BridgetTaskIcon task={node?.thread?.bridgetTask} />
+                  ) : null}
                   <ThreadRelationshipIcon
                     driver={isSubagent && !isParent ? providerDriver : undefined}
                     provider={provider}

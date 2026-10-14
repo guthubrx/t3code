@@ -28,7 +28,50 @@ import { ThreadHoverCard } from "../ThreadHoverCard";
 import { MiddleTruncate } from "../ui/middle-truncate";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 import { cn } from "~/lib/utils";
+import bridgetLogoUrl from "~/assets/bridget-logo.svg";
 import { deriveProviderInstanceEntries, shouldShowInstanceBadge } from "../../providerInstances";
+
+/** Colour only attests a known local placement; legacy metadata stays neutral. */
+export function BridgetTaskIcon({
+  task,
+  className,
+}: {
+  task: BridgetLineageTask | undefined;
+  className?: string;
+}) {
+  const local = task?.placement === null;
+  const label = local
+    ? "Bridget · Local"
+    : task?.placement
+      ? "Bridget · Distant"
+      : "Bridget · Localisation inconnue";
+  return (
+    <span
+      role="img"
+      aria-label={label}
+      className={cn(
+        "inline-block size-4 shrink-0",
+        !local && "bg-current text-muted-foreground",
+        className,
+      )}
+      style={
+        local
+          ? {
+              backgroundImage: `url(${JSON.stringify(bridgetLogoUrl)})`,
+              backgroundSize: "contain",
+              backgroundRepeat: "no-repeat",
+              backgroundPosition: "center",
+            }
+          : {
+              maskImage: `url(${JSON.stringify(bridgetLogoUrl)})`,
+              maskSize: "contain",
+              maskRepeat: "no-repeat",
+              maskPosition: "center",
+            }
+      }
+    />
+  );
+}
 
 /** A contact is an observation from the read, never a live connectivity clock. */
 export function BridgetTaskPlacement({
@@ -166,6 +209,9 @@ export function SubagentTooltipContent(props: {
   return (
     <ThreadHoverCard title={props.title}>
       <div className="flex min-w-0 items-center gap-2">
+        {props.origin === "bridget_native" ? (
+          <BridgetTaskIcon task={nativeTask} className="size-3" />
+        ) : null}
         {driver ? (
           <ProviderInstanceIcon
             driverKind={driver}
