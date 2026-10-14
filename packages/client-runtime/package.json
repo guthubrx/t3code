@@ -7,6 +7,10 @@
       "types": "./src/composerThreadItems.ts",
       "default": "./src/composerThreadItems.ts"
     },
+    "./bridget-journal-presentation": {
+      "types": "./src/bridgetJournalPresentation.ts",
+      "default": "./src/bridgetJournalPresentation.ts"
+    },
     "./handoff": {
       "types": "./src/handoff.ts",
       "default": "./src/handoff.ts"

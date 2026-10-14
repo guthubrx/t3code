@@ -227,6 +227,8 @@ interface ChatMarkdownProps {
   lineBreaks?: boolean;
   /** Parse sanitized raw HTML instead of displaying its source text. */
   parseRawHtml?: boolean;
+  /** Read remote transcript Markdown without filesystem, media, shell or link actions. */
+  inert?: boolean;
   /** Append a prompt that invokes a newly created artifact-template skill. */
   onUseArtifactTemplate?: ((template: CodexArtifactTemplate) => void) | undefined;
   onRunShellCommand?: ((command: string) => void) | undefined;
@@ -2305,6 +2307,7 @@ function useChatMarkdownState({
   renderContextReference,
   headingLevelOffset = 0,
   githubMedia = false,
+  inert = false,
 }: ChatMarkdownProps) {
   const { resolvedTheme } = useTheme();
   const [localMediaPreview, setLocalMediaPreview] = useState<ExpandedImagePreview | null>(null);
@@ -2420,6 +2423,8 @@ function useChatMarkdownState({
   );
   const diffThemeName = resolveDiffThemeName(resolvedTheme);
   const markdownFileLinkMetaByHref = useMemo(() => {
+    if (inert)
+      return new Map<string, NonNullable<ReturnType<typeof resolveMarkdownFileLinkMeta>>>();
     const metaByHref = new Map<
       string,
       NonNullable<ReturnType<typeof resolveMarkdownFileLinkMeta>>
@@ -2434,8 +2439,9 @@ function useChatMarkdownState({
       }
     }
     return metaByHref;
-  }, [cwd, imageBaseDir, text]);
+  }, [cwd, imageBaseDir, inert, text]);
   const inlineCodeFileLinkMetaByText = useMemo(() => {
+    if (inert) return new Map<string, MarkdownFileLinkMeta>();
     const metaByText = new Map<string, MarkdownFileLinkMeta>();
     for (const span of extractInlineCodeSpans(text)) {
       if (metaByText.has(span)) continue;
@@ -2445,7 +2451,7 @@ function useChatMarkdownState({
       }
     }
     return metaByText;
-  }, [cwd, imageBaseDir, text]);
+  }, [cwd, imageBaseDir, inert, text]);
   const fileLinkParentSuffixByPath = useMemo(() => {
     const filePaths = [
       ...[...markdownFileLinkMetaByHref.values()].map((meta) => meta.filePath),
@@ -2714,12 +2720,13 @@ function useChatMarkdownState({
       headingLevelOffset,
       imageBaseDir,
       inlineCodeFileLinkMetaByText,
+      inert,
       isStreaming,
       linkTargetPreference,
       markdownFileLinkMetaByHref,
-      onTaskListChange,
-      onUseArtifactTemplate,
-      onRunShellCommand,
+      onTaskListChange: inert ? undefined : onTaskListChange,
+      onUseArtifactTemplate: inert ? undefined : onUseArtifactTemplate,
+      onRunShellCommand: inert ? undefined : onRunShellCommand,
       openChangeRequestLink,
       openDeferredMarkdownLink,
       openExternalLinkInPreview,
@@ -2729,7 +2736,7 @@ function useChatMarkdownState({
       resolveThreadPullRequest,
       resolvedTheme,
       serverConfig,
-      skills,
+      skills: inert ? EMPTY_MARKDOWN_SKILLS : skills,
       text,
       threadRef,
       updateThreadPullRequestLink,
@@ -2747,6 +2754,7 @@ function useChatMarkdownState({
       headingLevelOffset,
       imageBaseDir,
       inlineCodeFileLinkMetaByText,
+      inert,
       isStreaming,
       linkTargetPreference,
       markdownFileLinkMetaByHref,
@@ -2810,9 +2818,9 @@ const CHAT_MARKDOWN_COMPONENTS = {
   h5: markdownHeadingRenderer(5),
   h6: markdownHeadingRenderer(6),
   div: function MarkdownDiv({ node, children, ...props }) {
-    const { onUseArtifactTemplate } = use(ChatMarkdownRendererContext);
+    const { inert, onUseArtifactTemplate } = use(ChatMarkdownRendererContext);
     const artifactTemplate = artifactTemplateFromHastProperties(node?.properties);
-    if (artifactTemplate) {
+    if (artifactTemplate && !inert) {
       return (
         <CodexArtifactTemplateCard template={artifactTemplate} onUse={onUseArtifactTemplate} />
       );
@@ -2914,7 +2922,11 @@ const CHAT_MARKDOWN_COMPONENTS = {
       fileLinkChip,
       renderContextReference,
       text,
+      inert,
     } = use(ChatMarkdownRendererContext);
+    if (inert) {
+      return <span>{children}</span>;
+    }
     const citation = href ? parseAssistantCitationHref(href) : null;
     if (citation) return <AssistantCitationChip citation={citation} />;
     // A thread link names a thread in this message's environment and opens it in the app.
@@ -3155,10 +3167,10 @@ const CHAT_MARKDOWN_COMPONENTS = {
     );
   },
   code: function MarkdownCode({ node, children, className, ...props }) {
-    const { cwd, imageBaseDir, inlineCodeFileLinkMetaByText, fileLinkChip } = use(
+    const { cwd, imageBaseDir, inlineCodeFileLinkMetaByText, fileLinkChip, inert } = use(
       ChatMarkdownRendererContext,
     );
-    if (node?.properties?.dataInlineCode != null) {
+    if (!inert && node?.properties?.dataInlineCode != null) {
       const codeText = nodeToPlainText(children);
       const fileLinkMeta =
         inlineCodeFileLinkMetaByText.get(codeText.trim()) ??
@@ -3186,7 +3198,11 @@ const CHAT_MARKDOWN_COMPONENTS = {
       imageBaseDir,
       threadRef,
       renderContextReference,
+      inert,
     } = use(ChatMarkdownRendererContext);
+    if (inert) {
+      return <span>{alt ? `[image: ${alt}]` : "[image]"}</span>;
+    }
     const imageExpand = use(MarkdownLinkContext) ? undefined : expandMedia;
     const contextReference = typeof src === "string" ? parseComposerContextHref(src) : null;
     if (contextReference) {
@@ -3313,9 +3329,16 @@ const CHAT_MARKDOWN_COMPONENTS = {
     return <MarkdownDetails open={detailsOpen}>{children}</MarkdownDetails>;
   },
   pre: function MarkdownPre({ node, children, ...props }) {
-    const { resolvedTheme, diffThemeName, expandMedia, isStreaming, onRunShellCommand, text } = use(
-      ChatMarkdownRendererContext,
-    );
+    const {
+      resolvedTheme,
+      diffThemeName,
+      expandMedia,
+      inert,
+      isStreaming,
+      onRunShellCommand,
+      text,
+    } = use(ChatMarkdownRendererContext);
+    if (inert) return <pre {...props}>{children}</pre>;
     const codeBlock = extractCodeBlock(children);
     if (!codeBlock) {
       return <pre {...props}>{children}</pre>;
@@ -3383,6 +3406,7 @@ function ChatMarkdown({
   className,
   lineBreaks = false,
   parseRawHtml = true,
+  inert = false,
   extraRemarkPlugins = EMPTY_REMARK_PLUGINS,
   ...props
 }: ChatMarkdownProps) {
@@ -3393,7 +3417,7 @@ function ChatMarkdown({
     markdownUrlTransform,
     localMediaPreview,
     setLocalMediaPreview,
-  } = useChatMarkdownState({ text, ...props });
+  } = useChatMarkdownState({ text, inert, ...props });
   const incrementalParsing =
     props.isStreaming === true &&
     extraRemarkPlugins.length === 0 &&
@@ -3425,7 +3449,7 @@ function ChatMarkdown({
         <ReactMarkdown
           remarkPlugins={remarkPlugins}
           rehypePlugins={
-            parseRawHtml
+            !inert && parseRawHtml
               ? CHAT_MARKDOWN_RENDER_REHYPE_PLUGINS
               : CHAT_MARKDOWN_LITERAL_HTML_REHYPE_PLUGINS
           }

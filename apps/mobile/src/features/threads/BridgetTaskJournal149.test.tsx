@@ -25,6 +25,7 @@ const TASK_ID = "25000000-0000-4000-8000-000000000001";
 const ROOT_THREAD_ID = "40000000-0000-4000-8000-000000000001";
 // Compte les UUID générés : chaque action d'arrêt doit en produire un neuf.
 const uuidCalls = vi.hoisted(() => ({ count: 0 }));
+const nativeMarkdown = vi.hoisted(() => ({ props: [] as Array<Record<string, unknown>> }));
 
 const listeners = new Set<() => void>();
 const pendingReads: {
@@ -82,6 +83,35 @@ vi.mock("react-native", () => ({
 }));
 vi.mock("@react-navigation/native", () => ({
   useIsFocused: () => true,
+}));
+vi.mock("react-native-nitro-markdown", () => ({
+  Markdown: ({ children }: { children: unknown }) => children,
+}));
+vi.mock("../../native/SelectableMarkdownText", () => ({
+  hasNativeSelectableMarkdownText: () => true,
+  SelectableMarkdownText: (props: { markdown: string }) => {
+    nativeMarkdown.props.push(props);
+    return props.markdown;
+  },
+}));
+vi.mock("../../lib/copyTextWithHaptic", () => ({ copyTextWithHaptic: vi.fn() }));
+vi.mock("../../lib/useFontFamily", () => ({
+  useFontFamily: (weight: string) => `DMSans-${weight}`,
+}));
+vi.mock("../../lib/useUniwindTheme", () => ({
+  useUniwindTheme: () => ({
+    "--color-md-body": "#102030",
+    "--color-md-strong": "#203040",
+    "--color-md-link": "#304050",
+    "--color-md-blockquote-border": "#405060",
+    "--color-md-blockquote-bg": "#506070",
+    "--color-md-code-bg": "#607080",
+    "--color-md-code-text": "#708090",
+    "--color-md-hr": "#8090a0",
+  }),
+}));
+vi.mock("../settings/appearance/AppearancePreferencesProvider", () => ({
+  useAppearancePreferences: () => ({ appearance: { baseFontSize: 18 } }),
 }));
 vi.mock("expo-crypto", () => ({
   randomUUID: () => `mobile-test-request-${++uuidCalls.count}`,
@@ -278,6 +308,7 @@ beforeEach(() => {
   listeners.clear();
   pendingReads.length = 0;
   cancelCalls.length = 0;
+  nativeMarkdown.props.length = 0;
   uuidCalls.count = 0;
   native.appState = "active";
   native.stateListeners.clear();
@@ -307,6 +338,115 @@ afterEach(async () => {
 });
 
 describe("BridgetTaskJournal (mobile, session 149)", () => {
+  it("réutilise la projection commune pour texte exact et activité distincte", async () => {
+    await mount(makeThread());
+    await deliverJournal({
+      events: [
+        { ...journalEvent(1), event: "update", payload: { kind: "text", content: "workflow" } },
+        { ...journalEvent(2), event: "update", payload: { kind: "text", content: " SpecKit" } },
+        {
+          ...journalEvent(3),
+          event: "update",
+          payload: { kind: "command", detail: "item/started", text: "pwd" },
+        },
+      ],
+      nextSeq: 3,
+      caughtUp: true,
+      gap: null,
+      gaps: [],
+      continuityCut: null,
+      conflicts: [],
+      evicted: 0,
+    });
+    expect(text()).toContain("workflow SpecKit");
+    expect(text()).toContain("Commande commencée · pwd");
+  });
+
+  it("rend l’enveloppe complète et le témoin ts/v seulement après ouverture des détails", async () => {
+    await mount(makeThread());
+    const first = {
+      ...journalEvent(11),
+      session_id: "session-r5",
+      message_id: "message-r5",
+      payload: "preuve-r5",
+    };
+    const conflicting = {
+      ...first,
+      ts: "2026-10-10T10:06:11Z",
+    };
+    await deliverJournal({
+      events: [first, conflicting],
+      nextSeq: 11,
+      caughtUp: true,
+      gap: null,
+      gaps: [],
+      continuityCut: null,
+      conflicts: [],
+      evicted: 0,
+    });
+    expect(text()).toContain("Détails techniques");
+    expect(text()).not.toContain('"ts": "2026-10-10T10:05:11Z"');
+    expect(text()).not.toContain('"ts": "2026-10-10T10:06:11Z"');
+    await press("Détails techniques");
+    expect(text()).toContain("Conflit de rejeu #11");
+    expect(text()).toContain('"v": 1');
+    expect(text()).toContain('"ts": "2026-10-10T10:05:11Z"');
+    expect(text()).toContain('"ts": "2026-10-10T10:06:11Z"');
+    expect(text()).toContain('"session_id": "session-r5"');
+    expect(text()).toContain('"message_id": "message-r5"');
+    expect(text()).toContain('"payload": "preuve-r5"');
+  });
+
+  it("rend titres, code et liens dans le lecteur sélectionnable aux préférences T3", async () => {
+    await mount(makeThread());
+    const markdown =
+      "# Titre\n\n`code` et [lien](https://example.test)\n\n![preuve](https://image.test/a.png)";
+    await deliverJournal({
+      events: [
+        { ...journalEvent(1), event: "update", payload: { kind: "text", content: markdown } },
+      ],
+      nextSeq: 1,
+      caughtUp: true,
+      gap: null,
+      gaps: [],
+      continuityCut: null,
+      conflicts: [],
+      evicted: 0,
+    });
+    const props = nativeMarkdown.props.at(-1) as {
+      readonly markdown: string;
+      readonly textStyle: {
+        readonly color: string;
+        readonly fontFamily: string;
+        readonly headingFontFamily: string;
+        readonly boldFontFamily: string;
+        readonly fontSize: number;
+        readonly lineHeight: number;
+        readonly headingFontSizes: ReadonlyArray<number>;
+      };
+      readonly onLinkPress: (href: string) => void;
+      readonly renderImage: (image: {
+        href: string;
+        alt: string | null;
+        title: string | null;
+      }) => unknown;
+    };
+    expect(props.markdown).toBe(markdown);
+    expect(props.textStyle).toMatchObject({
+      color: "#102030",
+      fontFamily: "DMSans-regular",
+      headingFontFamily: "DMSans-bold",
+      boldFontFamily: "DMSans-bold",
+      fontSize: 18,
+    });
+    expect(props.textStyle.lineHeight).toBeGreaterThan(props.textStyle.fontSize);
+    expect(props.textStyle.headingFontSizes).toHaveLength(6);
+    expect(props.onLinkPress("https://example.test")).toBeUndefined();
+    expect(
+      props.renderImage({ href: "https://image.test/a.png", alt: "preuve", title: null }),
+    ).toMatchObject({ props: { children: "[image: preuve]" } });
+  });
+
   it("suit le journal à l'écran actif, coupe à l'arrière-plan et reprend avec afterSeq", async () => {
     await mount(makeThread());
     // Écran actif : watch + journal natifs souscrits, chargement annoncé.
@@ -360,6 +500,110 @@ describe("BridgetTaskJournal (mobile, session 149)", () => {
     expect(native.activeJournals).toBe(1);
     // La reprise porte la dernière séquence connue (nextSeq du dernier pli).
     expect(native.lastJournalTarget!.input.context.afterSeq).toBe(8);
+  });
+
+  it("conserve les lacunes et la coupe chargées après une reprise mobile partielle", async () => {
+    await mount(makeThread());
+    const events = [
+      { ...journalEvent(1), event: "update", payload: { kind: "text", content: "avant G1" } },
+      { ...journalEvent(3), event: "update", payload: { kind: "text", content: "entre G1 et G2" } },
+      { ...journalEvent(5), event: "update", payload: { kind: "text", content: "après G2" } },
+    ];
+    const g1 = { from_seq: 2, to_seq: 2, reason: "transport" } as const;
+    const g2 = { from_seq: 4, to_seq: 4, reason: "transport" } as const;
+    await deliverJournal({
+      events,
+      nextSeq: 5,
+      caughtUp: true,
+      gap: null,
+      gaps: [g1, g2],
+      continuityCut: { fromSeq: 4, toSeq: 4, reason: "gap-pressure" },
+      conflicts: [],
+      evicted: 0,
+    });
+    expect(text().match(/Extrait :/g) ?? []).toHaveLength(2);
+    await act(async () => {
+      native.appState = "background";
+      for (const handler of native.stateListeners) handler("background");
+    });
+    await act(async () => {
+      native.appState = "active";
+      for (const handler of native.stateListeners) handler("active");
+    });
+    expect(native.lastJournalTarget!.input.context.afterSeq).toBe(5);
+    await deliverJournal({
+      events: [],
+      nextSeq: 5,
+      caughtUp: true,
+      gap: null,
+      gaps: [g2],
+      continuityCut: null,
+      conflicts: [],
+      evicted: 0,
+    });
+    expect(text().match(/Extrait :/g) ?? []).toHaveLength(2);
+    expect(text()).toContain(
+      "Continuité incertaine : les fragments ne sont pas regroupés entre 4–4.",
+    );
+    await deliverJournal({
+      events: [],
+      nextSeq: 5,
+      caughtUp: true,
+      gap: null,
+      gaps: [],
+      continuityCut: null,
+      conflicts: [],
+      evicted: 0,
+    });
+    expect(text().match(/Extrait :/g) ?? []).toHaveLength(2);
+    expect(text()).toContain(
+      "Continuité incertaine : les fragments ne sont pas regroupés entre 4–4.",
+    );
+    const empty = {
+      events: [],
+      caughtUp: true,
+      gap: null,
+      gaps: [],
+      continuityCut: null,
+      conflicts: [],
+      evicted: 0,
+    };
+    for (const prefixMissing of [false, true]) {
+      await deliverJournal({ ...empty, nextSeq: 0 });
+      await mount(makeThread());
+      if (prefixMissing) {
+        await deliverJournal({
+          ...empty,
+          nextSeq: 40,
+          gap: { from_seq: 1, to_seq: 40, reason: "transport" },
+        });
+      }
+      await deliverJournal({
+        ...empty,
+        nextSeq: 41,
+        events: [
+          {
+            ...journalEvent(41),
+            event: "update",
+            payload: { kind: "text", content: "fragment 41" },
+          },
+        ],
+      });
+      expect(text()).toContain("fragment 41");
+      expect(text().includes("Extrait :")).toBe(prefixMissing);
+      await act(async () => {
+        native.appState = "background";
+        for (const handler of native.stateListeners) handler("background");
+      });
+      await act(async () => {
+        native.appState = "active";
+        for (const handler of native.stateListeners) handler("active");
+      });
+      expect(native.lastJournalTarget!.input.context.afterSeq).toBe(41);
+      await deliverJournal({ ...empty, nextSeq: 41 });
+      expect(text()).toContain("fragment 41");
+      expect(text().includes("Extrait :")).toBe(prefixMissing);
+    }
   });
 
   it("lit le résultat paginé, garde le contenu en cas de panne, et confine l'arrêt à l'annulation native", async () => {

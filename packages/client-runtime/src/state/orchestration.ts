@@ -24,6 +24,13 @@ import {
 } from "./runtime.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { subscribe } from "../rpc/client.ts";
+import {
+  mergeJournalEvents,
+  retainBridgetJournalGaps,
+  type BridgetJournalConflict,
+  type BridgetJournalContinuityCut,
+  type BridgetJournalGap,
+} from "../bridgetJournalPresentation.ts";
 
 export interface BridgetWatchState {
   readonly event: BridgetWatchEvent | null;
@@ -40,7 +47,12 @@ export interface BridgetJournalState {
   readonly events: ReadonlyArray<BridgetJournalEvent>;
   readonly nextSeq: number;
   readonly caughtUp: boolean;
+  /** Legacy latest marker remains available to current consumers. */
   readonly gap: BridgetLineageJournal["gap"];
+  /** Ephemeral continuity boundaries; never persisted or sent over RPC. */
+  readonly gaps: ReadonlyArray<BridgetJournalGap>;
+  readonly continuityCut: BridgetJournalContinuityCut | null;
+  readonly conflicts: ReadonlyArray<BridgetJournalConflict>;
   readonly evicted: number;
 }
 
@@ -126,17 +138,32 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
               nextSeq: context.afterSeq ?? 0,
               caughtUp: false,
               gap: null,
+              gaps: [],
+              continuityCut: null,
+              conflicts: [],
               evicted: 0,
             }),
             (previous, envelope) => {
-              const events = [...previous.events, ...envelope.events];
-              const overflow = Math.max(0, events.length - 4096);
+              const merged = mergeJournalEvents(
+                previous.events,
+                envelope.events,
+                previous.conflicts,
+              );
+              const firstRetainedSeq = merged.events[0]?.seq ?? null;
+              const gapState = retainBridgetJournalGaps(
+                { gaps: previous.gaps, continuityCut: previous.continuityCut },
+                envelope.gap,
+                firstRetainedSeq,
+              );
               return {
-                events: events.slice(overflow),
+                events: merged.events,
                 nextSeq: envelope.next_seq,
                 caughtUp: envelope.caught_up,
                 gap: envelope.gap ?? previous.gap,
-                evicted: previous.evicted + overflow,
+                gaps: gapState.gaps,
+                continuityCut: gapState.continuityCut,
+                conflicts: merged.conflicts,
+                evicted: previous.evicted + merged.evicted,
               };
             },
           ),

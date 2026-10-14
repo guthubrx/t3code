@@ -162,7 +162,7 @@ const fakeRootTurnNode = (status: string) =>
   }) as unknown as OrchestrationV2ThreadProjection["nodes"][number];
 
 it.effect(
-  "accumule les pages du journal Bridget, garde le dernier gap et la fraîcheur caught_up sans dédupliquer",
+  "accumule les pages du journal Bridget, garde les frontières et déduplique avant la projection",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -200,7 +200,7 @@ it.effect(
         // attendre l'état final committé plutôt que lire tout de suite.
         const settled = Latch.makeUnsafe();
         const stopSettling = h.registry.subscribe(atom, (result) => {
-          if (AsyncResult.isSuccess(result) && result.value.events.length === 5) {
+          if (AsyncResult.isSuccess(result) && result.value.events.length === 4) {
             settled.openUnsafe();
           }
         });
@@ -211,18 +211,64 @@ it.effect(
         const state = yield* AtomRegistry.getResult(h.registry, atom);
         // La reprise demandée au serveur porte bien l'afterSeq du client.
         expect(JSON.stringify(journalInputs[0])).toContain('"afterSeq":41');
-        // Chaque enveloppe est pliée : aucun dédoublonnage au niveau état
-        // (le seq 46 dupliqué reste ; la fusion est le travail du composant).
-        expect(state.events.map((event) => event.seq)).toEqual([42, 43, 46, 46, 47]);
+        // La première preuve par séquence est conservée avant les Maps des vues.
+        expect(state.events.map((event) => event.seq)).toEqual([42, 43, 46, 47]);
         expect(state.nextSeq).toBe(47);
         // Le gap explicite du contrat (lineage.md §Journal) reste affiché tant
         // qu'aucune enveloppe neuve n'en apporte un autre.
         expect(state.gap).toEqual({ from_seq: 44, to_seq: 45, reason: "transport" });
+        expect(state.gaps).toEqual([{ from_seq: 44, to_seq: 45, reason: "transport" }]);
+        expect(state.continuityCut).toBeNull();
         expect(state.caughtUp).toBe(false);
         expect(state.evicted).toBe(0);
         unmount();
       }),
     ),
+);
+
+it.effect("borne les gaps sticky et conserve une coupe conservative sous pression", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const emitted = yield* Deferred.make<void>();
+      const envelopes = Array.from({ length: 66 }, (_, index) =>
+        journalEnvelope([journalEvent(index * 3 + 1)], index * 3 + 1, true, {
+          from_seq: index * 3 + 2,
+          to_seq: index * 3 + 3,
+          reason: "transport",
+        }),
+      );
+      const h = yield* makeLineageRuntime({
+        [WS_METHODS.bridgetLineageJournal]: () =>
+          Stream.make(...envelopes).pipe(
+            Stream.concat(
+              Stream.fromEffect(Deferred.succeed(emitted, undefined)).pipe(Stream.drain),
+            ),
+            Stream.concat(Stream.never),
+          ),
+      } as unknown as RpcSession["client"]);
+      const atom = h.atoms.bridgetLineageJournal({
+        environmentId: h.target.environmentId,
+        input: { context: { ...h.target.input, taskId: TASK_ID }, visitId: "visit-j-gaps" },
+      });
+      const unmount = h.registry.mount(atom);
+      const settled = Latch.makeUnsafe();
+      const unsubscribe = h.registry.subscribe(atom, (result) => {
+        if (
+          AsyncResult.isSuccess(result) &&
+          result.value.gaps.length === 64 &&
+          result.value.continuityCut !== null
+        )
+          settled.openUnsafe();
+      });
+      yield* Deferred.await(emitted);
+      yield* settled.await;
+      unsubscribe();
+      const state = yield* AtomRegistry.getResult(h.registry, atom);
+      expect(state.gaps).toHaveLength(64);
+      expect(state.continuityCut).toMatchObject({ reason: "gap-pressure" });
+      unmount();
+    }),
+  ),
 );
 
 it.effect("évince le début du journal au-delà de 4096 lignes et compte les lignes perdues", () =>

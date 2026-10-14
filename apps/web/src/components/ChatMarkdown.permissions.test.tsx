@@ -172,6 +172,29 @@ async function renderMarkdown(text: string) {
   });
 }
 
+it("rend le transcript inerte sans lien, fichier, média, HTML ou commande active", async () => {
+  const runShell = vi.fn();
+  await act(async () => {
+    renderer = create(
+      <ChatMarkdown
+        cwd="/work"
+        inert
+        onRunShellCommand={runShell}
+        text={
+          '[local](/etc/passwd) [PR](https://github.com/example/repo/pull/42) ![remote](https://example.test/image.png)\n\n<img src="https://example.test/inline.png" onerror="alert(1)" />\n\n```sh\necho unsafe\n```'
+        }
+        threadRef={threadRef}
+      />,
+    );
+  });
+  expect(renderer!.root.findAllByType("a")).toHaveLength(0);
+  expect(renderer!.root.findAllByType("img")).toHaveLength(0);
+  expect(state.openEditor).not.toHaveBeenCalled();
+  expect(state.openFile).not.toHaveBeenCalled();
+  expect(state.openExternal).not.toHaveBeenCalled();
+  expect(runShell).not.toHaveBeenCalled();
+});
+
 function menuEvent() {
   return { preventDefault: vi.fn(), stopPropagation: vi.fn(), clientX: 10, clientY: 10 };
 }
