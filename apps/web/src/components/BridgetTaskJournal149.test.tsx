@@ -144,6 +144,7 @@ vi.mock("~/state/session", () => ({
 }));
 vi.mock("~/hooks/useCopyToClipboard", () => ({ writeTextToClipboard: vi.fn(async () => true) }));
 vi.mock("~/components/ui/button", () => ({ Button: "button" }));
+vi.mock("./ChatMarkdown", () => ({ default: ({ text }: { text: string }) => <div>{text}</div> }));
 
 const journalEvent = (seq: number): BridgetJournalEvent => ({
   v: 1,
@@ -289,6 +290,97 @@ afterEach(async () => {
 });
 
 describe("BridgetTaskJournal (web, session 149)", () => {
+  it("présente les fragments exacts et les activités sans fabriquer un tour fournisseur", async () => {
+    await mount(makeThread());
+    await deliverJournal({
+      events: [
+        {
+          ...journalEvent(1),
+          event: "update",
+          payload: { kind: "text", content: "workflow" },
+        },
+        {
+          ...journalEvent(2),
+          event: "update",
+          payload: { kind: "text", content: " SpecKit" },
+        },
+        {
+          ...journalEvent(3),
+          event: "update",
+          payload: { kind: "command", detail: "item/started", text: "pwd" },
+        },
+        {
+          ...journalEvent(4),
+          event: "update",
+          payload: {
+            kind: "command",
+            detail: "item/completed",
+            text: "pwd",
+            item_id: "exec-1",
+            exit_code: 0,
+            state: "completed",
+            status: "completed",
+            output_tail: "workspace",
+          },
+        },
+      ],
+      nextSeq: 4,
+      caughtUp: true,
+      gap: null,
+      gaps: [],
+      continuityCut: null,
+      conflicts: [],
+      evicted: 0,
+    });
+    expect(text()).toContain("workflow SpecKit");
+    expect(text()).toContain("Commande commencée · pwd");
+    expect(text()).toContain("Commande terminée · pwd");
+    expect(text()).not.toContain("assistant");
+  });
+
+  it("rend l’enveloppe complète et le témoin ts/v seulement après ouverture des détails", async () => {
+    await mount(makeThread());
+    const first = {
+      ...journalEvent(11),
+      session_id: "session-r5",
+      message_id: "message-r5",
+      payload: "preuve-r5",
+    };
+    const conflicting = {
+      ...first,
+      ts: "2026-10-10T10:06:11Z",
+    };
+    await deliverJournal({
+      events: [first, conflicting],
+      nextSeq: 11,
+      caughtUp: true,
+      gap: null,
+      gaps: [],
+      continuityCut: null,
+      conflicts: [],
+      evicted: 0,
+    });
+    expect(text()).toContain("Détails techniques");
+    expect(text()).not.toContain('"ts": "2026-10-10T10:05:11Z"');
+    expect(text()).not.toContain('"ts": "2026-10-10T10:06:11Z"');
+    const technicalDetails = renderer!.root
+      .findAllByType("details")
+      .find((node) =>
+        node
+          .findAllByType("summary")
+          .some((summary) => flatten(summary.children).includes("Détails techniques")),
+      );
+    expect(technicalDetails).toBeDefined();
+    await act(async () => technicalDetails!.props.onToggle({ currentTarget: { open: true } }));
+    expect(text()).toContain("Conflit de rejeu #11");
+    expect(text()).toContain('"v": 1');
+    expect(text()).toContain('"ts": "2026-10-10T10:05:11Z"');
+    expect(text()).toContain('"ts": "2026-10-10T10:06:11Z"');
+    expect(text()).toContain('"session_id": "session-r5"');
+    expect(text()).toContain('"message_id": "message-r5"');
+    expect(text()).toContain('"payload": "preuve-r5"');
+  });
+
   it("montre le chargement, déduplique par seq, trie, puis affiche gap et éviction", async () => {
     await mount(makeThread());
     expect(text()).toContain("Chargement du journal…");
@@ -400,6 +492,120 @@ describe("BridgetTaskJournal (web, session 149)", () => {
     });
     expect(activeJournals).toBe(1);
     expect(lastJournalTarget?.input.context).toMatchObject({ afterSeq: 8 });
+  });
+
+  it("conserve les lacunes et la coupe chargées après une nouvelle visite partielle", async () => {
+    await mount(makeThread());
+    const events = [
+      { ...journalEvent(1), event: "update", payload: { kind: "text", content: "avant G1" } },
+      { ...journalEvent(3), event: "update", payload: { kind: "text", content: "entre G1 et G2" } },
+      { ...journalEvent(5), event: "update", payload: { kind: "text", content: "après G2" } },
+    ];
+    const g1 = { from_seq: 2, to_seq: 2, reason: "transport" } as const;
+    const g2 = { from_seq: 4, to_seq: 4, reason: "transport" } as const;
+    await deliverJournal({
+      events,
+      nextSeq: 5,
+      caughtUp: true,
+      gap: null,
+      gaps: [g1, g2],
+      continuityCut: { fromSeq: 4, toSeq: 4, reason: "gap-pressure" },
+      conflicts: [],
+      evicted: 0,
+    });
+    expect(
+      renderer!.root
+        .findAll((node) => node.props["data-journal-seq"] !== undefined)
+        .map((node) => node.props["data-journal-seq"]),
+    ).toEqual([1, 3, 5]);
+    await act(async () => {
+      visibilityState = "hidden";
+      for (const listener of visibilityListeners) listener();
+    });
+    await act(async () => {
+      visibilityState = "visible";
+      for (const listener of visibilityListeners) listener();
+    });
+    expect(lastJournalTarget?.input.context).toMatchObject({ afterSeq: 5 });
+    await deliverJournal({
+      events: [],
+      nextSeq: 5,
+      caughtUp: true,
+      gap: null,
+      gaps: [g2],
+      continuityCut: null,
+      conflicts: [],
+      evicted: 0,
+    });
+    expect(
+      renderer!.root
+        .findAll((node) => node.props["data-journal-seq"] !== undefined)
+        .map((node) => node.props["data-journal-seq"]),
+    ).toEqual([1, 3, 5]);
+    expect(text()).toContain("Continuité du journal incertaine entre les séquences 4–4");
+    await deliverJournal({
+      events: [],
+      nextSeq: 5,
+      caughtUp: true,
+      gap: null,
+      gaps: [],
+      continuityCut: null,
+      conflicts: [],
+      evicted: 0,
+    });
+    expect(
+      renderer!.root
+        .findAll((node) => node.props["data-journal-seq"] !== undefined)
+        .map((node) => node.props["data-journal-seq"]),
+    ).toEqual([1, 3, 5]);
+    expect(text()).toContain("Continuité du journal incertaine entre les séquences 4–4");
+    const empty = {
+      events: [],
+      caughtUp: true,
+      gap: null,
+      gaps: [],
+      continuityCut: null,
+      conflicts: [],
+      evicted: 0,
+    };
+    for (const prefixMissing of [false, true]) {
+      await act(async () => renderer?.unmount());
+      renderer = null;
+      await deliverJournal({ ...empty, nextSeq: 0 });
+      await mount(makeThread());
+      if (prefixMissing) {
+        await deliverJournal({
+          ...empty,
+          nextSeq: 40,
+          gap: { from_seq: 1, to_seq: 40, reason: "transport" },
+        });
+      }
+      await deliverJournal({
+        ...empty,
+        nextSeq: 41,
+        events: [
+          {
+            ...journalEvent(41),
+            event: "update",
+            payload: { kind: "text", content: "fragment 41" },
+          },
+        ],
+      });
+      expect(text()).toContain("fragment 41");
+      expect(text().includes("Extrait :")).toBe(prefixMissing);
+      await act(async () => {
+        visibilityState = "hidden";
+        for (const listener of visibilityListeners) listener();
+      });
+      await act(async () => {
+        visibilityState = "visible";
+        for (const listener of visibilityListeners) listener();
+      });
+      expect(lastJournalTarget?.input.context).toMatchObject({ afterSeq: 41 });
+      await deliverJournal({ ...empty, nextSeq: 41 });
+      expect(text()).toContain("fragment 41");
+      expect(text().includes("Extrait :")).toBe(prefixMissing);
+    }
   });
 
   it("garde le statut historique sans disponibilité feinte et conserve le journal en cas de panne", async () => {

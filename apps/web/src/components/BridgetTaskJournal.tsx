@@ -1,6 +1,16 @@
 import { useAtomValue } from "@effect/atom-react";
 import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
 import type { BridgetJournalState } from "@t3tools/client-runtime/state/orchestration";
+import {
+  mergeJournalEvents,
+  projectBridgetJournal,
+  retainBridgetJournalGaps,
+  type BridgetJournalBlock,
+  type BridgetJournalConflict,
+  type BridgetJournalContinuityCut,
+  type BridgetJournalGap,
+  type BridgetJournalProjection,
+} from "@t3tools/client-runtime/bridget-journal-presentation";
 import type {
   BridgetJournalEvent,
   BridgetLineageDetail,
@@ -14,7 +24,16 @@ import type {
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
-import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { orchestrationEnvironment } from "~/state/orchestration";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -24,6 +43,7 @@ import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 import { Button } from "~/components/ui/button";
 import { randomUUID } from "~/lib/utils";
 import { BridgetTaskPlacement } from "./chat/SubagentTooltipContent";
+import ChatMarkdown from "./ChatMarkdown";
 
 type Context = { environmentId: EnvironmentId; projectId: ProjectId; threadId: ThreadId };
 
@@ -108,17 +128,84 @@ const statusLabels = {
   cancelled: "Annulé",
 } as const;
 
-const JournalRow = memo(function JournalRow({ event }: { event: BridgetJournalEvent }) {
+function rawPreview(event: BridgetJournalEvent): string | null {
+  return typeof event.payload === "string" ? event.payload : null;
+}
+
+const JournalDetails = memo(function JournalDetails({ block }: { block: BridgetJournalBlock }) {
+  const [open, setOpen] = useState(false);
   return (
-    <li className="border-b border-border/50 py-2" data-journal-seq={event.seq}>
-      <div className="flex gap-2 text-xs text-muted-foreground">
-        <time>{event.ts}</time>
-        <span>{event.event}</span>
-        <span>#{event.seq}</span>
-      </div>
-      <pre className="mt-1 whitespace-pre-wrap break-words text-xs">
-        {typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload, null, 2)}
-      </pre>
+    <details
+      className="mt-2 text-xs text-muted-foreground"
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="cursor-pointer select-none">
+        Détails techniques · #{block.firstSeq}–#{block.lastSeq}
+      </summary>
+      {open ? (
+        <div className="mt-2 space-y-2">
+          {block.conflicts.map((conflict) => (
+            <div key={`conflict:${conflict.seq}`} className="rounded border border-warning/40 p-2">
+              <p className="font-medium text-foreground">
+                Conflit de rejeu #{conflict.seq}
+                {conflict.additionalConflicts > 0
+                  ? ` · ${conflict.additionalConflicts + 1} occurrences conflictuelles`
+                  : ""}
+              </p>
+              <pre className="mt-1 whitespace-pre-wrap break-words">
+                {JSON.stringify(conflict.conflicting, null, 2)}
+              </pre>
+            </div>
+          ))}
+          {block.events.map((event) => (
+            <pre key={event.seq} className="whitespace-pre-wrap break-words">
+              {JSON.stringify(event, null, 2)}
+            </pre>
+          ))}
+        </div>
+      ) : null}
+    </details>
+  );
+});
+
+const JournalBlockView = memo(function JournalBlockView({ block }: { block: BridgetJournalBlock }) {
+  return (
+    <li className="border-b border-border/50 py-3" data-journal-seq={block.firstSeq}>
+      {block.excerpt ? (
+        <p className="mb-2 text-xs text-muted-foreground">
+          Extrait : le début de ce segment n’est pas chargé.
+        </p>
+      ) : null}
+      {block.kind === "text" ? (
+        <ChatMarkdown className="text-sm" cwd={undefined} inert text={block.content} />
+      ) : block.kind === "activity" ? (
+        <details className="rounded border bg-muted/30 px-3 py-2">
+          <summary className="cursor-pointer select-none text-sm font-medium">
+            {block.label}
+            {block.text ? ` · ${block.text}` : ""}
+          </summary>
+          <div className="mt-2 space-y-2 text-sm">
+            {block.detail ? <p>Détail : {block.detail}</p> : null}
+            {block.toolCallId ? <p>Identifiant d’appel : {block.toolCallId}</p> : null}
+            {block.exitCode !== null ? <p>Code de sortie : {block.exitCode}</p> : null}
+            {block.status ? <p>Statut : {block.status}</p> : null}
+            {block.state ? <p>État : {block.state}</p> : null}
+            {block.outputTail !== null ? (
+              <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-background p-2 text-xs">
+                {block.outputTail}
+              </pre>
+            ) : null}
+          </div>
+        </details>
+      ) : (
+        <details className="rounded border border-dashed px-3 py-2">
+          <summary className="cursor-pointer select-none text-sm">
+            {block.label}
+            {rawPreview(block.events[0]!) ? ` · ${rawPreview(block.events[0]!)} ` : ""}
+          </summary>
+        </details>
+      )}
+      <JournalDetails block={block} />
     </li>
   );
 });
@@ -178,7 +265,13 @@ export function BridgetTaskJournal({
   const cancel = useAtomCommand(orchestrationEnvironment.bridgetLineageCancel, {
     reportFailure: false,
   });
-  const [events, setEvents] = useState<ReadonlyArray<BridgetJournalEvent>>([]);
+  const [journal, setJournal] = useState<{
+    readonly events: ReadonlyArray<BridgetJournalEvent>;
+    readonly conflicts: ReadonlyArray<BridgetJournalConflict>;
+    readonly headCut: boolean;
+    readonly gaps: ReadonlyArray<BridgetJournalGap>;
+    readonly continuityCut: BridgetJournalContinuityCut | null;
+  }>({ events: [], conflicts: [], headCut: false, gaps: [], continuityCut: null });
   const [failure, setFailure] = useState<string | null>(null);
   const [caughtUp, setCaughtUp] = useState(false);
   const [gap, setGap] = useState<BridgetLineageJournal["gap"]>(null);
@@ -189,9 +282,11 @@ export function BridgetTaskJournal({
   const [result, setResult] = useState("");
   const [reading, setReading] = useState(false);
   const [history, setHistory] = useState<BridgetLineageJournal | null>(null);
+  const [historyAfterSeq, setHistoryAfterSeq] = useState<number | null>(null);
   const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
   const [bottomInset, setBottomInset] = useState(0);
   const lastSeq = useRef(0);
+  const liveProjection = useRef<BridgetJournalProjection | null>(null);
   const requests = useRef(new Set<AbortController>());
   useLayoutEffect(() => {
     const overlay = scrollElement
@@ -224,11 +319,30 @@ export function BridgetTaskJournal({
     setCaughtUp(state.caughtUp);
     if (state.gap !== null) setGap(state.gap);
     if (state.evicted > 0) setEvicted(true);
-    setEvents((previous) => {
-      const merged = new Map(previous.map((event) => [event.seq, event]));
-      for (const event of state.events) if (!merged.has(event.seq)) merged.set(event.seq, event);
-      const ordered = [...merged.values()].sort((a, b) => a.seq - b.seq);
-      return ordered.slice(-4096);
+    setJournal((previous) => {
+      const merged = mergeJournalEvents(previous.events, state.events, [
+        ...previous.conflicts,
+        ...(state.conflicts ?? []),
+      ]);
+      const incomingGaps =
+        state.gap === null ? (state.gaps ?? []) : [...(state.gaps ?? []), state.gap];
+      const firstRetainedSeq = merged.events[0]?.seq ?? null;
+      const prefixGap =
+        firstRetainedSeq !== null &&
+        (previous.gaps.some((knownGap) => knownGap.to_seq < firstRetainedSeq) ||
+          incomingGaps.some((incomingGap) => incomingGap.to_seq < firstRetainedSeq));
+      const continuity = retainBridgetJournalGaps(
+        { gaps: previous.gaps, continuityCut: previous.continuityCut },
+        incomingGaps,
+        firstRetainedSeq,
+        state.continuityCut ?? null,
+      );
+      return {
+        events: merged.events,
+        conflicts: merged.conflicts,
+        headCut: previous.headCut || prefixGap || state.evicted > 0 || merged.evicted > 0,
+        ...continuity,
+      };
     });
   }, []);
   const read = async (input: BridgetLineageReadInput) => {
@@ -284,7 +398,10 @@ export function BridgetTaskJournal({
         afterSeq,
         limit: 100,
       });
-      if (value !== null && "events" in value) setHistory(value);
+      if (value !== null && "events" in value) {
+        setHistory(value);
+        setHistoryAfterSeq(afterSeq);
+      }
     } finally {
       setReading(false);
     }
@@ -309,6 +426,34 @@ export function BridgetTaskJournal({
   };
   const nativeStatus = task?.status ?? ref.status;
   const terminal = ["result_available", "failed", "cancelled"].includes(nativeStatus);
+  const liveInput = useMemo(
+    () => ({
+      events: journal.events,
+      conflicts: journal.conflicts,
+      gaps: journal.gaps,
+      continuityCut: journal.continuityCut,
+      beginsWithExcerpt: journal.headCut,
+    }),
+    [journal],
+  );
+  const projectedLiveJournal = useMemo(
+    () => projectBridgetJournal(liveInput, liveProjection.current ?? undefined),
+    [liveInput],
+  );
+  useEffect(() => {
+    liveProjection.current = projectedLiveJournal;
+  }, [projectedLiveJournal]);
+  const projectedHistory = useMemo(() => {
+    if (history === null) return null;
+    const merged = mergeJournalEvents([], history.events);
+    return projectBridgetJournal({
+      events: merged.events,
+      conflicts: merged.conflicts,
+      gaps: history.gap === null ? [] : [history.gap],
+      beginsWithExcerpt: historyAfterSeq !== 0 || history.gap !== null,
+    });
+  }, [history, historyAfterSeq]);
+  const projection = projectedHistory ?? projectedLiveJournal;
   return (
     <section
       className="flex min-h-0 min-w-0 flex-1 flex-col"
@@ -393,6 +538,13 @@ export function BridgetTaskJournal({
               Journal incomplet : séquences {gap.from_seq}–{gap.to_seq} ({gap.reason}).
             </p>
           ) : null}
+          {journal.continuityCut ? (
+            <p role="status" className="mb-2 text-sm">
+              Continuité du journal incertaine entre les séquences {journal.continuityCut.fromSeq}–
+              {journal.continuityCut.toSeq} : les fragments ne sont pas regroupés à travers cette
+              zone.
+            </p>
+          ) : null}
           {evicted ? (
             <p className="mb-2 text-sm">
               Les 4 096 dernières lignes sont affichées. Le début reste disponible dans
@@ -409,7 +561,14 @@ export function BridgetTaskJournal({
               Lire le début
             </Button>
             {history ? (
-              <Button size="xs" variant="ghost" onClick={() => setHistory(null)}>
+              <Button
+                size="xs"
+                variant="ghost"
+                onClick={() => {
+                  setHistory(null);
+                  setHistoryAfterSeq(null);
+                }}
+              >
                 Retour au suivi
               </Button>
             ) : null}
@@ -432,22 +591,27 @@ export function BridgetTaskJournal({
                   Copier le résultat chargé
                 </Button>
                 {detail.result_next_offset !== null ? (
-                  <Button
-                    size="xs"
-                    variant="ghost"
-                    disabled={reading}
-                    onClick={() => void readResult(detail.result_next_offset!)}
-                  >
-                    Suite du résultat
-                  </Button>
+                  <>
+                    <span className="text-xs text-muted-foreground">
+                      Résultat partiel : la suite n’est pas encore chargée.
+                    </span>
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      disabled={reading}
+                      onClick={() => void readResult(detail.result_next_offset!)}
+                    >
+                      Suite du résultat
+                    </Button>
+                  </>
                 ) : null}
               </div>
-              <pre className="whitespace-pre-wrap break-words text-sm">{result}</pre>
+              <ChatMarkdown cwd={undefined} inert text={result} />
             </div>
           ) : null}
           <ol className="list-none p-0">
-            {(history?.events ?? events).map((event) => (
-              <JournalRow key={event.seq} event={event} />
+            {projection.blocks.map((block) => (
+              <JournalBlockView key={block.key} block={block} />
             ))}
           </ol>
           {history ? (
