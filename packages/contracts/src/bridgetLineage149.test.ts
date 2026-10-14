@@ -13,6 +13,8 @@ import {
   BridgetLineageSnapshotV1,
   BridgetLineageTask,
   BridgetLineageTaskV1,
+  BridgetLineageTaskV2,
+  BridgetLineageTaskV3,
   BridgetLineageView,
   BridgetLineageWatchInput,
   BridgetNativeTaskStatus,
@@ -536,13 +538,131 @@ describe("S162 versioned remote lineage", () => {
   });
 
   it("rejects unsupported success versions and keeps errors and cancellation on v1", () => {
-    expect(() => strictSnapshot({ ...snapshot, version: 3 })).toThrow();
-    expect(() => strictDetail({ ...detail, version: 3 })).toThrow();
+    expect(() => strictSnapshot({ ...snapshot, version: 4 })).toThrow();
+    expect(() => strictDetail({ ...detail, version: 4 })).toThrow();
     expect(decodeError({ _tag: "BridgetLineageError", code: "unsupported_version" }).code).toBe(
       "unsupported_version",
     );
     expect(() =>
       decodeCancelResult({ version: 2, task_id: taskId, status: "cancelled" }),
     ).toThrow();
+  });
+});
+
+describe("SPEC163 — closed v3 decision and frozen old tasks", () => {
+  const strictTask = Schema.decodeUnknownSync(BridgetLineageTaskV3, { onExcessProperty: "error" });
+  const strictSnapshot = Schema.decodeUnknownSync(BridgetLineageSnapshot, {
+    onExcessProperty: "error",
+  });
+  const strictDetail = Schema.decodeUnknownSync(BridgetLineageDetail, {
+    onExcessProperty: "error",
+  });
+  const row = { ...task, placement: null, decision: null };
+  const snapshot = {
+    version: 3,
+    status: "ok",
+    generation,
+    seq: 7,
+    root_owner_agent_id: parentTaskId,
+    tasks: [row],
+    next_cursor: null,
+  };
+  const detail = {
+    version: 3,
+    status: "ok",
+    generation,
+    seq: 7,
+    root_owner_agent_id: parentTaskId,
+    task: row,
+    result: null,
+    result_offset: 0,
+    result_next_offset: null,
+    result_total_bytes: 0,
+  };
+  it("requires nullable decision only in v3 and preserves every supported mode", () => {
+    expect(strictSnapshot(snapshot)).toEqual(snapshot);
+    expect(strictDetail(detail)).toEqual(detail);
+    expect(() => strictTask({ ...task, placement: null })).toThrow();
+    for (const mode of ["explicit", "automatic", "fallback"] as const) {
+      const decision = { mode, candidate_id: "c01", reason: "profil autorisé" };
+      expect(strictTask({ ...row, decision }).decision).toEqual(decision);
+      expect(decodeTask({ ...row, decision }).decision).toEqual(decision);
+      expect(strictTask({ ...row, decision: { mode, candidate_id: "c01" } }).decision).toEqual({
+        mode,
+        candidate_id: "c01",
+      });
+    }
+    expect(decodeTask(task).decision).toBeUndefined();
+  });
+  it("bounds reason in UTF-8 bytes and rejects unknown decision fields", () => {
+    const decision = { mode: "automatic", candidate_id: "c01", reason: "é".repeat(128) };
+    expect(strictTask({ ...row, decision }).decision).toEqual(decision);
+    expect(
+      strictTask({ ...row, decision: { ...decision, candidate_id: "c08", reason: "x" } }).decision
+        ?.candidate_id,
+    ).toBe("c08");
+    for (const invalid of [
+      { ...decision, reason: "é".repeat(129) },
+      { ...decision, reason: "" },
+      { ...decision, candidate_id: "c09" },
+      { ...decision, candidate_id: "forged" },
+      { ...decision, reason: "x".repeat(257) },
+      { ...decision, reason: null },
+      ...[
+        "\u0000",
+        "\u001f",
+        "\u007f",
+        "\u009f",
+        "\u00ad",
+        "\u0600",
+        "\u0605",
+        "\u061c",
+        "\u06dd",
+        "\u070f",
+        "\u0890",
+        "\u0891",
+        "\u08e2",
+        "\u180e",
+        "\u200b",
+        "\u200f",
+        "\u202a",
+        "\u202e",
+        "\u2060",
+        "\u2065",
+        "\u206f",
+        "\ufeff",
+        "\ufff9",
+        "\ufffb",
+        "\u{110bd}",
+        "\u{110cd}",
+        "\u{13430}",
+        "\u{1345f}",
+        "\u{1bca0}",
+        "\u{1bca3}",
+        "\u{1d173}",
+        "\u{1d17a}",
+        "\u{e0001}",
+        "\u{e0020}",
+        "\u{e007f}",
+        "\ufe00",
+        "\ufe0f",
+        "\u{e0100}",
+        "\u{e01ef}",
+      ].map((control) => ({ ...decision, reason: `texte${control}` })),
+      { ...decision, mode: "guessed" },
+      { ...decision, secret: "must-not-leak" },
+    ])
+      expect(() => strictTask({ ...row, decision: invalid })).toThrow();
+  });
+  it("rejects decision enrichment through the frozen v1 and v2 decoders", () => {
+    const strictV1 = Schema.decodeUnknownSync(BridgetLineageTaskV1, { onExcessProperty: "error" });
+    const strictV2 = Schema.decodeUnknownSync(BridgetLineageTaskV2, { onExcessProperty: "error" });
+    const v2 = { ...task, placement: null };
+    expect(JSON.stringify(strictV1(task))).toBe(JSON.stringify(task));
+    expect(JSON.stringify(strictV2(v2))).toBe(JSON.stringify(v2));
+    expect(() => strictV1({ ...task, decision: null })).toThrow();
+    expect(() => strictV2(row)).toThrow();
+    expect(() => strictSnapshot({ ...snapshot, version: 2 })).toThrow();
+    expect(() => strictDetail({ ...detail, version: 2 })).toThrow();
   });
 });

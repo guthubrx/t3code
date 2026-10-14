@@ -5,7 +5,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   type BridgetLineageJournal,
   type BridgetLineageSnapshot,
-  type BridgetLineageTaskV2,
+  type BridgetLineageTaskV3,
   ProjectId,
   type OrchestrationProjectShell,
   type OrchestrationV2ThreadShell,
@@ -34,7 +34,7 @@ const projectId = ProjectId.make("project-lineage-149");
 const workspaceRoot = "/project with spaces/$(forged); é";
 const input = { threadId, projectId };
 
-const task = (overrides: Partial<BridgetLineageTaskV2> = {}): BridgetLineageTaskV2 => ({
+const task = (overrides: Partial<BridgetLineageTaskV3> = {}): BridgetLineageTaskV3 => ({
   task_id: uuid(1),
   parent_task_id: null,
   parent_agent_id: uuid(900),
@@ -56,13 +56,14 @@ const task = (overrides: Partial<BridgetLineageTaskV2> = {}): BridgetLineageTask
   result_available: false,
   journal_available: true,
   placement: null,
+  decision: null,
   ...overrides,
 });
 const snapshot = (
-  tasks: BridgetLineageTaskV2[],
-  overrides: Partial<Extract<BridgetLineageSnapshot, { readonly version: 2 }>> = {},
-): Extract<BridgetLineageSnapshot, { readonly version: 2 }> => ({
-  version: 2,
+  tasks: BridgetLineageTaskV3[],
+  overrides: Partial<Extract<BridgetLineageSnapshot, { readonly version: 3 }>> = {},
+): Extract<BridgetLineageSnapshot, { readonly version: 3 }> => ({
+  version: 3,
   status: "ok",
   generation: uuid(900),
   seq: 7,
@@ -72,7 +73,7 @@ const snapshot = (
   ...overrides,
 });
 const detail = (overrides: Record<string, unknown> = {}): unknown => ({
-  version: 2,
+  version: 3,
   status: "ok",
   generation: uuid(900),
   seq: 7,
@@ -264,7 +265,7 @@ describe("BridgetReader149 lineage context", () => {
         "--project-root",
         workspaceRoot,
         "--response-version",
-        "2",
+        "3",
         "--action",
         "list",
         "--limit",
@@ -823,7 +824,7 @@ describe("BridgetReader162 negotiated remote metadata", () => {
     last_contact_at: 1790000010,
     contact_state: "connected" as const,
   };
-  const { placement: _placement, ...legacyTask } = task();
+  const { placement: _placement, decision: _decision, ...legacyTask } = task();
   const legacySnapshot = { ...snapshot([]), version: 1, tasks: [legacyTask] };
   const legacyDetail = {
     version: 1,
@@ -838,25 +839,50 @@ describe("BridgetReader162 negotiated remote metadata", () => {
     result_total_bytes: 0,
   };
 
-  it.effect("reads v2 placement once and keeps contact observations from each page", () =>
-    Effect.gen(function* () {
-      const first = snapshot([task({ placement })], { next_cursor: "next" });
-      const second = snapshot([
-        task({
-          task_id: uuid(2),
-          placement: { ...placement, last_contact_at: 1790000011 },
-        }),
-      ]);
-      const { reader, calls } = yield* harness({ results: [output(first), output(second)] });
-      const result = yield* reader.lineageSnapshot(input);
-      expect(result).toEqual({
-        ...first,
-        tasks: [...first.tasks, ...second.tasks],
-        next_cursor: null,
-      });
-      expect(calls).toHaveLength(2);
-      expect(calls.every((call) => call.args?.includes("--response-version"))).toBe(true);
-    }),
+  const v2Snapshot = (
+    rows: ReadonlyArray<BridgetLineageTaskV3> = [task()],
+    nextCursor: string | null = null,
+  ) => ({
+    ...snapshot([]),
+    version: 2,
+    tasks: rows.map(({ decision: _decision, ...row }) => row),
+    next_cursor: nextCursor,
+  });
+  const v2Detail = { ...legacyDetail, version: 2, task: { ...legacyTask, placement } };
+
+  it.effect(
+    "reads v3 placement and decision once and keeps contact observations from each page",
+    () =>
+      Effect.gen(function* () {
+        const first = snapshot(
+          [
+            task({
+              placement,
+              decision: {
+                mode: "automatic",
+                candidate_id: "c01",
+                reason: "profil autorisé",
+              },
+            }),
+          ],
+          { next_cursor: "next" },
+        );
+        const second = snapshot([
+          task({
+            task_id: uuid(2),
+            placement: { ...placement, last_contact_at: 1790000011 },
+          }),
+        ]);
+        const { reader, calls } = yield* harness({ results: [output(first), output(second)] });
+        const result = yield* reader.lineageSnapshot(input);
+        expect(result).toEqual({
+          ...first,
+          tasks: [...first.tasks, ...second.tasks],
+          next_cursor: null,
+        });
+        expect(calls).toHaveLength(2);
+        expect(calls.every((call) => call.args?.includes("--response-version"))).toBe(true);
+      }),
   );
 
   it.effect.each(["invalid_request", "unsupported_version"])(
@@ -864,45 +890,62 @@ describe("BridgetReader162 negotiated remote metadata", () => {
     (code) =>
       Effect.gen(function* () {
         const { reader, calls } = yield* harness({
-          results: [output(refusal(code), 2), output(legacySnapshot)],
+          results: [
+            output(refusal("unsupported_version"), 2),
+            output(refusal(code), 2),
+            output(legacySnapshot),
+          ],
         });
         expect(yield* reader.lineageSnapshot(input)).toEqual(legacySnapshot);
-        expect(calls).toHaveLength(2);
-        expect(calls[0]!.args).toContain("--response-version");
-        expect(calls[1]!.args).not.toContain("--response-version");
-        expect(calls[1]!.args).not.toContain("--cursor");
+        expect(calls).toHaveLength(3);
+        expect(calls[0]!.args).toContain("3");
+        expect(calls[1]!.args).toContain("2");
+        expect(calls[2]!.args).not.toContain("--response-version");
+        expect(calls[2]!.args).not.toContain("--cursor");
       }),
   );
 
-  it.effect("discards every v2 page before restarting the v1 snapshot at cursor zero", () =>
-    Effect.gen(function* () {
-      const first = snapshot([task({ task_id: uuid(77), placement })], {
-        next_cursor: "v2-cursor",
-      });
-      const { reader, calls } = yield* harness({
-        results: [output(first), output(refusal("unsupported_version"), 2), output(legacySnapshot)],
-      });
-      expect(yield* reader.lineageSnapshot(input)).toEqual(legacySnapshot);
-      expect(calls).toHaveLength(3);
-      expect(calls[1]!.args).toContain("v2-cursor");
-      expect(calls[2]!.args).not.toContain("--cursor");
-      expect(calls[2]!.args).not.toContain("--response-version");
-    }),
+  it.effect(
+    "discards every v2 page before restarting the v1 snapshot at cursor zero after v3 refusal",
+    () =>
+      Effect.gen(function* () {
+        const first = snapshot([task({ task_id: uuid(77), placement })], {
+          next_cursor: "v2-cursor",
+        });
+        const { reader, calls } = yield* harness({
+          results: [
+            output(refusal("unsupported_version"), 2),
+            output(v2Snapshot(first.tasks, "v2-cursor")),
+            output(refusal("unsupported_version"), 2),
+            output(legacySnapshot),
+          ],
+        });
+        expect(yield* reader.lineageSnapshot(input)).toEqual(legacySnapshot);
+        expect(calls).toHaveLength(4);
+        expect(calls[2]!.args).toContain("v2-cursor");
+        expect(calls[3]!.args).not.toContain("--cursor");
+        expect(calls[3]!.args).not.toContain("--response-version");
+      }),
   );
 
-  it.effect("keeps a refused fallback closed without a third attempt", () =>
+  it.effect("keeps a refused final fallback closed without a fourth attempt", () =>
     Effect.gen(function* () {
       const { reader, calls } = yield* harness({
-        results: [output(refusal("invalid_request"), 2), output(refusal("unsupported_version"), 2)],
+        results: [
+          output(refusal("unsupported_version"), 2),
+          output(refusal("invalid_request"), 2),
+          output(refusal("unsupported_version"), 2),
+        ],
       });
       expect((yield* reader.lineageSnapshot(input).pipe(Effect.flip)).code).toBe(
         "unsupported_version",
       );
-      expect(calls).toHaveLength(2);
+      expect(calls).toHaveLength(3);
     }),
   );
 
   it.effect.each([
+    "invalid_request",
     "binding_unavailable",
     "project_mismatch",
     "task_unavailable",
@@ -919,7 +962,7 @@ describe("BridgetReader162 negotiated remote metadata", () => {
 
   it.effect.each([
     { name: "implicit v1 success", response: output(legacySnapshot) },
-    { name: "future success", response: output({ ...snapshot([]), version: 3 }) },
+    { name: "future success", response: output({ ...snapshot([]), version: 4 }) },
     { name: "malformed JSON", response: output("not JSON") },
     { name: "missing placement", response: output({ ...snapshot([]), tasks: [legacyTask] }) },
     { name: "non-v1 error", response: output({ ...refusal("invalid_request"), version: 2 }, 2) },
@@ -942,17 +985,30 @@ describe("BridgetReader162 negotiated remote metadata", () => {
   );
 
   it.effect(
-    "negotiates detail v2 and falls back once without changing the requested result window",
+    "negotiates detail v3 and falls back twice without changing the requested result window",
     () =>
       Effect.gen(function* () {
-        const rich = detail({ task: task({ placement }) });
+        const rich = detail({
+          task: task({
+            placement,
+            decision: {
+              mode: "fallback",
+              candidate_id: "c02",
+              reason: "service indisponible",
+            },
+          }),
+        });
         const success = yield* harness({ results: [output(rich)] });
         expect(
           yield* success.reader.lineageRead({ ...input, action: "show", taskId: uuid(1) }),
         ).toEqual(rich);
         expect(success.calls).toHaveLength(1);
         const fallback = yield* harness({
-          results: [output(refusal("unsupported_version"), 2), output(legacyDetail)],
+          results: [
+            output(refusal("unsupported_version"), 2),
+            output(refusal("invalid_request"), 2),
+            output(legacyDetail),
+          ],
         });
         expect(
           yield* fallback.reader.lineageRead({
@@ -963,10 +1019,73 @@ describe("BridgetReader162 negotiated remote metadata", () => {
             limit: 12,
           }),
         ).toEqual(legacyDetail);
-        expect(fallback.calls).toHaveLength(2);
-        expect(fallback.calls[1]!.args).not.toContain("--response-version");
-        expect(fallback.calls[1]!.args.slice(-4)).toEqual(["--limit", "12", "--offset", "0"]);
+        expect(fallback.calls).toHaveLength(3);
+        expect(fallback.calls[2]!.args).not.toContain("--response-version");
+        expect(fallback.calls[2]!.args.slice(-4)).toEqual(["--limit", "12", "--offset", "0"]);
       }),
+  );
+
+  it.effect("discards v3 staging before reading a homogeneous v2 snapshot and detail", () =>
+    Effect.gen(function* () {
+      const first = snapshot(
+        [
+          task({
+            task_id: uuid(77),
+            decision: {
+              mode: "automatic",
+              candidate_id: "c01",
+              reason: "profil autorisé",
+            },
+          }),
+        ],
+        { next_cursor: "v3-cursor" },
+      );
+      const old = v2Snapshot();
+      const list = yield* harness({
+        results: [output(first), output(refusal("unsupported_version"), 2), output(old)],
+      });
+      expect(yield* list.reader.lineageSnapshot(input)).toEqual(old);
+      expect(list.calls).toHaveLength(3);
+      expect(list.calls[1]!.args).toContain("v3-cursor");
+      expect(list.calls[2]!.args).toContain("2");
+      expect(list.calls[2]!.args).not.toContain("--cursor");
+      const show = yield* harness({
+        results: [output(refusal("unsupported_version"), 2), output(v2Detail)],
+      });
+      expect(yield* show.reader.lineageRead({ ...input, action: "show", taskId: uuid(1) })).toEqual(
+        v2Detail,
+      );
+      expect(show.calls).toHaveLength(2);
+    }),
+  );
+
+  it.effect("refuses mixed success versions without downgrade or partial publication", () =>
+    Effect.gen(function* () {
+      const h = yield* harness({
+        results: [output(snapshot([task()], { next_cursor: "v3-cursor" })), output(v2Snapshot())],
+      });
+      expect((yield* h.reader.lineageSnapshot(input).pipe(Effect.flip)).code).toBe(
+        "invalid_output",
+      );
+      expect(h.calls).toHaveLength(2);
+    }),
+  );
+
+  it.effect.each([
+    "invalid_request",
+    "binding_unavailable",
+    "project_mismatch",
+    "store_unavailable",
+  ])("does not downgrade a structured v3 detail refusal %s", (code) =>
+    Effect.gen(function* () {
+      const h = yield* harness({ results: [output(refusal(code), 2), output(v2Detail)] });
+      expect(
+        (yield* h.reader
+          .lineageRead({ ...input, action: "show", taskId: uuid(1) })
+          .pipe(Effect.flip)).code,
+      ).toBe(code);
+      expect(h.calls).toHaveLength(1);
+    }),
   );
 
   it.effect("does not negotiate or replay journal reads and cancellation", () =>

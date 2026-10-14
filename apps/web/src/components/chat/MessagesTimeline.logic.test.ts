@@ -184,6 +184,7 @@ describe("SPEC143 outgoing Bridget presentation", () => {
       const item = {
         ...source,
         type: "dynamic_tool" as const,
+        providerThreadId: null,
         toolName,
         input: { to: "Atelier", body: "Corps conservé" },
         output: { status: "accepted" },

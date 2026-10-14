@@ -845,6 +845,7 @@ describe("MessagesTimeline", () => {
     const item = {
       ...source.item,
       type: "dynamic_tool" as const,
+      providerThreadId: null,
       status: "completed" as const,
       toolName:
         toolData.type === "mcpToolCall"

@@ -474,7 +474,7 @@ const make = Effect.gen(function* () {
   // O(n): each bounded page is decoded once; no mutation or provider operation.
   const lineageSnapshotPages = Effect.fn("BridgetReader.lineageSnapshot")(function* (
     input: BridgetLineageWatchInput,
-    responseVersion: 1 | 2,
+    responseVersion: 1 | 2 | 3,
   ) {
     const project = yield* resolveLineageContext(input);
     let head: BridgetLineageSnapshot | undefined;
@@ -487,7 +487,7 @@ const make = Effect.gen(function* () {
           "lineage",
           "inspect",
           ...lineageArgs(input, project.workspaceRoot),
-          ...(responseVersion === 2 ? ["--response-version", "2"] : []),
+          ...(responseVersion === 1 ? [] : ["--response-version", String(responseVersion)]),
           "--action",
           "list",
           "--limit",
@@ -526,13 +526,24 @@ const make = Effect.gen(function* () {
       Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
     );
   });
-  const lineageSnapshot = (input: BridgetLineageWatchInput) =>
-    lineageSnapshotPages(input, 2).pipe(
+  const negotiateLineage = <A>(
+    attempt: (version: 1 | 2 | 3) => Effect.Effect<A, BridgetLineageError>,
+  ) =>
+    attempt(3).pipe(
       Effect.catch((error) =>
-        error.code === "unsupported_version" || error.code === "invalid_request"
-          ? lineageSnapshotPages(input, 1)
+        error.code === "unsupported_version"
+          ? attempt(2).pipe(
+              Effect.catch((legacyError) =>
+                legacyError.code === "unsupported_version" || legacyError.code === "invalid_request"
+                  ? attempt(1)
+                  : Effect.fail(legacyError),
+              ),
+            )
           : Effect.fail(error),
       ),
+    );
+  const lineageSnapshot = (input: BridgetLineageWatchInput) =>
+    negotiateLineage((version) => lineageSnapshotPages(input, version)).pipe(
       Effect.timeoutOrElse({
         duration: "30 seconds",
         orElse: () => Effect.fail(new BridgetLineageError({ code: "timeout" })),
@@ -567,14 +578,14 @@ const make = Effect.gen(function* () {
     });
   const lineageReadAttempt = Effect.fn("BridgetReader.lineageRead")(function* (
     input: Exclude<BridgetLineageReadInput, { readonly action: "list" }>,
-    responseVersion: 1 | 2,
+    responseVersion: 1 | 2 | 3,
   ) {
     const project = yield* resolveLineageContext(input);
     const args = [
       "lineage",
       "inspect",
       ...lineageArgs(input, project.workspaceRoot),
-      ...(responseVersion === 2 ? ["--response-version", "2"] : []),
+      ...(responseVersion === 1 ? [] : ["--response-version", String(responseVersion)]),
       "--action",
       input.action,
       "--task",
@@ -612,13 +623,7 @@ const make = Effect.gen(function* () {
   const lineageRead = (input: Exclude<BridgetLineageReadInput, { readonly action: "list" }>) =>
     input.action === "journal"
       ? lineageReadAttempt(input, 1)
-      : lineageReadAttempt(input, 2).pipe(
-          Effect.catch((error) =>
-            error.code === "unsupported_version" || error.code === "invalid_request"
-              ? lineageReadAttempt(input, 1)
-              : Effect.fail(error),
-          ),
-        );
+      : negotiateLineage((version) => lineageReadAttempt(input, version));
   const lineageCancel = Effect.fn("BridgetReader.lineageCancel")(function* (
     input: BridgetLineageCancelInput,
   ) {

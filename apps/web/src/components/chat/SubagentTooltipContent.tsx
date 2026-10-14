@@ -216,6 +216,22 @@ export function SubagentTooltipContent(props: {
         {props.elapsed}
       </div>
       {props.origin === "bridget_native" ? <BridgetTaskPlacement task={nativeTask} /> : null}
+      {nativeTask?.decision ? (
+        <span className="block min-w-0 break-words">
+          Choix{" "}
+          {nativeTask.decision.mode === "automatic"
+            ? "automatique"
+            : nativeTask.decision.mode === "fallback"
+              ? "de repli"
+              : "explicite"}{" "}
+          · {nativeTask.decision.candidate_id}
+          {nativeTask.decision.reason !== undefined ? (
+            <span className="block text-xs text-muted-foreground">
+              {nativeTask.decision.reason}
+            </span>
+          ) : null}
+        </span>
+      ) : null}
       {metadata.map(({ label, value }) => {
         const Icon = label === "Branch" ? GitBranchIcon : FolderIcon;
         return (

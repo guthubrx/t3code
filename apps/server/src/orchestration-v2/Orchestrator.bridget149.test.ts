@@ -1816,6 +1816,35 @@ describe("Orchestrator162 remote lineage projection", () => {
           "162-reopen",
         );
         expect(replay.storedEvents).toEqual([]);
+        const automatic = {
+          ...refreshed,
+          decision: { mode: "automatic" as const, candidate_id: "c01", reason: "profil autorisé" },
+        };
+        const v3: BridgetLineageSnapshot = { ...first, version: 3, seq: 9, tasks: [automatic] };
+        yield* sync(orchestrator, rootId, v3, "163-automatic");
+        expect((yield* projections.getThread(childA)).bridgetTask).toEqual(automatic);
+        // Equal watermarks do not hide enrichment or a changed reason.
+        const revised = {
+          ...automatic,
+          decision: { ...automatic.decision, reason: "raison actualisée" },
+        };
+        const changed = yield* sync(
+          orchestrator,
+          rootId,
+          { ...v3, tasks: [revised] },
+          "163-reason-same-seq",
+        );
+        expect(changed.storedEvents.length).toBeGreaterThan(0);
+        expect((yield* projections.getThread(childA)).bridgetTask).toEqual(revised);
+        yield* sync(
+          orchestrator,
+          rootId,
+          { ...first, seq: 9, tasks: [refreshed] },
+          "163-old-reader",
+        );
+        const withoutDecision = (yield* projections.getThread(childA)).bridgetTask;
+        expect(withoutDecision).toEqual(refreshed);
+        expect(withoutDecision?.decision).toBeUndefined();
         const records = yield* projections.getThreadRecords(childA, [
           "runs",
           "providerThreads",

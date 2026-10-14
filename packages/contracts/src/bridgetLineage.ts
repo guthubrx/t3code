@@ -78,10 +78,41 @@ export const BridgetLineageTaskV2 = Schema.Struct({
 });
 export type BridgetLineageTaskV2 = typeof BridgetLineageTaskV2.Type;
 
-/** Stored projections may predate v2; absent placement means metadata unavailable. */
+// Exact rendering-inertia guard from bridget-core/src/text_guards.rs, including
+// variation selectors and reserved U+2065 beyond Unicode Cc/Cf categories.
+const decisionControlCharacters =
+  /[\u0000-\u001f\u007f-\u009f\u00ad\u0600-\u0605\u061c\u06dd\u070f\u0890-\u0891\u08e2\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb\u{110bd}\u{110cd}\u{13430}-\u{1345f}\u{1bca0}-\u{1bca3}\u{1d173}-\u{1d17a}\u{e0001}\u{e0020}-\u{e007f}\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/u;
+
+/** Decision text is data only; v3 never changes a frozen v1/v2 task. */
+export const BridgetLineageDecisionV3 = Schema.Struct({
+  mode: Schema.Literals(["explicit", "automatic", "fallback"]),
+  candidate_id: Schema.String.check(Schema.isPattern(/^c0[1-8]$/)),
+  reason: Schema.optional(
+    Schema.String.check(
+      Schema.makeFilter(
+        (value: string) => {
+          const bytes = new TextEncoder().encode(value).length;
+          return bytes >= 1 && bytes <= 256 && !decisionControlCharacters.test(value);
+        },
+        {
+          expected: "1 to 256 UTF-8 bytes without control or format characters",
+        },
+      ),
+    ),
+  ),
+});
+export type BridgetLineageDecisionV3 = typeof BridgetLineageDecisionV3.Type;
+export const BridgetLineageTaskV3 = Schema.Struct({
+  ...BridgetLineageTaskV2.fields,
+  decision: Schema.NullOr(BridgetLineageDecisionV3),
+});
+export type BridgetLineageTaskV3 = typeof BridgetLineageTaskV3.Type;
+
+/** Stored projections may predate enrichment; absent fields mean metadata unavailable. */
 export const BridgetLineageTask = Schema.Struct({
   ...BridgetLineageTaskV1.fields,
   placement: Schema.optional(Schema.NullOr(BridgetLineagePlacementV2)),
+  decision: Schema.optional(Schema.NullOr(BridgetLineageDecisionV3)),
 });
 export type BridgetLineageTask = typeof BridgetLineageTask.Type;
 
@@ -110,9 +141,15 @@ export const BridgetLineageSnapshotV2 = Schema.Struct({
   version: Schema.Literal(2),
   tasks: Schema.Array(BridgetLineageTaskV2).check(Schema.isMaxLength(4096)),
 });
+export const BridgetLineageSnapshotV3 = Schema.Struct({
+  ...BridgetLineageSnapshotV2.fields,
+  version: Schema.Literal(3),
+  tasks: Schema.Array(BridgetLineageTaskV3).check(Schema.isMaxLength(4096)),
+});
 export const BridgetLineageSnapshot = Schema.Union([
   BridgetLineageSnapshotV1,
   BridgetLineageSnapshotV2,
+  BridgetLineageSnapshotV3,
 ]);
 export type BridgetLineageSnapshot = typeof BridgetLineageSnapshot.Type;
 
@@ -133,7 +170,16 @@ export const BridgetLineageDetailV2 = Schema.Struct({
   version: Schema.Literal(2),
   task: BridgetLineageTaskV2,
 });
-export const BridgetLineageDetail = Schema.Union([BridgetLineageDetailV1, BridgetLineageDetailV2]);
+export const BridgetLineageDetailV3 = Schema.Struct({
+  ...BridgetLineageDetailV2.fields,
+  version: Schema.Literal(3),
+  task: BridgetLineageTaskV3,
+});
+export const BridgetLineageDetail = Schema.Union([
+  BridgetLineageDetailV1,
+  BridgetLineageDetailV2,
+  BridgetLineageDetailV3,
+]);
 export type BridgetLineageDetail = typeof BridgetLineageDetail.Type;
 
 export const BridgetJournalEvent = Schema.Struct({
