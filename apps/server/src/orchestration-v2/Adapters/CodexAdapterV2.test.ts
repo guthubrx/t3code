@@ -1862,21 +1862,22 @@ describe("CodexAdapterV2 session initialize", () => {
               { threadId: "scope-root", config: config("scope-target") },
               nativeResult("scope-child"),
             ),
+            ...read(8),
             ...rpc(
-              8,
+              9,
               "thread/start",
-              { config: CodexAdapterV2.CODEX_THREAD_CONFIG },
+              { config: config("scope-foreign") },
               nativeResult("scope-foreign"),
             ),
             ...rpc(
-              9,
+              10,
               "thread/start",
               { config: CodexAdapterV2.CODEX_THREAD_CONFIG },
               nativeResult("scope-revoked"),
             ),
-            ...read(10),
+            ...read(11),
             ...rpc(
-              11,
+              12,
               "thread/resume",
               { threadId: "scope-root", excludeTurns: true, config: config("scope-remount") },
               { thread: { id: "scope-root", updatedAt: 1782622450 } },
@@ -1927,6 +1928,175 @@ describe("CodexAdapterV2 session initialize", () => {
         runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
       });
       assert.equal(session.initializeRequests(), 1);
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+  );
+
+  it.effect("remounts a rotated private identity before the first resumed turn", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "166-mcp-" });
+      const scenario = "private-mcp-turn-remount";
+      const threadId = ThreadId.make(`thread-${scenario}`);
+      const nativeThreadId = "native-private-mcp-turn-remount";
+      const nativeTurnId = "turn-private-mcp-turn-remount";
+      const providerSessionId = `provider-session-${scenario}`;
+      const prompt = "Resume the existing work.";
+      const base = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt });
+      const config = (token: string) => ({
+        ...CodexAdapterV2.CODEX_THREAD_CONFIG,
+        "mcp_servers.t3-code": {
+          url: "http://127.0.0.1:43123/mcp",
+          http_headers: { Authorization: `Bearer ${token}` },
+        },
+        "mcp_servers.bridget": {
+          command: "/usr/bin/true",
+          args: ["mcp"],
+          env: {
+            HOME: home,
+            BRIDGET_HOME: `${home}/.cache/bridget-core`,
+            BRIDGET_SOCKET: `${home}/.cache/bridget-core/bridget.sock`,
+            T3CODE_HOME: home,
+            BRIDGET_T3_MCP_ENDPOINT: "http://127.0.0.1:43123/mcp",
+            BRIDGET_T3_MCP_AUTHORIZATION: `Bearer ${token}`,
+          },
+        },
+      });
+      const rpc = (
+        id: number,
+        method: string,
+        params: unknown,
+        result: unknown,
+      ): CodexReplay.CodexAppServerReplayEntry[] => [
+        { type: "expect_outbound", label: method, frame: { id, method, params } },
+        { type: "emit_inbound", label: method, frame: { id, result } },
+      ];
+      const read = (id: number) =>
+        rpc(
+          id,
+          "config/read",
+          { cwd: "/workspace", includeLayers: false },
+          { config: { mcp_servers: {} }, origins: {} },
+        );
+      const nativeResult = base[4];
+      assert.ok(nativeResult?.type === "emit_inbound" && Predicate.isObject(nativeResult.frame));
+      if (nativeResult.type !== "emit_inbound" || !Predicate.isObject(nativeResult.frame)) return;
+      const turnStartParams = yield* CodexAdapterV2.buildCodexTurnStartParams({
+        nativeThreadId,
+        codexInput: [{ type: "text", text: prompt }],
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+        modelSelection: CODEX_TEST_MODEL_SELECTION,
+        hasT3Mcp: true,
+        browserToolsAvailable: false,
+        deviceToolsAvailable: false,
+      });
+      const session = yield* openReplaySession(
+        makeCodexReplayTranscript({
+          scenario,
+          entries: [
+            ...base.slice(0, 3),
+            ...read(2),
+            ...rpc(
+              3,
+              "thread/start",
+              { config: config("identity-a"), cwd: "/workspace", model: "gpt-5.4" },
+              nativeResult.frame.result,
+            ),
+            ...read(4),
+            ...rpc(
+              5,
+              "thread/resume",
+              {
+                threadId: nativeThreadId,
+                excludeTurns: true,
+                config: config("identity-b"),
+                cwd: "/workspace",
+              },
+              { thread: { id: nativeThreadId, updatedAt: 1782622450 } },
+            ),
+            ...rpc(6, "turn/start", turnStartParams, {
+              turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }),
+            }),
+            ...read(7),
+            {
+              type: "expect_outbound",
+              label: "failed private remount",
+              frame: {
+                id: 8,
+                method: "thread/resume",
+                params: {
+                  threadId: nativeThreadId,
+                  excludeTurns: true,
+                  config: config("identity-c"),
+                  cwd: "/workspace",
+                },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "failed private remount",
+              frame: { id: 8, error: { code: -32000, message: "resume refused" } },
+            },
+          ],
+        }),
+        undefined,
+        { HOME: home, PATH: "/usr/bin:/bin", T3CODE_BRIDGET_EXECUTABLE: "/usr/bin/true" },
+      );
+      const bind = (token: string) => {
+        const credential = {
+          environmentId: EnvironmentId.make("remount-env"),
+          threadId,
+          providerSessionId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          endpoint: "http://127.0.0.1:43123/mcp",
+          authorizationHeader: `Bearer ${token}`,
+          browserToolsAvailable: false,
+          t3codeHome: home,
+        };
+        McpProviderSession.setMcpProviderSession(credential);
+        return credential;
+      };
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+      );
+      const identityA = bind("identity-a");
+      const providerThread = yield* session.ensureThread(threadId);
+      const identityB = bind("identity-b");
+      const turnInput = makeCodexTestTurnInput({
+        threadId,
+        providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("attempt-private-mcp-turn-remount"),
+        text: prompt,
+      });
+
+      yield* session.runtime.startTurn(turnInput);
+
+      assert.deepEqual(
+        yield* Effect.promise(() =>
+          McpProviderSession.readMcpProviderPermissions(identityA, turnInput.runId, {
+            attemptId: turnInput.attemptId,
+            providerThreadId: providerThread.id,
+          }),
+        ),
+        { status: "unavailable" },
+      );
+      const currentPermissions = yield* Effect.promise(() =>
+        McpProviderSession.readMcpProviderPermissions(identityB, turnInput.runId, {
+          attemptId: turnInput.attemptId,
+          providerThreadId: providerThread.id,
+        }),
+      );
+      assert.equal(currentPermissions.status, "valid");
+
+      bind("identity-c");
+      const failedTurn = makeCodexTestTurnInput({
+        threadId,
+        providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("attempt-private-mcp-turn-remount-failure"),
+        text: "Retry after another rotation.",
+      });
+      assert.equal((yield* Effect.exit(session.runtime.startTurn(failedTurn)))._tag, "Failure");
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
   );
 
@@ -2850,10 +3020,63 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ...entries.slice(0, 5),
             {
               type: "expect_outbound",
-              label: "context turn",
-              frame: { id: 3, method: "turn/start", params },
+              label: "read config before context remount",
+              frame: {
+                id: 3,
+                method: "config/read",
+                params: { cwd: "/workspace", includeLayers: false },
+              },
             },
-            ...entries.slice(6),
+            {
+              type: "emit_inbound",
+              label: "read config before context remount",
+              frame: { id: 3, result: { config: { mcp_servers: {} }, origins: {} } },
+            },
+            {
+              type: "expect_outbound",
+              label: "remount context identity",
+              frame: {
+                id: 4,
+                method: "thread/resume",
+                params: {
+                  threadId: nativeThreadId,
+                  excludeTurns: true,
+                  cwd: "/workspace",
+                  model: "gpt-5.4",
+                  config: {
+                    ...CodexAdapterV2.CODEX_THREAD_CONFIG,
+                    "mcp_servers.t3-code": {
+                      url: "http://127.0.0.1:43123/mcp",
+                      http_headers: { Authorization: "Bearer test" },
+                    },
+                  },
+                },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "remount context identity",
+              frame: {
+                id: 4,
+                result: { thread: { id: nativeThreadId, updatedAt: 1782622450 } },
+              },
+            },
+            {
+              type: "expect_outbound",
+              label: "context turn",
+              frame: { id: 5, method: "turn/start", params },
+            },
+            {
+              type: "emit_inbound",
+              label: "context turn",
+              frame: {
+                id: 5,
+                result: {
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }),
+                },
+              },
+            },
+            entries[7]!,
             {
               type: "emit_inbound",
               label: "compacted",
@@ -2870,7 +3093,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               type: "expect_outbound",
               label: "restore context",
               frame: {
-                id: 4,
+                id: 6,
                 method: "thread/inject_items",
                 params: {
                   threadId: nativeThreadId,
@@ -2882,7 +3105,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 },
               },
             },
-            { type: "emit_inbound", label: "restored", frame: { id: 4, result: {} } },
+            { type: "emit_inbound", label: "restored", frame: { id: 6, result: {} } },
             {
               type: "emit_inbound",
               label: "done",
@@ -2900,7 +3123,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         McpProviderSession.setMcpProviderSession({
           environmentId: EnvironmentId.make("test"),
           threadId: harness.threadId,
-          providerSessionId: "context-session",
+          providerSessionId: "provider-session-restore-context",
           providerInstanceId: ProviderInstanceId.make("codex"),
           endpoint: "http://127.0.0.1:43123/mcp",
           authorizationHeader: "Bearer test",

@@ -1804,19 +1804,17 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
         );
         const bridgetCredentialsByThread = new Map<
           ThreadId,
-          McpProviderSession.McpProviderSessionConfig
+          McpProviderSession.McpProviderSessionConfig | null
         >();
+        const currentMcpSession = (threadId: ThreadId) => {
+          const current = McpProviderSession.readMcpProviderSession(threadId);
+          return current?.providerInstanceId === adapterOptions.instanceId ? current : undefined;
+        };
         const threadRuntimeParams = (params: Parameters<typeof codexThreadRuntimeParams>[0]) =>
           Effect.gen(function* () {
             yield* ensureInitialized;
-            const currentSession =
-              params.threadId === null
-                ? undefined
-                : McpProviderSession.readMcpProviderSession(params.threadId);
             const session =
-              currentSession?.providerInstanceId === adapterOptions.instanceId
-                ? currentSession
-                : undefined;
+              params.threadId === null ? undefined : currentMcpSession(params.threadId);
             const cwd = params.runtimePolicy?.cwd ?? input.runtimePolicy.cwd;
             const bridgetMcpServer = yield* prepareCodexBridgetMcp({
               session,
@@ -1832,11 +1830,9 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             );
             // A rotation during policy lookup invalidates this candidate's private mount.
             const stillCurrent =
-              params.threadId !== null &&
-              McpProviderSession.readMcpProviderSession(params.threadId) === session;
+              params.threadId !== null && currentMcpSession(params.threadId) === session;
             if (params.threadId !== null) {
-              if (stillCurrent && session !== undefined)
-                bridgetCredentialsByThread.set(params.threadId, session);
+              if (stillCurrent) bridgetCredentialsByThread.set(params.threadId, session ?? null);
               else bridgetCredentialsByThread.delete(params.threadId);
             }
             return codexThreadRuntimeParams({
@@ -6244,6 +6240,77 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           );
         });
 
+        const resumeNativeThread = (input: {
+          readonly providerThread: OrchestrationV2ProviderThread;
+          readonly threadId: ThreadId | null;
+          readonly modelSelection?: ModelSelection;
+          readonly runtimePolicy?: ProviderAdapterV2RuntimePolicy;
+        }) =>
+          Effect.gen(function* () {
+            const nativeThreadId = yield* getNativeThreadId(input.providerThread);
+            // excludeTurns is not in the generated request schema yet.
+            const resume = client.raw.request("thread/resume", {
+              threadId: nativeThreadId,
+              excludeTurns: true,
+              ...(yield* threadRuntimeParams({
+                threadId: input.threadId,
+                ...(input.modelSelection === undefined
+                  ? {}
+                  : { modelSelection: input.modelSelection }),
+                ...(input.runtimePolicy === undefined
+                  ? {}
+                  : { runtimePolicy: input.runtimePolicy }),
+              })),
+            });
+            return yield* ensureInitialized.pipe(
+              Effect.andThen(
+                resume.pipe(
+                  Effect.catchTags({
+                    CodexAppServerRequestError: (cause) => {
+                      if (
+                        !/\bsession \S+ is archived\b|\bcodex unarchive\b/i.test(cause.errorMessage)
+                      ) {
+                        return Effect.fail(cause);
+                      }
+                      // Keep the session's history without decoding the unarchive response.
+                      return client.raw
+                        .request("thread/unarchive", { threadId: nativeThreadId })
+                        .pipe(Effect.andThen(resume));
+                    },
+                  }),
+                ),
+              ),
+              Effect.flatMap(decodeCodexResumeMetadata),
+            );
+          });
+
+        const ensureCurrentBridgetCredential = (turnInput: ProviderAdapterV2TurnInput) =>
+          Effect.gen(function* () {
+            for (let attempt = 0; attempt < 2; attempt++) {
+              const current = currentMcpSession(turnInput.threadId);
+              if (
+                bridgetCredentialsByThread.has(turnInput.threadId) &&
+                bridgetCredentialsByThread.get(turnInput.threadId) === (current ?? null)
+              )
+                return current;
+              yield* resumeNativeThread({
+                providerThread: turnInput.providerThread,
+                threadId: turnInput.threadId,
+                modelSelection: turnInput.modelSelection,
+                runtimePolicy: turnInput.runtimePolicy,
+              });
+            }
+            const current = currentMcpSession(turnInput.threadId);
+            if (
+              bridgetCredentialsByThread.has(turnInput.threadId) &&
+              bridgetCredentialsByThread.get(turnInput.threadId) === (current ?? null)
+            )
+              return current;
+            return yield* toProtocolError(
+              "Bridget identity changed while remounting the native Codex thread.",
+            );
+          });
+
         /** Starts a native turn with this run's full turn configuration. */
         const startNativeTurn = (
           turnInput: ProviderAdapterV2TurnInput,
@@ -6251,7 +6318,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
         ) =>
           Effect.gen(function* () {
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
-            const mcpSession = McpProviderSession.readMcpProviderSession(turnInput.threadId);
+            const mcpSession = yield* ensureCurrentBridgetCredential(turnInput);
             const turnStartParams = yield* buildCodexTurnStartParams({
               nativeThreadId: threadId,
               codexInput,
@@ -6582,43 +6649,16 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             ),
           resumeThread: (threadInput) =>
             Effect.gen(function* () {
-              const nativeThreadId = yield* getNativeThreadId(threadInput.providerThread);
-              // excludeTurns is not in the generated request schema yet.
-              const resume = client.raw.request("thread/resume", {
-                threadId: nativeThreadId,
-                excludeTurns: true,
-                ...(yield* threadRuntimeParams({
-                  threadId: threadInput.threadId ?? threadInput.providerThread.appThreadId,
-                  ...(threadInput.modelSelection === undefined
-                    ? {}
-                    : { modelSelection: threadInput.modelSelection }),
-                  ...(threadInput.runtimePolicy === undefined
-                    ? {}
-                    : { runtimePolicy: threadInput.runtimePolicy }),
-                })),
+              const response = yield* resumeNativeThread({
+                providerThread: threadInput.providerThread,
+                threadId: threadInput.threadId ?? threadInput.providerThread.appThreadId,
+                ...(threadInput.modelSelection === undefined
+                  ? {}
+                  : { modelSelection: threadInput.modelSelection }),
+                ...(threadInput.runtimePolicy === undefined
+                  ? {}
+                  : { runtimePolicy: threadInput.runtimePolicy }),
               });
-              const response = yield* ensureInitialized.pipe(
-                Effect.andThen(
-                  resume.pipe(
-                    Effect.catchTags({
-                      CodexAppServerRequestError: (cause) => {
-                        if (
-                          !/\bsession \S+ is archived\b|\bcodex unarchive\b/i.test(
-                            cause.errorMessage,
-                          )
-                        ) {
-                          return Effect.fail(cause);
-                        }
-                        // Keep the session's history without decoding the unarchive response.
-                        return client.raw
-                          .request("thread/unarchive", { threadId: nativeThreadId })
-                          .pipe(Effect.andThen(resume));
-                      },
-                    }),
-                  ),
-                ),
-                Effect.flatMap(decodeCodexResumeMetadata),
-              );
               // Codex follows a resume with a goal snapshot notification; the
               // run's first turn writes it if it differs from the stored goal.
               return {
