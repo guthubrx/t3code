@@ -11,6 +11,7 @@ import {
   ORCHESTRATION_PROTOCOL_HEADER,
   ORCHESTRATION_PROTOCOL_VERSION,
   OrchestrationV2ThreadBoundedSnapshot,
+  OrchestrationV2ThreadDetailSnapshot,
   OrchestrationV2ThreadStreamItem,
   ProjectId,
   ProviderDriverKind,
@@ -43,6 +44,9 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 
+const decodeFull = Schema.decodeUnknownSync(
+  Schema.fromJsonString(Schema.toCodecJson(OrchestrationV2ThreadDetailSnapshot)),
+);
 const decodeBounded = Schema.decodeUnknownSync(
   Schema.fromJsonString(Schema.toCodecJson(OrchestrationV2ThreadBoundedSnapshot)),
 );
@@ -80,16 +84,17 @@ const management = Layer.unwrap(
 class OrchestrationApi extends HttpApi.make("environment").add(
   EnvironmentHttpApi.groups.orchestration,
 ) {}
-const auth = Layer.succeed(EnvironmentAuthenticatedAuth, (effect) =>
-  effect.pipe(
-    Effect.provideService(EnvironmentAuthenticatedPrincipal, {
-      sessionId: AuthSessionId.make("compact-transport"),
-      subject: "compact-transport",
-      method: "browser-session-cookie",
-      scopes: new Set([AuthOrchestrationReadScope]),
-    }),
-  ),
-);
+const auth = (subject: string) =>
+  Layer.succeed(EnvironmentAuthenticatedAuth, (effect) =>
+    effect.pipe(
+      Effect.provideService(EnvironmentAuthenticatedPrincipal, {
+        sessionId: AuthSessionId.make("compact-transport"),
+        subject,
+        method: "browser-session-cookie",
+        scopes: new Set([AuthOrchestrationReadScope]),
+      }),
+    ),
+  );
 
 function threadCreated(id: ThreadId, at: DateTime.Utc, forkOf?: RunId): OrchestrationV2DomainEvent {
   return {
@@ -232,12 +237,15 @@ const TestLayer = Layer.mergeAll(
   Layer.mock(ProjectEnrichmentService.ProjectEnrichmentService)({}),
 ).pipe(Layer.provideMerge(store));
 
-const withHttp = <A>(use: (get: (path: string) => Promise<Response>) => Promise<A>) =>
+const withHttp = <A>(
+  use: (get: (path: string) => Promise<Response>) => Promise<A>,
+  subject = "compact-transport",
+) =>
   Effect.gen(function* () {
     const context = yield* Effect.context<Layer.Success<typeof TestLayer>>();
     const appLayer = HttpApiBuilder.layer(OrchestrationApi).pipe(
       Layer.provide(OrchestrationHttp.layer),
-      Layer.provide(auth),
+      Layer.provide(auth(subject)),
       Layer.provide(Layer.succeedContext(context)),
       Layer.provide(NodeHttpPlatform.layer),
       Layer.provide(Etag.layerWeak),
@@ -278,6 +286,92 @@ function itemIds(projection: OrchestrationV2ThreadProjection): string[] {
 }
 
 it.layer(TestLayer)("compact bounded snapshot transport", (it) => {
+  it.effect(
+    "HTTP169: full Bridget snapshots omit only visibleTurnItems and keep bounded responses unchanged",
+    () =>
+      Effect.gen(function* () {
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const at = yield* DateTime.now;
+        const rootNodeId = NodeId.make(`node:${longRun}`);
+        yield* projections.apply({
+          id: EventId.make("event:http169:node"),
+          type: "node.updated",
+          threadId: LONG,
+          runId: longRun,
+          nodeId: rootNodeId,
+          driver: ProviderDriverKind.make("codex"),
+          occurredAt: at,
+          payload: {
+            id: rootNodeId,
+            threadId: LONG,
+            runId: longRun,
+            parentNodeId: null,
+            rootNodeId,
+            kind: "root_turn",
+            status: "completed",
+            countsForRun: true,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt: at,
+            completedAt: at,
+          },
+        });
+        yield* projections.apply({
+          id: EventId.make("event:http169:message"),
+          type: "message.updated",
+          threadId: LONG,
+          runId: longRun,
+          nodeId: rootNodeId,
+          driver: ProviderDriverKind.make("codex"),
+          occurredAt: at,
+          payload: {
+            createdBy: "user",
+            creationSource: "web",
+            id: MessageId.make(`message:${longRun}`),
+            threadId: LONG,
+            runId: longRun,
+            nodeId: rootNodeId,
+            role: "user",
+            text: "Bridget full snapshot fixture",
+            attachments: [],
+            streaming: false,
+            createdAt: at,
+            updatedAt: at,
+          },
+        });
+        const path = `/api/orchestration/threads/${encodeURIComponent(LONG)}`;
+        const ordinary = yield* withHttp(async (get) => {
+          const full = await get(path);
+          const bounded = await get(`${path}/bounded`);
+          assert.strictEqual(full.status, 200);
+          assert.strictEqual(bounded.status, 200);
+          return { fullBody: await full.text(), boundedBody: await bounded.text() };
+        });
+        const bridget = yield* withHttp(async (get) => {
+          const full = await get(path);
+          const bounded = await get(`${path}/bounded`);
+          assert.strictEqual(full.status, 200);
+          assert.strictEqual(bounded.status, 200);
+          return { fullBody: await full.text(), boundedBody: await bounded.text() };
+        }, "bridget");
+        const full = decodeFull(ordinary.fullBody);
+        assert.isAbove(full.projection.visibleTurnItems.length, 0);
+        assert.isAbove(full.projection.runs.length, 0);
+        assert.isAbove(full.projection.nodes.length, 0);
+        assert.isAbove(full.projection.messages.length, 0);
+        assert.isAbove(full.projection.turnItems.length, 0);
+        assert.deepStrictEqual(decodeFull(bridget.fullBody), {
+          ...full,
+          projection: { ...full.projection, visibleTurnItems: [] },
+        });
+        assert.isBelow(bridget.fullBody.length, ordinary.fullBody.length);
+        assert.strictEqual(bridget.boundedBody, ordinary.boundedBody);
+      }),
+  );
+
   describe.each([
     ["fork", FORK],
     ["long run with a retained interrupt request", LONG],

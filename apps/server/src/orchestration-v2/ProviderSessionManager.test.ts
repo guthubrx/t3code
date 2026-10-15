@@ -13,7 +13,8 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
-  type ProviderSessionId,
+  ProviderSessionId,
+  RunId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -39,6 +40,10 @@ import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ServerConfig169 from "../config.ts";
+import * as ServerSecretStore169 from "../auth/ServerSecretStore.ts";
+import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
+import { buildCodexTurnStartParams } from "./Adapters/CodexAdapterV2.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
@@ -47,6 +52,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import {
   ProviderAdapterEventStreamError,
   type ProviderAdapterV2Event,
+  type ProviderAdapterV2TurnInput,
   ProviderAdapterProtocolError,
   type ProviderAdapterV2RuntimePolicy,
   type ProviderAdapterV2SessionRuntime,
@@ -322,6 +328,7 @@ function makeProviderAdapter(
     readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
     readonly hangSessionScopeClose?: boolean;
     readonly startTurn?: Effect.Effect<void>;
+    readonly onStartTurn?: (input: ProviderAdapterV2TurnInput) => Effect.Effect<void>;
     readonly beforeUnload?: Effect.Effect<void>;
     /** Registers the process's closeCount finalizer before `beforeOpen` runs. */
     readonly spawnBeforeOpen?: boolean;
@@ -419,7 +426,7 @@ function makeProviderAdapter(
               ...current,
               resumeCount: current.resumeCount + 1,
             })).pipe(Effect.as(threadInput.providerThread)),
-          startTurn: () => options.startTurn ?? Effect.void,
+          startTurn: (input) => options.onStartTurn?.(input) ?? options.startTurn ?? Effect.void,
           steerTurn: () => Effect.void,
           interruptTurn: () =>
             Ref.update(state, (current) => ({
@@ -472,6 +479,8 @@ function layerTest(input: {
   readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
   readonly hangSessionScopeClose?: boolean;
   readonly startTurn?: Effect.Effect<void>;
+  readonly onStartTurn?: (input: ProviderAdapterV2TurnInput) => Effect.Effect<void>;
+  readonly configureMcp?: boolean;
   readonly beforeUnload?: Effect.Effect<void>;
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
@@ -502,6 +511,7 @@ function layerTest(input: {
         ? {}
         : { hangSessionScopeClose: input.hangSessionScopeClose }),
       ...(input.startTurn === undefined ? {} : { startTurn: input.startTurn }),
+      ...(input.onStartTurn === undefined ? {} : { onStartTurn: input.onStartTurn }),
       ...(input.beforeUnload === undefined ? {} : { beforeUnload: input.beforeUnload }),
       ...(input.spawnBeforeOpen === undefined ? {} : { spawnBeforeOpen: input.spawnBeforeOpen }),
       ...(input.scopeCloseReached === undefined
@@ -530,6 +540,7 @@ function layerTest(input: {
     layerConfiguredMcpRegistry,
     ProviderSessionManager.layerWithOptions({
       idleTimeoutMs: input.idleTimeoutMs,
+      ...(input.configureMcp === undefined ? {} : { configureMcp: input.configureMcp }),
       ...(input.maxIdlePinMs === undefined ? {} : { maxIdlePinMs: input.maxIdlePinMs }),
     }).pipe(
       Layer.provide(
@@ -4594,4 +4605,123 @@ it.effect(
       });
       assert.isFalse(denied?.capabilities?.has("device"));
     }),
+);
+
+it.effect.each([false, true])(
+  "SPEC169 reads real file changes on an already attached turn (MCP %s)",
+  (configureMcp) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const settings = yield* ServerSettings.ServerSettingsService;
+      const config = yield* ServerConfig169.ServerConfig;
+      yield* settings.start;
+      const changes = yield* settings.subscribeChanges;
+      const fs = yield* FileSystem.FileSystem;
+      const observed: Array<{
+        text: string;
+        preference: ProviderAdapterV2TurnInput["bridgetDelegationPreference"];
+        config: McpProviderSession.McpProviderSessionConfig | undefined;
+      }> = [];
+      yield* Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        const threadId = ThreadId.make("thread169-toggle");
+        const providerSessionId = ProviderSessionId.make("session169-toggle");
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        const providerThread = makeProviderThread({
+          idAllocator: ids,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        const appThread = { id: threadId } as ProviderAdapterV2TurnInput["appThread"];
+        for (const [ordinal, contents, expected] of [
+          [1, '{"preferBridgetDelegation":false}', "off"],
+          [2, '{"preferBridgetDelegation":true}', "prefer"],
+          [3, '{"preferBridgetDelegation":false}', "off"],
+          [4, '{"preferBridgetDelegation":', "blocked"],
+          [5, "{}", "off"],
+        ] as const) {
+          yield* writeFileStringAtomically({ filePath: config.settingsPath, contents });
+          yield* changes.pipe(Stream.runHead, Effect.timeout("2 seconds"));
+          const runId = RunId.make("run169-" + ordinal);
+          yield* runtime.startTurn({
+            appThread,
+            threadId,
+            providerThread,
+            runId,
+            runOrdinal: ordinal,
+            providerTurnOrdinal: ordinal,
+            attemptId: ids.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+            rootNodeId: ids.derive.rootNode({ runId }),
+            message: {
+              createdBy: "user",
+              creationSource: "web",
+              messageId: yield* ids.allocate.message({ threadId, ordinal }),
+              text: "Continue",
+              attachments: [],
+            },
+            modelSelection,
+            runtimePolicy,
+          });
+          assert.equal(observed.at(-1)?.preference, expected);
+          if (expected !== "off") assert.include(observed.at(-1)!.text, "preference: blocked");
+          else {
+            assert.notInclude(observed.at(-1)!.text, "preference: blocked");
+            if (!configureMcp)
+              assert.include(observed.at(-1)!.text, "preference is off for this turn");
+          }
+        }
+        assert.equal((yield* Ref.get(state)).openCount, 1);
+        for (const turn of observed) assert.strictEqual(turn.config, observed[0]!.config);
+        if (!configureMcp) assert.isUndefined(observed[0]!.config);
+        assert.equal(yield* fs.readFileString(config.settingsPath), "{}");
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60_000,
+            configureMcp,
+            serverSettingsLayer: Layer.succeed(ServerSettings.ServerSettingsService, settings),
+            onStartTurn: (input) =>
+              Effect.gen(function* () {
+                const config = McpProviderSession.readMcpProviderSession(input.threadId);
+                const params = yield* buildCodexTurnStartParams({
+                  nativeThreadId: "native169",
+                  codexInput: [{ type: "text", text: input.message.text }],
+                  modelSelection: input.modelSelection,
+                  runtimePolicy: input.runtimePolicy,
+                  hasT3Mcp: config !== undefined,
+                  hasBridgetMcp: false,
+                  bridgetDelegationPreference: input.bridgetDelegationPreference,
+                }).pipe(Effect.orDie);
+                observed.push({
+                  text: params.additionalContext?.t3_code_orchestration?.value ?? "",
+                  preference: input.bridgetDelegationPreference,
+                  config,
+                });
+              }),
+          }),
+        ),
+      );
+    }).pipe(
+      Effect.scoped,
+      TestClock.withLive,
+      Effect.provide(
+        ServerSettings.layer.pipe(
+          Layer.provide(ServerSecretStore169.layer),
+          Layer.provide(SqlitePersistence.layerMemory),
+          Layer.provideMerge(
+            ServerConfig169.layerTest(process.cwd(), { prefix: "t3-manager169-" }),
+          ),
+        ),
+      ),
+      Effect.provide(NodeServices.layer),
+    ),
 );

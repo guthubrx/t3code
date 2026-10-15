@@ -125,3 +125,14 @@ it("preserves code indentation and line breaks when expanding a skill", () => {
     "/skill:review ```ts\n  const x = 1;\n```",
   );
 });
+
+it("SPEC169 keeps the private policy control out of user slash commands", () => {
+  const parsed = parsePiDiscoveredCommands({
+    commands: [
+      { name: "t3-bridget-policy", source: "extension" },
+      { name: "t3-bridget-policy:1", source: "extension" },
+      { name: "hello", source: "extension" },
+    ],
+  });
+  expect(parsed.slashCommands.map((command) => command.name)).toEqual(["hello"]);
+});

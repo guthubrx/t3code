@@ -5,6 +5,7 @@ import {
   t3AcpPromptWithInstructions,
   t3OrchestrationPromptForFirstRun,
   t3OrchestrationSystemPrompt,
+  t3OrchestrationInstructions,
 } from "./orchestrationInstructions.ts";
 
 describe("T3 orchestration provider instructions", () => {
@@ -26,7 +27,7 @@ describe("T3 orchestration provider instructions", () => {
     assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "bindToCurrentThread=false");
   });
 
-  it("injects prompt fallback only for an MCP-enabled first run", () => {
+  it("injects the current mode initially and skips an unchanged known policy", () => {
     const prompt = "Inspect the repository.";
     const injected = t3OrchestrationPromptForFirstRun({
       prompt,
@@ -37,12 +38,17 @@ describe("T3 orchestration provider instructions", () => {
     assert.include(injected, "<t3_code_orchestration_instructions>");
     assert.include(injected, `<user_request>\n${prompt}\n</user_request>`);
     assert.equal(
-      t3OrchestrationPromptForFirstRun({ prompt, runOrdinal: 2, hasT3Mcp: true }),
+      t3OrchestrationPromptForFirstRun({
+        prompt,
+        runOrdinal: 2,
+        hasT3Mcp: true,
+        previousPreference: "off",
+      }),
       prompt,
     );
-    assert.equal(
+    assert.include(
       t3OrchestrationPromptForFirstRun({ prompt, runOrdinal: 1, hasT3Mcp: false }),
-      prompt,
+      "preference is off for this turn",
     );
   });
 
@@ -86,5 +92,121 @@ describe("T3 orchestration provider instructions", () => {
     assert.include(withoutMcp, "T3 Code interaction mode: Default");
     assert.notInclude(withoutMcp, "T3 Code collaborative browser");
     assert.notInclude(withoutMcp, "T3 Code orchestration");
+  });
+});
+
+describe("SPEC169 delegation guidance", () => {
+  it("R2 resets unknown persisted policies without inventing missing MCP tools", () => {
+    const prompt = "Resume existing work";
+    const off = t3OrchestrationInstructions({
+      bridgetDelegationPreference: "off",
+      hasT3Mcp: false,
+    });
+    assert.include(off, "preference is off for this turn");
+    assert.notInclude(off, "orchestrator_capabilities");
+    for (const hasT3Mcp of [false, true]) {
+      const resumed = t3OrchestrationPromptForFirstRun({ prompt, runOrdinal: 8, hasT3Mcp });
+      assert.include(
+        resumed,
+        hasT3Mcp ? "Prefer native subagent tools" : "preference is off for this turn",
+      );
+      assert.equal(
+        t3OrchestrationPromptForFirstRun({ prompt: "/compact", runOrdinal: 8, hasT3Mcp }),
+        "/compact",
+      );
+      const acp = t3AcpPromptWithInstructions({
+        prompt,
+        state: { interactionMode: "default", hasT3Mcp },
+      });
+      assert.include(
+        acp,
+        hasT3Mcp ? "Prefer native subagent tools" : "preference is off for this turn",
+      );
+    }
+  });
+  it("keeps the legacy OFF text byte-identical and removes conflicting ON routes", () => {
+    assert.strictEqual(t3OrchestrationInstructions(), T3_CODE_ORCHESTRATION_INSTRUCTIONS);
+    const preferred = t3OrchestrationInstructions({
+      bridgetDelegationPreference: "prefer",
+      hasBridgetMcp: true,
+    });
+    assert.include(preferred, "bridget_auto_delegate");
+    for (const obsolete of [
+      "Prefer native subagent tools",
+      "Use `delegate_task` with that provider",
+      "For every T3 delegated review round",
+      "you delegate or dedupe",
+      "before reporting that the capability is absent",
+      "acp-mcp-call delegate_task",
+    ])
+      assert.notInclude(preferred, obsolete);
+    for (const retained of [
+      "ordinary top-level T3 conversations",
+      "schedule_task",
+      "request_secret",
+      "Showing visuals",
+    ])
+      assert.include(preferred, retained);
+    for (const constraint of [
+      "every unspecified fleet",
+      "explicit human constraint",
+      "expected_base_commit",
+      "parent model",
+      "idempotency key",
+      "original engine",
+    ])
+      assert.include(preferred, constraint);
+    assert.include(preferred, "one bounded tool-catalog discovery attempt");
+    assert.include(preferred, "Never silently fall back");
+  });
+  it("blocks an unavailable or untrusted route without inventing a T3 mount", () => {
+    for (const preference of ["prefer", "blocked"] as const) {
+      const text = t3OrchestrationSystemPrompt(false, { bridgetDelegationPreference: preference });
+      assert.include(text!, "preference: blocked");
+      assert.include(text!, "Stop new delegated work");
+      assert.include(text!, "task_status");
+      assert.include(text!, "task_cancel");
+      assert.notInclude(text!, "The `t3-code` MCP server provides");
+    }
+  });
+  it("reinjects ACP and first-prompt guidance after each policy transition, preserving slash commands", () => {
+    const off = {
+      interactionMode: "default",
+      hasT3Mcp: true,
+      bridgetDelegationPreference: "off",
+    } as const;
+    const on = { ...off, bridgetDelegationPreference: "prefer" } as const;
+    assert.include(
+      t3AcpPromptWithInstructions({ prompt: "Continue", state: on, previousState: off }),
+      "preference: blocked",
+    );
+    assert.include(
+      t3AcpPromptWithInstructions({ prompt: "Continue", state: off, previousState: on }),
+      "Prefer native subagent tools",
+    );
+    assert.equal(
+      t3AcpPromptWithInstructions({ prompt: "/compact", state: on, previousState: off }),
+      "/compact",
+    );
+    assert.include(
+      t3OrchestrationPromptForFirstRun({
+        prompt: "Continue",
+        runOrdinal: 2,
+        hasT3Mcp: true,
+        previousPreference: "off",
+        bridgetDelegationPreference: "prefer",
+      }),
+      "preference: blocked",
+    );
+    assert.equal(
+      t3OrchestrationPromptForFirstRun({
+        prompt: "/model example",
+        runOrdinal: 2,
+        hasT3Mcp: true,
+        previousPreference: "off",
+        bridgetDelegationPreference: "prefer",
+      }),
+      "/model example",
+    );
   });
 });

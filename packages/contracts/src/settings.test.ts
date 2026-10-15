@@ -1044,3 +1044,16 @@ describe("ServerSettings.removeAgentCreditsOnMerge", () => {
     ).toBe(true);
   });
 });
+
+describe("SPEC169 file-only Bridget delegation preference", () => {
+  it("defaults off, preserves explicit file values and excludes the patch API", () => {
+    expect(decodeServerSettings({}).preferBridgetDelegation).toBe(false);
+    for (const value of [false, true]) {
+      expect(decodeServerSettings({ preferBridgetDelegation: value }).preferBridgetDelegation).toBe(
+        value,
+      );
+      expect(decodeServerSettingsPatch({ preferBridgetDelegation: value })).toEqual({});
+    }
+    expect(() => decodeServerSettings({ preferBridgetDelegation: "true" })).toThrow();
+  });
+});

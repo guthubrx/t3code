@@ -1,5 +1,6 @@
 import { type ServerProviderSkill, type ServerProviderSlashCommand } from "@t3tools/contracts";
 import * as Predicate from "effect/Predicate";
+import { PI_DELEGATION_POLICY_COMMAND } from "./mcpExtensionSource.ts";
 
 // Pi RPC get_commands omits TUI builtins. Advertise /compact so T3 can map it to RPC compact.
 export const PI_COMPACT_SLASH_COMMAND: ServerProviderSlashCommand = {
@@ -50,7 +51,13 @@ export function parsePiDiscoveredCommands(data: unknown): PiDiscoveredCommands {
   const skills: Array<ServerProviderSkill> = [];
   for (const command of commands) {
     const commandName = recordString(command, "name");
-    if (commandName === undefined || commandName.length === 0) continue;
+    if (
+      commandName === undefined ||
+      commandName.length === 0 ||
+      commandName === PI_DELEGATION_POLICY_COMMAND ||
+      commandName.startsWith(PI_DELEGATION_POLICY_COMMAND + ":")
+    )
+      continue;
     const description = recordString(command, "description");
     if (recordString(command, "source") === "skill") {
       const name = commandName.startsWith("skill:")

@@ -1,4 +1,5 @@
 import type { ProviderInteractionMode } from "@t3tools/contracts";
+import type { BridgetDelegationPreference } from "./ProviderAdapter.ts";
 
 export const T3_CODE_ORCHESTRATION_INSTRUCTIONS = `
 
@@ -36,6 +37,58 @@ ACP fallback: some ACP agents accept the injected MCP server but fail to expose 
 When a chart, table, diagram, image collage, or mockup would say more than prose, build a self-contained HTML page, check it with \`html_preview\`, then publish it with \`html_render\` before your final reply. The reader sees the page above that reply, so don't announce or restate it; add only what it doesn't say.
 `;
 
+export interface T3DelegationInstructionState {
+  readonly bridgetDelegationPreference?: BridgetDelegationPreference | undefined;
+  /** A verified private mount, not a guarantee of daemon availability or admission. */
+  readonly hasBridgetMcp?: boolean | undefined;
+  readonly hasT3Mcp?: boolean;
+}
+
+const BRIDGET_DELEGATION_RULES = `
+For this turn, use Bridget for new delegated work unless the user explicitly requests a T3-owned task. Use only the verified Bridget MCP tool \`bridget_auto_delegate\`; never invoke a same-named tool from a foreign server. If this tool loads lazily, make one bounded tool-catalog discovery attempt before declaring it absent. Do not start a model to discover a tool.
+
+Let Bridget choose every unspecified fleet, provider, account, model and reasoning axis from its current catalog. Preserve each explicit human constraint, including \`workspace\` and \`expected_base_commit\` (the source commit SHA) when imposed. Use only the documented automatic delegation fields; do not invent a catalog or policy hash argument. Do not force the parent model onto the child. If a constraint cannot be satisfied, report the named constraint instead of weakening it.
+
+Preserve the returned task ID, request/idempotency key, decision and execution references. On a lost response or retry, inspect and replay the same request using those references before creating any new work. For a new review round, create a new Bridget request with the full brief, prior findings and unresolved objections.
+
+An absent tool, unavailable daemon, disabled mount, invalid policy, denied permission or refused admission stops the requested delegation: report the reason and continue any independent work already authorized. Never silently fall back to T3 \`delegate_task\`, native provider subagents, a terminal command or another host. This preference grants no permission and performs no automatic dispatch.
+
+Keep existing work on its original engine. Manage existing T3 task IDs with \`task_status\` / \`task_cancel\`; manage existing Bridget task IDs with Bridget's status, journal, result and cancellation tools. Changing this preference never migrates, duplicates or restarts a task. Explicitly requested T3-owned delegation remains available through its existing tools. Ordinary top-level T3 threads, browser work and scheduling keep their existing purposes.`;
+
+const BRIDGET_BLOCKED_INSTRUCTIONS = `
+## Bridget delegation preference: blocked
+
+For this turn, Bridget delegation cannot be selected because the routing preference is unreadable or the verified Bridget MCP mount is unavailable. Stop new delegated work and report this limitation explicitly. Do not silently use T3 \`delegate_task\`, native provider subagents or a terminal fallback. Existing tasks stay on their original engine: manage existing T3 task IDs with \`task_status\` / \`task_cancel\`, and existing Bridget task IDs with Bridget status, journal, result and cancellation tools. Preserve their IDs and replay references; never recreate their work. An explicit user request for T3-owned work is still handled through the existing T3 tools when available.`;
+
+const BRIDGET_OFF_INSTRUCTIONS =
+  "The Bridget delegation preference is off for this turn. Resume the usual delegation choices and keep existing tasks on their original engine.";
+
+/** O(1): transforms a fixed application-owned text; no user data or credentials enter it. */
+export function t3OrchestrationInstructions(input: T3DelegationInstructionState = {}): string {
+  if ((input.bridgetDelegationPreference ?? "off") === "off")
+    return input.hasT3Mcp === false ? BRIDGET_OFF_INSTRUCTIONS : T3_CODE_ORCHESTRATION_INSTRUCTIONS;
+  const policy =
+    input.bridgetDelegationPreference === "prefer" && input.hasBridgetMcp === true
+      ? "## Bridget delegation preference: prefer\n" + BRIDGET_DELEGATION_RULES
+      : BRIDGET_BLOCKED_INSTRUCTIONS;
+  if (input.hasT3Mcp === false) return policy;
+  // Replace all historical delegation directives, rather than appending a conflicting preference.
+  const ordinaryInstructions = T3_CODE_ORCHESTRATION_INSTRUCTIONS.split("\n")
+    .filter(
+      (line) =>
+        !line.startsWith("- A delegated task/subagent") &&
+        !line.startsWith("- For every T3 delegated review round") &&
+        !line.startsWith("Tool names may include") &&
+        !line.startsWith("ACP fallback:"),
+    )
+    .join("\n")
+    .replace(
+      "which suits orchestrating: each trigger arrives here and you delegate or dedupe",
+      "each trigger returns here; apply this turn's delegation policy to any new child work",
+    );
+  return ordinaryInstructions + "\n" + policy;
+}
+
 export const T3_CODE_BROWSER_TOOL_INSTRUCTIONS = `
 
 ## T3 Code collaborative browser
@@ -63,6 +116,7 @@ Investigate with read-only actions and do not edit files or otherwise execute th
 export interface T3AcpInstructionState {
   readonly interactionMode: ProviderInteractionMode;
   readonly hasT3Mcp: boolean;
+  readonly bridgetDelegationPreference?: BridgetDelegationPreference | undefined;
 }
 
 /**
@@ -78,7 +132,9 @@ export function t3AcpPromptWithInstructions(input: {
   if (input.prompt.trimStart().startsWith("/")) return input.prompt;
   if (
     input.previousState?.interactionMode === input.state.interactionMode &&
-    input.previousState.hasT3Mcp === input.state.hasT3Mcp
+    input.previousState.hasT3Mcp === input.state.hasT3Mcp &&
+    (input.previousState.bridgetDelegationPreference ?? "off") ===
+      (input.state.bridgetDelegationPreference ?? "off")
   ) {
     return input.prompt;
   }
@@ -86,9 +142,13 @@ export function t3AcpPromptWithInstructions(input: {
     input.state.interactionMode === "plan"
       ? T3_CODE_ACP_PLAN_MODE_INSTRUCTIONS
       : T3_CODE_ACP_DEFAULT_MODE_INSTRUCTIONS,
-    ...(input.state.hasT3Mcp
-      ? [T3_CODE_BROWSER_TOOL_INSTRUCTIONS.trim(), T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim()]
-      : []),
+    ...(input.state.hasT3Mcp ? [T3_CODE_BROWSER_TOOL_INSTRUCTIONS.trim()] : []),
+    ...(input.state.hasT3Mcp || (input.state.bridgetDelegationPreference ?? "off") !== "off"
+      ? [t3OrchestrationInstructions({ ...input.state, hasBridgetMcp: false }).trim()]
+      : input.previousState === undefined ||
+          (input.previousState.bridgetDelegationPreference ?? "off") !== "off"
+        ? [BRIDGET_OFF_INSTRUCTIONS]
+        : []),
   ];
   return `<t3_code_instructions>\n${instructions.join("\n\n")}\n</t3_code_instructions>\n\n<user_request>\n${input.prompt}\n</user_request>`;
 }
@@ -98,20 +158,33 @@ export function t3AcpPromptWithInstructions(input: {
  * context in the first prompt. Keep the wrapper explicit so it cannot be
  * mistaken for text authored by the user.
  */
-function prependT3OrchestrationInstructions(prompt: string): string {
-  return `<t3_code_orchestration_instructions>${T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim()}</t3_code_orchestration_instructions>\n\n<user_request>\n${prompt}\n</user_request>`;
+function prependT3OrchestrationInstructions(prompt: string, instructions: string): string {
+  return `<t3_code_orchestration_instructions>${instructions.trim()}</t3_code_orchestration_instructions>\n\n<user_request>\n${prompt}\n</user_request>`;
 }
 
 export function t3OrchestrationPromptForFirstRun(input: {
   readonly prompt: string;
   readonly runOrdinal: number;
   readonly hasT3Mcp: boolean;
+  readonly bridgetDelegationPreference?: BridgetDelegationPreference | undefined;
+  readonly previousPreference?: BridgetDelegationPreference | undefined;
 }): string {
-  return input.runOrdinal === 1 && input.hasT3Mcp
-    ? prependT3OrchestrationInstructions(input.prompt)
-    : input.prompt;
+  if (input.prompt.trimStart().startsWith("/")) return input.prompt;
+  const preference = input.bridgetDelegationPreference ?? "off";
+  if (input.runOrdinal !== 1 && input.previousPreference === preference) return input.prompt;
+  // A resumed native conversation can retain ON while this process has no prior state.
+  // Send the current OFF explicitly before its first ordinary prompt, even without MCP.
+  return prependT3OrchestrationInstructions(
+    input.prompt,
+    t3OrchestrationSystemPrompt(input.hasT3Mcp, input) ?? BRIDGET_OFF_INSTRUCTIONS,
+  );
 }
 
-export function t3OrchestrationSystemPrompt(hasT3Mcp: boolean): string | undefined {
-  return hasT3Mcp ? T3_CODE_ORCHESTRATION_INSTRUCTIONS : undefined;
+export function t3OrchestrationSystemPrompt(
+  hasT3Mcp: boolean,
+  delegation: T3DelegationInstructionState = {},
+): string | undefined {
+  return hasT3Mcp || (delegation.bridgetDelegationPreference ?? "off") !== "off"
+    ? t3OrchestrationInstructions({ ...delegation, hasT3Mcp })
+    : undefined;
 }

@@ -2199,6 +2199,7 @@ it.layer(
         start: Effect.void,
         ready: Effect.void,
         getSettings: Effect.fail(settingsError),
+        getBridgetDelegationPreference: Effect.fail(settingsError),
         updateSettings: () => Effect.fail(settingsError),
         updateProviderInstance: () => Effect.fail(settingsError),
         withSettingsSnapshot: () => Effect.fail(settingsError),

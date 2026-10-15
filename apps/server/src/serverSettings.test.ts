@@ -1903,3 +1903,116 @@ it.layer(NodeServices.layer)("server settings", (it) => {
     }).pipe(Effect.provide(layerServerSettings())),
   );
 });
+
+it.layer(NodeServices.layer)("SPEC169 settings", (it) => {
+  it.effect("SPEC169 reads file-only ON and preserves it through an unrelated patch", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      yield* fs.writeFileString(config.settingsPath, '{"preferBridgetDelegation":true}');
+      assert.equal(yield* service.getBridgetDelegationPreference, "prefer");
+      yield* service.updateSettings({ responseStreamingMode: "turn" });
+      const raw = JSON.parse(yield* fs.readFileString(config.settingsPath));
+      assert.isTrue(raw.preferBridgetDelegation);
+      assert.equal(yield* service.getBridgetDelegationPreference, "prefer");
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect(
+    "SPEC169 refuses secret patches from an invalid file before any secret mutation",
+    () => {
+      let secretWrites = 0;
+      const layerSecrets = Layer.effect(
+        ServerSecretStore.ServerSecretStore,
+        Effect.gen(function* () {
+          const delegate = yield* ServerSecretStore.ServerSecretStore;
+          return ServerSecretStore.ServerSecretStore.of({
+            ...delegate,
+            set: (name, value) =>
+              Effect.sync(() => {
+                secretWrites++;
+              }).pipe(Effect.andThen(delegate.set(name, value))),
+            create: (name, value) =>
+              Effect.sync(() => {
+                secretWrites++;
+              }).pipe(Effect.andThen(delegate.create(name, value))),
+            remove: (name) =>
+              Effect.sync(() => {
+                secretWrites++;
+              }).pipe(Effect.andThen(delegate.remove(name))),
+          });
+        }),
+      ).pipe(Layer.provide(ServerSecretStore.layer));
+      const layerSettings = ServerSettingsModule.layer.pipe(
+        Layer.provide(layerSecrets),
+        Layer.provideMerge(Layer.fresh(SqlitePersistence.layerMemory)),
+        Layer.provideMerge(
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-settings169-invalid-" }),
+        ),
+      );
+      return Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const broken = '{"preferBridgetDelegation":false,';
+        yield* fs.writeFileString(config.settingsPath, broken);
+        assert.equal(yield* service.getBridgetDelegationPreference, "blocked");
+        const result = yield* service
+          .updateSettings({
+            providerInstances: {
+              [ProviderInstanceId.make("test169")]: {
+                driver: ProviderDriverKind.make("codex"),
+                config: {},
+                environment: [{ name: "TEST_SECRET", value: "fixture-value", sensitive: true }],
+              },
+            },
+          })
+          .pipe(Effect.exit);
+        assert.equal(result._tag, "Failure");
+        assert.equal(secretWrites, 0);
+        assert.equal(yield* fs.readFileString(config.settingsPath), broken);
+        assert.equal(yield* service.getBridgetDelegationPreference, "blocked");
+      }).pipe(Effect.provide(layerSettings));
+    },
+  );
+
+  it.effect("SPEC169 does not decode an I/O failure as an OFF preference", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      yield* fs.remove(config.settingsPath, { force: true });
+      yield* fs.makeDirectory(config.settingsPath);
+      assert.equal(
+        (yield* service.getBridgetDelegationPreference.pipe(Effect.exit))._tag,
+        "Failure",
+      );
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("SPEC169 reloads OFF, ON, invalid settings and valid repair in both directions", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const fs = yield* FileSystem.FileSystem;
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        yield* fs.remove(config.settingsPath, { force: true });
+        assert.equal(yield* service.getBridgetDelegationPreference, "off");
+        yield* service.start;
+        const changes = yield* service.subscribeChanges;
+        for (const [contents, expected] of [
+          ['{"preferBridgetDelegation":true}', "prefer"],
+          ['{"preferBridgetDelegation":false}', "off"],
+          ['{"preferBridgetDelegation":', "blocked"],
+          ['{"preferBridgetDelegation":true}', "prefer"],
+          ["{}", "off"],
+        ] as const) {
+          yield* writeFileStringAtomically({ filePath: config.settingsPath, contents });
+          yield* changes.pipe(Stream.runHead, Effect.timeout("2 seconds"));
+          assert.equal(yield* service.getBridgetDelegationPreference, expected);
+        }
+      }),
+    ).pipe(TestClock.withLive, Effect.provide(layerServerSettings())),
+  );
+});

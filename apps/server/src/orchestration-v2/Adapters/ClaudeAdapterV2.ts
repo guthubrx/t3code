@@ -126,7 +126,7 @@ import {
 } from "../../provider/claudeUsageLimits.ts";
 import type { ServerProviderShape } from "@t3tools/provider-core/server/snapshot";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
-import { T3_CODE_ORCHESTRATION_INSTRUCTIONS } from "@t3tools/provider-core/server/orchestrationInstructions";
+import { t3OrchestrationSystemPrompt } from "@t3tools/provider-core/server/orchestrationInstructions";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import {
   mcpToolPresentation,
@@ -339,6 +339,7 @@ export type ClaudeAgentSdkQueryOptions = Omit<
 
 export interface ClaudeAgentSdkQueryOpenInput {
   readonly options: ClaudeAgentSdkQueryOptions;
+  readonly bridgetDelegationPreference?: ProviderAdapter.ProviderAdapterV2TurnInput["bridgetDelegationPreference"];
   readonly threadId: ThreadId;
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
   /** Captured where the adapter builds the private MCP transport; never supplied by a tool. */
@@ -346,6 +347,8 @@ export interface ClaudeAgentSdkQueryOpenInput {
 }
 
 export interface ClaudeAgentSdkQuerySession {
+  /** Actual result of the private SDK preparation, never inferred from a credential. */
+  readonly bridgetMcpMounted?: boolean;
   readonly bridgetPermissionInputs?: ClaudeBridgetPermissionInputs;
   readonly bridgetCredential?: McpProviderSession.McpProviderSessionConfig;
   readonly messages: Stream.Stream<SDKMessage, ClaudeAgentSdkQueryRunnerError>;
@@ -755,6 +758,15 @@ export class ClaudeBackgroundWorkBlocksQueryReplacementError extends Schema.Tagg
   }
 }
 
+export class ClaudeBridgetMcpPreparationChangedError extends Schema.TaggedError<ClaudeBridgetMcpPreparationChangedError>()(
+  "ClaudeBridgetMcpPreparationChangedError",
+  {},
+) {
+  override get message(): string {
+    return "Claude Bridget mount changed while preparing its delegation instructions. Send the message again.";
+  }
+}
+
 export interface ClaudeAgentSdkQueryRunnerShape {
   readonly allocateSessionId: Effect.Effect<string, ClaudeAgentSdkQueryRunnerError>;
   readonly open: (
@@ -809,6 +821,31 @@ function closeClaudeQuery(queryRuntime: ClaudeQuery) {
     try: () => queryRuntime.close(),
     catch: (cause) => queryRunnerError(cause, "close"),
   });
+}
+
+/** Await native cleanup before reusing a fresh sessionId for an unprompted replacement. */
+const returnUnpromptedClaudeQuery = (candidate: ClaudeQuery) =>
+  Effect.tryPromise({
+    try: () => candidate.return(undefined),
+    catch: (cause) => queryRunnerError(cause, "returnUnpromptedQuery"),
+  }).pipe(Effect.asVoid);
+
+function claudeSystemPromptForDelegation(
+  hasT3Mcp: boolean,
+  preference: ProviderAdapter.ProviderAdapterV2TurnInput["bridgetDelegationPreference"],
+  hasBridgetMcp: boolean | undefined,
+) {
+  return {
+    type: "preset" as const,
+    preset: "claude_code" as const,
+    append:
+      buildRuntimeInstructions({ harness: "Claude Code" }) +
+      (t3OrchestrationSystemPrompt(hasT3Mcp, {
+        bridgetDelegationPreference: preference,
+        hasBridgetMcp,
+      }) ?? ""),
+    snapshot: false,
+  };
 }
 
 // Iterate the Query itself, not query[Symbol.asyncIterator]() (the raw
@@ -989,313 +1026,334 @@ export function makeClaudeAgentSdkProtocolLogger(input: {
   };
 }
 
-export const layerQueryRunner: Layer.Layer<
+export const makeQueryRunnerLayer = (
+  sdkQuery: typeof query = query,
+): Layer.Layer<
   ClaudeAgentSdkQueryRunner,
   never,
   Crypto.Crypto | ProviderEventLoggers.ProviderEventLoggers | FileSystem.FileSystem | Path.Path
-> = Layer.effect(
-  ClaudeAgentSdkQueryRunner,
-  Effect.gen(function* () {
-    const crypto = yield* Crypto.Crypto;
-    const fileSystem = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
-    const environment = yield* HostProcessEnvironment;
-    const resolvePermissionExecutable = yield* SpawnExecutableResolution;
-    const permissionPlatform = yield* HostProcessPlatform;
-    const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
+> =>
+  Layer.effect(
+    ClaudeAgentSdkQueryRunner,
+    Effect.gen(function* () {
+      const crypto = yield* Crypto.Crypto;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const environment = yield* HostProcessEnvironment;
+      const resolvePermissionExecutable = yield* SpawnExecutableResolution;
+      const permissionPlatform = yield* HostProcessPlatform;
+      const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
 
-    return ClaudeAgentSdkQueryRunner.of({
-      allocateSessionId: crypto.randomUUIDv4.pipe(
-        Effect.mapError((cause) => queryRunnerError(cause, "allocateSessionId")),
-      ),
-      open: Effect.fn("ClaudeAgentSdkQueryRunner.open")(function* (
-        input: ClaudeAgentSdkQueryOpenInput,
-      ) {
-        const protocolLogger = makeClaudeAgentSdkProtocolLogger({
-          nativeEventLogger,
-          threadId: input.threadId,
-          providerSessionId: input.providerSessionId,
-        });
-        const logProtocolEvent = (event: ClaudeAgentSdkProtocolLogEvent) =>
-          protocolLogger === undefined ? Effect.void : protocolLogger(event);
-        const promptQueue = yield* Queue.unbounded<SDKUserMessage>();
-        const prompt = Stream.fromQueue(promptQueue).pipe(
-          Stream.catchCause((cause) =>
-            Cause.hasInterruptsOnly(cause) ? Stream.empty : Stream.failCause(cause),
-          ),
-          Stream.toAsyncIterable,
-        );
-        // Do not expose a candidate or send a prompt before its MCP catalogue is ready.
-        const permissionOptions = {
-          ...input.options,
-          env: { ...(input.options.env ?? process.env) },
-        };
-        let permissionSettings: BridgetClaudeSettingsOverrides | undefined;
-        let permissionsRepresented =
-          input.options.canUseTool !== undefined &&
-          input.options.sandbox === undefined &&
-          input.options.managedSettings === undefined &&
-          input.options.permissionPromptToolName === undefined &&
-          input.options.permissionPrompts === undefined &&
-          input.options.spawnClaudeCodeProcess === undefined &&
-          input.options.hooks === undefined &&
-          claudePermissionFlagsRepresented(permissionOptions);
-        try {
-          permissionSettings = claudeSanitarySettings(permissionOptions.settings);
-        } catch {
-          permissionsRepresented = false;
-        }
-        const initialLaunch = yield* Effect.promise(() =>
-          captureClaudeLaunchContext(
-            permissionOptions,
-            resolvePermissionExecutable,
-            permissionPlatform,
-            permissionSettings,
-          ),
-        );
-        const readOnlySettings = claudeBridgetReadOnlySettings(input.options.settings);
-        let appliedPermissionSettings = permissionSettings;
-        // An interrupted preparation owns and closes only this candidate process.
-        const queryRuntime = yield* Effect.uninterruptibleMask((restore) =>
-          Effect.gen(function* () {
-            const candidate = yield* Effect.try({
-              try: () => query({ prompt, options: input.options }),
-              catch: (cause) => queryRunnerError(cause, "query"),
-            });
-            const mcpSession = input.bridgetCredential;
-            const preparation = yield* restore(
-              prepareClaudeMcp({
-                query: candidate,
-                readOnlySettings,
-                session:
-                  mcpSession !== undefined &&
-                  McpProviderSession.readMcpProviderSession(input.threadId) === mcpSession
-                    ? mcpSession
-                    : undefined,
-                config: { homePath: "" },
-                environment: input.options.env ?? environment,
-                ...(input.options.cwd === undefined ? {} : { cwd: input.options.cwd }),
-                extraArgs: input.options.extraArgs ?? {},
-                ...(input.options.mcpServers === undefined
-                  ? {}
-                  : { servers: input.options.mcpServers }),
-              }),
-            ).pipe(
-              Effect.provideService(FileSystem.FileSystem, fileSystem),
-              Effect.provideService(Path.Path, path),
-              Effect.mapError((cause) => queryRunnerError(cause, "prepareMcp")),
-              Effect.onError(() => closeClaudeQuery(candidate).pipe(Effect.ignore)),
-            );
-            if (preparation.code === "mounted" && readOnlySettings !== undefined) {
-              try {
-                appliedPermissionSettings = claudeSanitarySettings(readOnlySettings);
-              } catch {
-                permissionsRepresented = false;
-              }
-            }
-            return candidate;
-          }),
-        ).pipe(Effect.onError(() => Queue.shutdown(promptQueue)));
-        const finalLaunch = yield* Effect.promise(() =>
-          captureClaudeLaunchContext(
-            permissionOptions,
-            resolvePermissionExecutable,
-            permissionPlatform,
-            appliedPermissionSettings,
-          ),
-        );
-        const sourceSelection = (launch: BridgetClaudeLaunchContext | undefined) =>
-          launch === undefined
-            ? undefined
-            : JSON.stringify({ ...launch, settings_overrides: undefined });
-        if (sourceSelection(initialLaunch) !== sourceSelection(finalLaunch))
-          permissionsRepresented = false;
-        const launchSnapshot =
-          finalLaunch === undefined
-            ? undefined
-            : yield* encodePermissionLaunchJson(finalLaunch).pipe(
-                Effect.catch(() => {
-                  permissionsRepresented = false;
-                  return Effect.succeed(undefined);
-                }),
-              );
-        const bridgetPermissionInputs: ClaudeBridgetPermissionInputs | undefined =
-          !permissionsRepresented
-            ? undefined
-            : {
-                cwd: permissionOptions.cwd ?? "",
-                policy: {
-                  kind: "claude",
-                  permission_mode: input.options.permissionMode,
-                  tools: input.options.tools,
-                  ...(input.options.allowedTools === undefined
-                    ? {}
-                    : { allowed_tools: [...input.options.allowedTools] }),
-                  ...(input.options.disallowedTools === undefined
-                    ? {}
-                    : { disallowed_tools: [...input.options.disallowedTools] }),
-                  ...(input.options.additionalDirectories === undefined
-                    ? {}
-                    : { additional_directories: [...input.options.additionalDirectories] }),
-                  ...(input.options.allowDangerouslySkipPermissions === undefined
-                    ? {}
-                    : {
-                        allow_dangerously_skip_permissions:
-                          input.options.allowDangerouslySkipPermissions,
-                      }),
-                  permission_callback: {
-                    kind: "t3_runtime",
-                    tool_approval: "prompt",
-                    plan_exit: "deny",
-                  },
-                  settings_sources: "provider_default",
-                  ...(finalLaunch === undefined ? {} : { launch_context: finalLaunch }),
-                },
-                verify: async () =>
-                  finalLaunch === undefined ||
-                  JSON.stringify(
-                    await captureClaudeLaunchContext(
-                      permissionOptions,
-                      resolvePermissionExecutable,
-                      permissionPlatform,
-                      appliedPermissionSettings,
+      return ClaudeAgentSdkQueryRunner.of({
+        allocateSessionId: crypto.randomUUIDv4.pipe(
+          Effect.mapError((cause) => queryRunnerError(cause, "allocateSessionId")),
+        ),
+        open: Effect.fn("ClaudeAgentSdkQueryRunner.open")(function* (
+          input: ClaudeAgentSdkQueryOpenInput,
+        ) {
+          const protocolLogger = makeClaudeAgentSdkProtocolLogger({
+            nativeEventLogger,
+            threadId: input.threadId,
+            providerSessionId: input.providerSessionId,
+          });
+          const logProtocolEvent = (event: ClaudeAgentSdkProtocolLogEvent) =>
+            protocolLogger === undefined ? Effect.void : protocolLogger(event);
+          // Do not expose a candidate or send a prompt before its MCP catalogue is ready.
+          const permissionOptions = {
+            ...input.options,
+            env: { ...(input.options.env ?? process.env) },
+          };
+          let permissionSettings: BridgetClaudeSettingsOverrides | undefined;
+          let permissionsRepresented =
+            input.options.canUseTool !== undefined &&
+            input.options.sandbox === undefined &&
+            input.options.managedSettings === undefined &&
+            input.options.permissionPromptToolName === undefined &&
+            input.options.permissionPrompts === undefined &&
+            input.options.spawnClaudeCodeProcess === undefined &&
+            input.options.hooks === undefined &&
+            claudePermissionFlagsRepresented(permissionOptions);
+          try {
+            permissionSettings = claudeSanitarySettings(permissionOptions.settings);
+          } catch {
+            permissionsRepresented = false;
+          }
+          const initialLaunch = yield* Effect.promise(() =>
+            captureClaudeLaunchContext(
+              permissionOptions,
+              resolvePermissionExecutable,
+              permissionPlatform,
+              permissionSettings,
+            ),
+          );
+          const readOnlySettings = claudeBridgetReadOnlySettings(input.options.settings);
+          let appliedPermissionSettings = permissionSettings;
+          // An interrupted preparation owns and closes only this candidate process.
+          let effectiveOptions = input.options;
+          const preparedQuery = yield* Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              const prepareCandidate = Effect.fnUntraced(function* (
+                options: ClaudeAgentSdkQueryOptions,
+              ) {
+                // Each SDK stream owns its queue. A retired candidate must never consume a later prompt.
+                const promptQueue = yield* Queue.unbounded<SDKUserMessage>();
+                const prompt = Stream.fromQueue(promptQueue).pipe(
+                  Stream.catchCause((cause) =>
+                    Cause.hasInterruptsOnly(cause) ? Stream.empty : Stream.failCause(cause),
+                  ),
+                  Stream.toAsyncIterable,
+                );
+                const candidate = yield* Effect.try({
+                  try: () => sdkQuery({ prompt, options }),
+                  catch: (cause) => queryRunnerError(cause, "query"),
+                }).pipe(Effect.onError(() => Queue.shutdown(promptQueue)));
+                const mcpSession = input.bridgetCredential;
+                const preparation = yield* restore(
+                  prepareClaudeMcp({
+                    query: candidate,
+                    readOnlySettings,
+                    session:
+                      mcpSession !== undefined &&
+                      McpProviderSession.readMcpProviderSession(input.threadId) === mcpSession
+                        ? mcpSession
+                        : undefined,
+                    config: { homePath: "" },
+                    environment: options.env ?? environment,
+                    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+                    extraArgs: options.extraArgs ?? {},
+                    ...(options.mcpServers === undefined ? {} : { servers: options.mcpServers }),
+                  }),
+                ).pipe(
+                  Effect.provideService(FileSystem.FileSystem, fileSystem),
+                  Effect.provideService(Path.Path, path),
+                  Effect.mapError((cause) => queryRunnerError(cause, "prepareMcp")),
+                  Effect.onError(() =>
+                    Queue.shutdown(promptQueue).pipe(
+                      Effect.andThen(returnUnpromptedClaudeQuery(candidate)),
+                      Effect.ignore,
                     ),
-                  ) === launchSnapshot,
-              };
-        yield* logProtocolEvent({
-          direction: "outgoing",
-          stage: "decoded",
-          payload: {
-            type: "query.open",
-            options: loggedClaudeQueryOptions(input.options),
-          },
-        });
+                  ),
+                );
+                return { candidate, promptQueue, mounted: preparation.code === "mounted" };
+              });
+              // The candidate is private and receives no user prompt until its catalogue is verified.
+              // A provisional prefer append avoids restarting a correctly mounted candidate.
+              if (input.bridgetDelegationPreference === "prefer") {
+                effectiveOptions = {
+                  ...input.options,
+                  systemPrompt: claudeSystemPromptForDelegation(
+                    input.options.mcpServers !== undefined,
+                    "prefer",
+                    true,
+                  ),
+                };
+              }
+              let prepared = yield* prepareCandidate(effectiveOptions);
+              if (input.bridgetDelegationPreference === "prefer" && !prepared.mounted) {
+                yield* Queue.shutdown(prepared.promptQueue);
+                yield* returnUnpromptedClaudeQuery(prepared.candidate);
+                // No prompt was offered: native qualification confirms a fresh sessionId can be reused
+                // after Query.return(). Preserve existing resume/resumeSessionAt exactly on resumed queries.
+                effectiveOptions = {
+                  ...input.options,
+                  systemPrompt: claudeSystemPromptForDelegation(
+                    input.options.mcpServers !== undefined,
+                    "prefer",
+                    false,
+                  ),
+                };
+                const second = yield* prepareCandidate(effectiveOptions);
+                if (second.mounted !== prepared.mounted) {
+                  yield* Queue.shutdown(second.promptQueue);
+                  yield* returnUnpromptedClaudeQuery(second.candidate);
+                  return yield* queryRunnerError(
+                    new ClaudeBridgetMcpPreparationChangedError(),
+                    "prepareMcpDelegation",
+                  );
+                }
+                prepared = second;
+              }
+              if (prepared.mounted && readOnlySettings !== undefined) {
+                try {
+                  appliedPermissionSettings = claudeSanitarySettings(readOnlySettings);
+                } catch {
+                  permissionsRepresented = false;
+                }
+              }
+              return prepared;
+            }),
+          );
+          const queryRuntime = preparedQuery.candidate;
+          const promptQueue = preparedQuery.promptQueue;
+          const finalLaunch = yield* Effect.promise(() =>
+            captureClaudeLaunchContext(
+              permissionOptions,
+              resolvePermissionExecutable,
+              permissionPlatform,
+              appliedPermissionSettings,
+            ),
+          );
+          const sourceSelection = (launch: BridgetClaudeLaunchContext | undefined) =>
+            launch === undefined
+              ? undefined
+              : JSON.stringify({ ...launch, settings_overrides: undefined });
+          if (sourceSelection(initialLaunch) !== sourceSelection(finalLaunch))
+            permissionsRepresented = false;
+          const launchSnapshot =
+            finalLaunch === undefined
+              ? undefined
+              : yield* encodePermissionLaunchJson(finalLaunch).pipe(
+                  Effect.catch(() => {
+                    permissionsRepresented = false;
+                    return Effect.succeed(undefined);
+                  }),
+                );
+          const bridgetPermissionInputs: ClaudeBridgetPermissionInputs | undefined =
+            !permissionsRepresented
+              ? undefined
+              : {
+                  cwd: permissionOptions.cwd ?? "",
+                  policy: {
+                    kind: "claude",
+                    permission_mode: input.options.permissionMode,
+                    tools: input.options.tools,
+                    ...(input.options.allowedTools === undefined
+                      ? {}
+                      : { allowed_tools: [...input.options.allowedTools] }),
+                    ...(input.options.disallowedTools === undefined
+                      ? {}
+                      : { disallowed_tools: [...input.options.disallowedTools] }),
+                    ...(input.options.additionalDirectories === undefined
+                      ? {}
+                      : { additional_directories: [...input.options.additionalDirectories] }),
+                    ...(input.options.allowDangerouslySkipPermissions === undefined
+                      ? {}
+                      : {
+                          allow_dangerously_skip_permissions:
+                            input.options.allowDangerouslySkipPermissions,
+                        }),
+                    permission_callback: {
+                      kind: "t3_runtime",
+                      tool_approval: "prompt",
+                      plan_exit: "deny",
+                    },
+                    settings_sources: "provider_default",
+                    ...(finalLaunch === undefined ? {} : { launch_context: finalLaunch }),
+                  },
+                  verify: async () =>
+                    finalLaunch === undefined ||
+                    JSON.stringify(
+                      await captureClaudeLaunchContext(
+                        permissionOptions,
+                        resolvePermissionExecutable,
+                        permissionPlatform,
+                        appliedPermissionSettings,
+                      ),
+                    ) === launchSnapshot,
+                };
+          yield* logProtocolEvent({
+            direction: "outgoing",
+            stage: "decoded",
+            payload: {
+              type: "query.open",
+              options: loggedClaudeQueryOptions(effectiveOptions),
+            },
+          });
 
-        return {
-          ...(bridgetPermissionInputs === undefined ? {} : { bridgetPermissionInputs }),
-          ...(input.bridgetCredential === undefined
-            ? {}
-            : { bridgetCredential: input.bridgetCredential }),
-          messages: Stream.fromAsyncIterable(claudeQueryMessages(queryRuntime), (cause) =>
-            queryRunnerError(cause, "fromAsyncIterable"),
-          ).pipe(
-            Stream.tap((message) =>
-              logProtocolEvent({
-                direction: "incoming",
-                stage: "decoded",
-                payload: message,
-              }),
-            ),
-          ),
-          offer: (message) =>
-            Queue.offer(promptQueue, message).pipe(
-              Effect.asVoid,
-              Effect.tap(() =>
+          return {
+            bridgetMcpMounted: preparedQuery.mounted,
+            ...(bridgetPermissionInputs === undefined ? {} : { bridgetPermissionInputs }),
+            ...(input.bridgetCredential === undefined
+              ? {}
+              : { bridgetCredential: input.bridgetCredential }),
+            messages: Stream.fromAsyncIterable(claudeQueryMessages(queryRuntime), (cause) =>
+              queryRunnerError(cause, "fromAsyncIterable"),
+            ).pipe(
+              Stream.tap((message) =>
                 logProtocolEvent({
-                  direction: "outgoing",
+                  direction: "incoming",
                   stage: "decoded",
-                  payload: {
-                    type: "prompt.offer",
-                    message,
-                  },
+                  payload: message,
                 }),
               ),
             ),
-          setModel: (model) =>
-            Effect.tryPromise({
-              try: () => queryRuntime.setModel(model),
-              catch: (cause) => queryRunnerError(cause, "setModel"),
+            offer: (message) =>
+              Queue.offer(promptQueue, message).pipe(
+                Effect.asVoid,
+                Effect.tap(() =>
+                  logProtocolEvent({
+                    direction: "outgoing",
+                    stage: "decoded",
+                    payload: {
+                      type: "prompt.offer",
+                      message,
+                    },
+                  }),
+                ),
+              ),
+            setModel: (model) =>
+              Effect.tryPromise({
+                try: () => queryRuntime.setModel(model),
+                catch: (cause) => queryRunnerError(cause, "setModel"),
+              }).pipe(
+                Effect.tap(() =>
+                  logProtocolEvent({
+                    direction: "outgoing",
+                    stage: "decoded",
+                    payload: {
+                      type: "query.set_model",
+                      model,
+                    },
+                  }),
+                ),
+              ),
+            setPermissionMode: (mode) =>
+              Effect.tryPromise({
+                try: () => queryRuntime.setPermissionMode(mode),
+                catch: (cause) => queryRunnerError(cause, "setPermissionMode"),
+              }).pipe(
+                Effect.tap(() =>
+                  logProtocolEvent({
+                    direction: "outgoing",
+                    stage: "decoded",
+                    payload: {
+                      type: "query.set_permission_mode",
+                      mode,
+                    },
+                  }),
+                ),
+              ),
+            interrupt: Effect.tryPromise({
+              try: () => queryRuntime.interrupt(),
+              catch: (cause) => queryRunnerError(cause, "interrupt"),
             }).pipe(
               Effect.tap(() =>
                 logProtocolEvent({
                   direction: "outgoing",
                   stage: "decoded",
                   payload: {
-                    type: "query.set_model",
-                    model,
+                    type: "query.interrupt",
                   },
                 }),
               ),
             ),
-          setPermissionMode: (mode) =>
-            Effect.tryPromise({
-              try: () => queryRuntime.setPermissionMode(mode),
-              catch: (cause) => queryRunnerError(cause, "setPermissionMode"),
-            }).pipe(
+            close: Queue.shutdown(promptQueue).pipe(
+              Effect.andThen(closeClaudeQuery(queryRuntime)),
               Effect.tap(() =>
                 logProtocolEvent({
                   direction: "outgoing",
                   stage: "decoded",
                   payload: {
-                    type: "query.set_permission_mode",
-                    mode,
+                    type: "query.close",
                   },
                 }),
               ),
             ),
-          interrupt: Effect.tryPromise({
-            try: () => queryRuntime.interrupt(),
-            catch: (cause) => queryRunnerError(cause, "interrupt"),
-          }).pipe(
-            Effect.tap(() =>
-              logProtocolEvent({
-                direction: "outgoing",
-                stage: "decoded",
-                payload: {
-                  type: "query.interrupt",
-                },
-              }),
-            ),
-          ),
-          close: Queue.shutdown(promptQueue).pipe(
-            Effect.andThen(closeClaudeQuery(queryRuntime)),
-            Effect.tap(() =>
-              logProtocolEvent({
-                direction: "outgoing",
-                stage: "decoded",
-                payload: {
-                  type: "query.close",
-                },
-              }),
-            ),
-          ),
-        } satisfies ClaudeAgentSdkQuerySession;
-      }),
-      forkSession: Effect.fn("ClaudeAgentSdkQueryRunner.forkSession")(function* (
-        input: ClaudeAgentSdkSessionForkInput,
-      ) {
-        const protocolLogger = makeClaudeAgentSdkProtocolLogger({
-          nativeEventLogger,
-          threadId: input.threadId,
-          providerSessionId: input.providerSessionId,
-        });
-        const logProtocolEvent = (event: ClaudeAgentSdkProtocolLogEvent) =>
-          protocolLogger === undefined ? Effect.void : protocolLogger(event);
-        yield* logProtocolEvent({
-          direction: "outgoing",
-          stage: "decoded",
-          payload: {
-            type: "session.fork",
-            sessionId: input.sessionId,
-            options: input.options,
-          },
-        });
-        const result = yield* Effect.tryPromise({
-          try: () => forkClaudeSession(input.sessionId, input.options),
-          catch: (cause) => queryRunnerError(cause, "forkSession"),
-        });
-        yield* logProtocolEvent({
-          direction: "incoming",
-          stage: "decoded",
-          payload: {
-            type: "session.forked",
-            sessionId: result.sessionId,
-          },
-        });
-        return result;
-      }),
-      subagentLaunchToolUseId: Effect.fn("ClaudeAgentSdkQueryRunner.subagentLaunchToolUseId")(
-        function* (input: ClaudeAgentSdkSubagentLookupInput) {
+          } satisfies ClaudeAgentSdkQuerySession;
+        }),
+        forkSession: Effect.fn("ClaudeAgentSdkQueryRunner.forkSession")(function* (
+          input: ClaudeAgentSdkSessionForkInput,
+        ) {
           const protocolLogger = makeClaudeAgentSdkProtocolLogger({
             nativeEventLogger,
             threadId: input.threadId,
@@ -1307,34 +1365,68 @@ export const layerQueryRunner: Layer.Layer<
             direction: "outgoing",
             stage: "decoded",
             payload: {
-              type: "subagent.lookup",
+              type: "session.fork",
               sessionId: input.sessionId,
-              agentId: input.agentId,
+              options: input.options,
             },
           });
-          // The CLI stamps every message of a subagent's transcript with the
-          // tool call that launched it; one message is enough.
-          const messages = yield* Effect.tryPromise({
-            try: () =>
-              getSubagentMessages(input.sessionId, input.agentId, {
-                ...(input.dir === null ? {} : { dir: input.dir }),
-                limit: 1,
-              }),
-            catch: (cause) => queryRunnerError(cause, "getSubagentMessages"),
+          const result = yield* Effect.tryPromise({
+            try: () => forkClaudeSession(input.sessionId, input.options),
+            catch: (cause) => queryRunnerError(cause, "forkSession"),
           });
-          const toolUseId = messages[0]?.parent_tool_use_id ?? null;
           yield* logProtocolEvent({
             direction: "incoming",
             stage: "decoded",
-            payload: { type: "subagent.found", toolUseId },
+            payload: {
+              type: "session.forked",
+              sessionId: result.sessionId,
+            },
           });
-          return toolUseId;
-        },
-      ),
-      assertComplete: Effect.void,
-    });
-  }),
-);
+          return result;
+        }),
+        subagentLaunchToolUseId: Effect.fn("ClaudeAgentSdkQueryRunner.subagentLaunchToolUseId")(
+          function* (input: ClaudeAgentSdkSubagentLookupInput) {
+            const protocolLogger = makeClaudeAgentSdkProtocolLogger({
+              nativeEventLogger,
+              threadId: input.threadId,
+              providerSessionId: input.providerSessionId,
+            });
+            const logProtocolEvent = (event: ClaudeAgentSdkProtocolLogEvent) =>
+              protocolLogger === undefined ? Effect.void : protocolLogger(event);
+            yield* logProtocolEvent({
+              direction: "outgoing",
+              stage: "decoded",
+              payload: {
+                type: "subagent.lookup",
+                sessionId: input.sessionId,
+                agentId: input.agentId,
+              },
+            });
+            // The CLI stamps every message of a subagent's transcript with the
+            // tool call that launched it; one message is enough.
+            const messages = yield* Effect.tryPromise({
+              try: () =>
+                getSubagentMessages(input.sessionId, input.agentId, {
+                  ...(input.dir === null ? {} : { dir: input.dir }),
+                  limit: 1,
+                }),
+              catch: (cause) => queryRunnerError(cause, "getSubagentMessages"),
+            });
+            const toolUseId = messages[0]?.parent_tool_use_id ?? null;
+            yield* logProtocolEvent({
+              direction: "incoming",
+              stage: "decoded",
+              payload: { type: "subagent.found", toolUseId },
+            });
+            return toolUseId;
+          },
+        ),
+        assertComplete: Effect.void,
+      });
+    }),
+  );
+
+export const layerQueryRunner = makeQueryRunnerLayer();
 
 export function makeClaudeQueryOptions(input: {
   readonly modelSelection: ModelSelection;
@@ -1350,6 +1442,8 @@ export function makeClaudeQueryOptions(input: {
    */
   readonly attachmentsDir?: string;
   readonly settings?: ClaudeSettings;
+  readonly bridgetDelegationPreference?: ProviderAdapter.ProviderAdapterV2TurnInput["bridgetDelegationPreference"];
+  readonly hasBridgetMcp?: boolean;
   readonly sdkSettings?: string | ClaudeSdkSettings;
   readonly environment?: NodeJS.ProcessEnv;
   readonly mcpServers?: ClaudeQueryOptions["mcpServers"];
@@ -1440,13 +1534,11 @@ export function makeClaudeQueryOptions(input: {
       : {}),
     ...(input.environment === undefined ? {} : { env: input.environment }),
     ...(input.mcpServers === undefined ? {} : { mcpServers: input.mcpServers }),
-    systemPrompt: {
-      type: "preset" as const,
-      preset: "claude_code" as const,
-      append:
-        buildRuntimeInstructions({ harness: "Claude Code" }) +
-        (input.mcpServers === undefined ? "" : T3_CODE_ORCHESTRATION_INSTRUCTIONS),
-    },
+    systemPrompt: claudeSystemPromptForDelegation(
+      input.mcpServers !== undefined,
+      input.bridgetDelegationPreference,
+      input.hasBridgetMcp,
+    ),
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
   };
   const additionalDirectories = [
@@ -7881,7 +7973,10 @@ export function makeClaudeAdapterV2(
               ? {}
               : { allowedTools: queryPolicy.allowedTools }),
           });
-          const queryPolicyKey = claudeEffectiveQueryPolicyKey(queryPolicy, mcpOverrides);
+          const queryPolicyKey =
+            claudeEffectiveQueryPolicyKey(queryPolicy, mcpOverrides) +
+            "\u0000" +
+            (turnInput.bridgetDelegationPreference ?? "off");
           const compiledSelection = compileClaudeModelSelection(turnInput.modelSelection);
           const resumeSessionAt = yield* getNativeConversationHeadId(turnInput.providerThread);
           const existing = yield* Ref.get(queryContext);
@@ -7952,6 +8047,9 @@ export function makeClaudeAdapterV2(
             resumeSessionAt !== undefined || openedWithResume || hasPersistedProviderTurn;
           const queryOptions = makeClaudeQueryOptions({
             modelSelection: turnInput.modelSelection,
+            bridgetDelegationPreference: turnInput.bridgetDelegationPreference,
+            // The runner resolves the actual catalogue before offer; credentials are no mount proof.
+            hasBridgetMcp: false,
             nativeThreadId,
             resume: shouldResume,
             ...(resumeSessionAt === undefined ? {} : { resumeSessionAt }),
@@ -7977,6 +8075,7 @@ export function makeClaudeAdapterV2(
               providerSessionId: input.providerSessionId,
               ...(bridgetCredential === undefined ? {} : { bridgetCredential }),
               options: queryOptions,
+              bridgetDelegationPreference: turnInput.bridgetDelegationPreference,
             })
             .pipe(
               // An interrupted open leaves the old process just as dead.

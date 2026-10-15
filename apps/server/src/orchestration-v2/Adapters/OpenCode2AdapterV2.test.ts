@@ -43,6 +43,8 @@ import type {
   ProviderAdapterV2SessionRuntime,
 } from "@t3tools/provider-core/server/ProviderAdapter";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
+import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
+import { t3OrchestrationSystemPrompt } from "@t3tools/provider-core/server/orchestrationInstructions";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import type { ProviderContinuationRequest } from "@t3tools/provider-core/server/continuationRequests";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/continuationRequests";
@@ -367,6 +369,57 @@ const terminalOf = (runtime: ProviderAdapterV2SessionRuntime) =>
     Stream.runHead,
     Effect.map(Option.getOrUndefined),
   );
+
+it.effect("SPEC169 rewrites OpenCode 2 instructions on reused ON/OFF turns", () =>
+  Effect.gen(function* () {
+    const blocked = [
+      buildRuntimeInstructions({ harness: "OpenCode", model: bigPickle.model }),
+      t3OrchestrationSystemPrompt(false, {
+        bridgetDelegationPreference: "prefer",
+        hasBridgetMcp: false,
+      }),
+    ].join("\n\n");
+    const off = buildRuntimeInstructions({ harness: "OpenCode", model: bigPickle.model });
+    assert.include(blocked, "preference: blocked");
+    assert.notInclude(blocked, "Prefer native subagent tools");
+    const entries: Array<ProviderReplayEntry> = [
+      ...opening,
+      out("session.get", { sessionID: SESSION }),
+      replyData("session.get", sessionInfo()),
+      ...noOpenRequests,
+    ];
+    for (const value of [blocked, off, blocked]) {
+      entries.push(
+        out("session.instructions.entry.put", { sessionID: SESSION, key: "t3-code", value }),
+        reply("session.instructions.entry.put", null),
+        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+        promptAccepted,
+        event("session.execution.succeeded", { sessionID: SESSION }),
+      );
+    }
+    const runtime = yield* openCode2ReplayRuntime(entries, { external: true });
+    const thread = yield* runtime.resumeThread({
+      providerThread: providerThread(yield* DateTime.now),
+      threadId,
+      modelSelection: bigPickle,
+      runtimePolicy: policy(),
+    });
+    let ordinal = 0;
+    for (const preference of ["prefer", "off", "prefer"] as const) {
+      ordinal += 1;
+      const terminal = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+      yield* runtime.startTurn({
+        ...turnInput(thread),
+        bridgetDelegationPreference: preference,
+        runId: RunId.make(`run-policy169-${ordinal}`),
+        attemptId: RunAttemptId.make(`attempt-policy169-${ordinal}`),
+        runOrdinal: ordinal,
+        providerTurnOrdinal: ordinal,
+      });
+      assert.equal((yield* Fiber.join(terminal))?.status, "completed");
+    }
+  }).pipe(Effect.scoped),
+);
 
 // The history the spike read back after its `simple` turn (recordings/simple.ndjson).
 const history = {

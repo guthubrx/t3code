@@ -39,6 +39,139 @@ import * as CursorAgentSdk from "./CursorAgentSdk.ts";
 const decodeCursorSettings = Schema.decodeEffect(CursorSettings);
 
 describe("CursorAdapterV2", () => {
+  it.effect("SPEC169 reinjects changed policy after a user slash without advancing its cache", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "cursor-policy169-" });
+      const sentMessages: Array<string> = [];
+      const instanceId = ProviderInstanceId.make("cursor");
+      const threadId = ThreadId.make("cursor-policy169-thread");
+      const modelSelection = { instanceId, model: "composer-2.5" };
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: workspace,
+      });
+      const adapter = yield* makeCursorAdapterV2({
+        instanceId,
+        settings: yield* decodeCursorSettings({}),
+        environment: { HOME: workspace },
+      }).pipe(
+        Effect.provideService(CursorAgentSdk.CursorAgentSdkRunner, {
+          assertComplete: Effect.void,
+          open: () =>
+            Effect.succeed({
+              agentId: "cursor-policy169",
+              listMessages: Effect.succeed([]),
+              close: Effect.void,
+              send: (input) =>
+                Effect.sync(() => {
+                  sentMessages.push(
+                    typeof input.message === "string" ? input.message : input.message.text,
+                  );
+                  const runId = `native-policy169-${sentMessages.length}`;
+                  return {
+                    agentId: "cursor-policy169",
+                    runId,
+                    wait: Effect.succeed({
+                      id: runId,
+                      requestId: runId,
+                      status: "finished" as const,
+                      model: { id: "composer-2.5" },
+                      durationMs: 1,
+                    }),
+                    cancel: Effect.void,
+                  };
+                }),
+            }),
+        }),
+        Effect.provide(layerTestProviderHost({ cwd: workspace })),
+      );
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("cursor-policy169-session"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const now = yield* DateTime.now;
+      let ordinal = 7;
+      for (const [preference, text] of [
+        ["off", "/initial-slash"],
+        ["off", "Resume existing native conversation"],
+        ["prefer", "Review"],
+        ["off", "/example"],
+        ["off", "Continue"],
+        ["off", "Continue again"],
+        ["prefer", "Review again"],
+      ] as const) {
+        ordinal += 1;
+        yield* runtime.startTurn({
+          threadId,
+          providerThread,
+          modelSelection,
+          runtimePolicy,
+          bridgetDelegationPreference: preference,
+          runId: RunId.make(`cursor-policy169-run-${ordinal}`),
+          runOrdinal: ordinal,
+          providerTurnOrdinal: ordinal,
+          attemptId: RunAttemptId.make(`cursor-policy169-attempt-${ordinal}`),
+          rootNodeId: NodeId.make(`cursor-policy169-root-${ordinal}`),
+          appThread: {
+            id: threadId,
+            projectId: ProjectId.make("cursor-policy169-project"),
+            createdBy: "user",
+            creationSource: "web",
+            title: "Cursor policy",
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: providerThread.id,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+          message: {
+            messageId: MessageId.make(`cursor-policy169-message-${ordinal}`),
+            createdBy: "user",
+            creationSource: "web",
+            text,
+            attachments: [],
+          },
+        });
+        yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runDrain,
+        );
+      }
+      assert.isTrue(sentMessages[0]!.startsWith("/initial-slash\n\n<runtime_info>"));
+      assert.notInclude(sentMessages[0]!, "<t3_code_orchestration_instructions>");
+      assert.include(sentMessages[1]!, "preference is off for this turn");
+      assert.notInclude(sentMessages[1]!, "orchestrator_capabilities");
+      assert.include(sentMessages[2]!, "preference: blocked");
+      assert.notInclude(sentMessages[2]!, "Prefer native subagent tools");
+      assert.isTrue(sentMessages[3]!.startsWith("/example\n\n<runtime_info>"));
+      assert.notInclude(sentMessages[3]!, "<t3_code_orchestration_instructions>");
+      assert.include(sentMessages[4]!, "preference is off for this turn");
+      assert.notInclude(sentMessages[4]!, "preference: blocked");
+      assert.isTrue(sentMessages[5]!.startsWith("Continue again\n\n<runtime_info>"));
+      assert.notInclude(sentMessages[5]!, "<t3_code_orchestration_instructions>");
+      assert.include(sentMessages[6]!, "preference: blocked");
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, IdAllocator.layer))),
+  );
   it.effect.each([
     { status: "finished", model: undefined, lateModel: undefined },
     { status: "cancelled", model: "claude-opus-4-6", lateModel: undefined },

@@ -33,6 +33,7 @@ import {
   ServerSettingsError,
   type ServerSettingsPatch,
 } from "@t3tools/contracts";
+import type { BridgetDelegationPreference } from "@t3tools/provider-core/server/ProviderAdapter";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -265,6 +266,12 @@ export class ServerSettingsService extends Context.Service<
     /** Read the current settings. */
     readonly getSettings: Effect.Effect<ServerSettings, ServerSettingsError>;
 
+    /** Read routing guidance and file trust from the same cached disk snapshot. */
+    readonly getBridgetDelegationPreference: Effect.Effect<
+      BridgetDelegationPreference,
+      ServerSettingsError
+    >;
+
     /** Patch settings and persist. Returns the new full settings object. */
     readonly updateSettings: (
       patch: ServerSettingsPatch,
@@ -330,6 +337,11 @@ const makeTest = (overrides: DeepPartial<ServerSettings> = {}) =>
       start: Effect.void,
       ready: Effect.void,
       getSettings,
+      getBridgetDelegationPreference: getSettings.pipe(
+        Effect.map((settings): BridgetDelegationPreference =>
+          settings.preferBridgetDelegation ? "prefer" : "off",
+        ),
+      ),
       updateSettings: (patch) =>
         updateTestSettings((currentSettings) =>
           Effect.succeed(applyServerSettingsPatch(currentSettings, patch)),
@@ -862,19 +874,23 @@ const make = Effect.gen(function* () {
     if (migrated !== loaded || (settingsFileTrusted && legacyProviders !== undefined)) {
       yield* writeSettingsAtomically(migrated);
     }
-    return migrated;
+    return { settings: migrated, trusted: settingsFileTrusted };
   });
 
   // A failed read is not kept: the next read retries instead of replaying the failure.
-  const settingsCache = yield* Cache.makeWith<typeof cacheKey, ServerSettings, ServerSettingsError>(
-    () => loadSettingsFromDisk,
-    {
-      capacity: 1,
-      timeToLive: (exit) => (Exit.isSuccess(exit) ? Duration.infinity : Duration.zero),
-    },
-  );
+  const settingsCache = yield* Cache.makeWith<
+    typeof cacheKey,
+    { readonly settings: ServerSettings; readonly trusted: boolean },
+    ServerSettingsError
+  >(() => loadSettingsFromDisk, {
+    capacity: 1,
+    timeToLive: (exit) => (Exit.isSuccess(exit) ? Duration.infinity : Duration.zero),
+  });
 
-  const getSettingsFromCache = Cache.get(settingsCache, cacheKey);
+  const getSettingsSnapshotFromCache = Cache.get(settingsCache, cacheKey);
+  const getSettingsFromCache = getSettingsSnapshotFromCache.pipe(
+    Effect.map((snapshot) => snapshot.settings),
+  );
 
   const materializeProviderEnvironmentSecrets = (
     settings: ServerSettings,
@@ -1252,7 +1268,12 @@ const make = Effect.gen(function* () {
   ): Effect.Effect<ServerSettings, ServerSettingsError> =>
     writeSemaphore.withPermits(1)(
       Effect.gen(function* () {
-        const current = yield* getSettingsFromCache;
+        const snapshot = yield* getSettingsSnapshotFromCache;
+        // Preserve an invalid file byte-for-byte, including on unrelated settings patches.
+        // Only a valid disk reload can restore trust; do not mutate secrets first.
+        if (!snapshot.trusted)
+          return yield* new ServerSettingsError({ settingsPath, operation: "write-file" });
+        const current = snapshot.settings;
         const updated = yield* update(current);
         const persisted = yield* persistProviderEnvironmentSecrets(current, updated);
         const next = yield* normalizeServerSettings(persisted.settings);
@@ -1276,7 +1297,7 @@ const make = Effect.gen(function* () {
             return materializedExit.value;
           }),
         );
-        yield* Cache.set(settingsCache, cacheKey, next);
+        yield* Cache.set(settingsCache, cacheKey, { settings: next, trusted: true });
         yield* emitChange(next);
         return resolveTextGenerationProvider(materialized);
       }),
@@ -1403,6 +1424,11 @@ const make = Effect.gen(function* () {
     getSettings: getSettingsFromCache.pipe(
       Effect.flatMap(materializeProviderEnvironmentSecrets),
       Effect.map(resolveTextGenerationProvider),
+    ),
+    getBridgetDelegationPreference: getSettingsSnapshotFromCache.pipe(
+      Effect.map(({ settings, trusted }): BridgetDelegationPreference =>
+        !trusted ? "blocked" : settings.preferBridgetDelegation ? "prefer" : "off",
+      ),
     ),
     updateSettings: (patch) =>
       updateAndPersistSettings((current) =>

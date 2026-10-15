@@ -393,7 +393,11 @@ export interface ProviderAdapterV2EnsureThreadInput {
   readonly existingProviderThread?: OrchestrationV2ProviderThread;
 }
 
+export type BridgetDelegationPreference = "off" | "prefer" | "blocked";
+
 export interface ProviderAdapterV2TurnInput {
+  /** Server-read routing guidance for this turn; independent of MCP credentials and permissions. */
+  readonly bridgetDelegationPreference?: BridgetDelegationPreference | undefined;
   readonly appThread: OrchestrationV2AppThread;
   readonly threadId: ThreadId;
   readonly runId: RunId;

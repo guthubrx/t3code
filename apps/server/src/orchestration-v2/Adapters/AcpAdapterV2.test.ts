@@ -766,124 +766,150 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
-  it.live("refreshes ACP prompt instructions when the interaction mode changes", () =>
-    Effect.gen(function* () {
-      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const path = yield* Path.Path;
-      const selfInvocation = yield* resolveSelfInvocation();
-      const mockAgentPath = yield* path.fromFileUrl(
-        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
-      );
-      const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
-      const instanceId = ProviderInstanceId.make("acp-test-instruction-transitions");
-      const threadId = ThreadId.make("thread-acp-instruction-transitions");
-      McpProviderSession.setMcpProviderSession({
-        environmentId: EnvironmentId.make("environment-acp-instruction-transitions"),
-        threadId,
-        providerSessionId: "mcp-session-acp-instruction-transitions",
-        providerInstanceId: instanceId,
-        endpoint: "http://127.0.0.1:43123/mcp",
-        authorizationHeader: "Bearer instruction-transition-token",
-        browserToolsAvailable: false,
-      });
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
-      );
-      const adapter = yield* makeAcpAdapterV2({
-        instanceId,
-        flavor: {
-          driver: ACP_TEST_DRIVER,
-          capabilities: AcpProviderCapabilitiesV2,
-          makeRuntime: makeMockRuntime({ childProcessSpawner, mockAgentPath, protocolEvents }),
-        },
-        selfInvocation,
-      });
-      const policy = (interactionMode: "default" | "plan") =>
-        ProviderAdapterV2RuntimePolicy.make({
-          runtimeMode: "full-access",
-          interactionMode,
-          cwd: process.cwd(),
-        });
-      const defaultPolicy = policy("default");
-      const modelSelection = { instanceId, model: "default" } as const;
-      const runtime = yield* adapter.openSession({
-        threadId,
-        providerSessionId: ProviderSessionId.make("provider-session-acp-instruction-transitions"),
-        modelSelection,
-        runtimePolicy: defaultPolicy,
-      });
-      const providerThread = yield* runtime.ensureThread({
-        threadId,
-        modelSelection,
-        runtimePolicy: defaultPolicy,
-      });
-      const now = yield* DateTime.now;
-      const runTurn = Effect.fnUntraced(function* (
-        ordinal: number,
-        runtimePolicy: ProviderAdapterV2RuntimePolicy,
-        messageText: string,
-      ) {
-        yield* runtime.startTurn(
-          makeTurnInput({
+  it.live.each([false, true])(
+    "SPEC169 refreshes resumed ACP instructions and slash transitions (MCP %s)",
+    (hasT3Mcp) =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const path = yield* Path.Path;
+        const selfInvocation = yield* resolveSelfInvocation();
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
+        const instanceId = ProviderInstanceId.make("acp-test-instruction-transitions");
+        const threadId = ThreadId.make("thread-acp-instruction-transitions");
+        if (hasT3Mcp)
+          McpProviderSession.setMcpProviderSession({
+            environmentId: EnvironmentId.make("environment-acp-instruction-transitions"),
             threadId,
-            providerThread,
-            instanceId,
-            runtimePolicy,
-            now,
-            ordinal,
-            messageText,
-          }),
+            providerSessionId: "mcp-session-acp-instruction-transitions",
+            providerInstanceId: instanceId,
+            endpoint: "http://127.0.0.1:43123/mcp",
+            authorizationHeader: "Bearer instruction-transition-token",
+            browserToolsAvailable: false,
+          });
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
         );
-        yield* runtime.events.pipe(
-          Stream.takeUntil((event) => event.type === "turn.terminal"),
-          Stream.runDrain,
-        );
-        const methods: Array<string> = [];
-        while (true) {
-          const event = yield* Queue.take(protocolEvents);
-          if (event.direction !== "outgoing") continue;
-          const method = rawProtocolMethod(event);
-          if (method === undefined) continue;
-          methods.push(method);
-          if (method === "session/prompt") {
-            return { methods, prompt: rawProtocolPromptText(event) };
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            makeRuntime: makeMockRuntime({ childProcessSpawner, mockAgentPath, protocolEvents }),
+          },
+          selfInvocation,
+        });
+        const policy = (interactionMode: "default" | "plan") =>
+          ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "full-access",
+            interactionMode,
+            cwd: process.cwd(),
+          });
+        const defaultPolicy = policy("default");
+        const modelSelection = { instanceId, model: "default" } as const;
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-acp-instruction-transitions"),
+          modelSelection,
+          runtimePolicy: defaultPolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy: defaultPolicy,
+        });
+        const now = yield* DateTime.now;
+        const runTurn = Effect.fnUntraced(function* (
+          ordinal: number,
+          runtimePolicy: ProviderAdapterV2RuntimePolicy,
+          messageText: string,
+          bridgetDelegationPreference?: "off" | "prefer" | "blocked",
+        ) {
+          yield* runtime.startTurn({
+            ...makeTurnInput({
+              threadId,
+              providerThread,
+              instanceId,
+              runtimePolicy,
+              now,
+              ordinal,
+              messageText,
+            }),
+            bridgetDelegationPreference,
+          });
+          yield* runtime.events.pipe(
+            Stream.takeUntil((event) => event.type === "turn.terminal"),
+            Stream.runDrain,
+          );
+          const methods: Array<string> = [];
+          while (true) {
+            const event = yield* Queue.take(protocolEvents);
+            if (event.direction !== "outgoing") continue;
+            const method = rawProtocolMethod(event);
+            if (method === undefined) continue;
+            methods.push(method);
+            if (method === "session/prompt") {
+              return { methods, prompt: rawProtocolPromptText(event) };
+            }
           }
+        });
+
+        const command = yield* runTurn(10, defaultPolicy, "/compact");
+        assert.isTrue(command.prompt.startsWith("/compact"));
+        assert.notInclude(command.prompt, "<t3_code_instructions>");
+        const firstDefault = yield* runTurn(11, defaultPolicy, "First default request.");
+        assert.include(firstDefault.prompt, "T3 Code interaction mode: Default");
+        if (hasT3Mcp) {
+          assert.include(firstDefault.prompt, "T3 Code collaborative browser");
+          assert.include(firstDefault.prompt, "T3 Code orchestration");
+        } else {
+          assert.include(firstDefault.prompt, "preference is off for this turn");
+          assert.notInclude(firstDefault.prompt, "orchestrator_capabilities");
         }
-      });
+        assert.notInclude(
+          firstDefault.methods,
+          "session/set_config_option",
+          "Build should preserve the agent's advertised mode default",
+        );
+        assert.include(
+          (yield* runTurn(12, defaultPolicy, "Second default request.")).prompt,
+          "Second default request.",
+        );
 
-      const command = yield* runTurn(0, defaultPolicy, "/compact");
-      assert.isTrue(command.prompt.startsWith("/compact"));
-      assert.notInclude(command.prompt, "<t3_code_instructions>");
-      const firstDefault = yield* runTurn(1, defaultPolicy, "First default request.");
-      assert.include(firstDefault.prompt, "T3 Code interaction mode: Default");
-      assert.include(firstDefault.prompt, "T3 Code collaborative browser");
-      assert.include(firstDefault.prompt, "T3 Code orchestration");
-      assert.notInclude(
-        firstDefault.methods,
-        "session/set_config_option",
-        "Build should preserve the agent's advertised mode default",
-      );
-      assert.include(
-        (yield* runTurn(2, defaultPolicy, "Second default request.")).prompt,
-        "Second default request.",
-      );
-
-      const planPolicy = policy("plan");
-      const firstPlan = yield* runTurn(3, planPolicy, "Plan this change.");
-      assert.include(firstPlan.prompt, "T3 Code interaction mode: Plan");
-      assert.include(firstPlan.methods, "session/set_config_option");
-      assert.include(
-        (yield* runTurn(4, planPolicy, "Continue planning.")).prompt,
-        "Continue planning.",
-      );
-      const restoredBuild = yield* runTurn(5, defaultPolicy, "Implement the change.");
-      assert.include(restoredBuild.prompt, "T3 Code interaction mode: Default");
-      assert.include(
-        restoredBuild.methods,
-        "session/set_config_option",
-        "Build should restore the native mode that T3 temporarily replaced for Plan",
-      );
-    }).pipe(Effect.provide(layerTest), Effect.scoped),
+        const planPolicy = policy("plan");
+        const firstPlan = yield* runTurn(13, planPolicy, "Plan this change.");
+        assert.include(firstPlan.prompt, "T3 Code interaction mode: Plan");
+        assert.include(firstPlan.methods, "session/set_config_option");
+        assert.include(
+          (yield* runTurn(14, planPolicy, "Continue planning.")).prompt,
+          "Continue planning.",
+        );
+        const restoredBuild = yield* runTurn(15, defaultPolicy, "Implement the change.");
+        assert.include(restoredBuild.prompt, "T3 Code interaction mode: Default");
+        assert.include(
+          restoredBuild.methods,
+          "session/set_config_option",
+          "Build should restore the native mode that T3 temporarily replaced for Plan",
+        );
+        const preferred = yield* runTurn(16, defaultPolicy, "Review next.", "prefer");
+        assert.include(preferred.prompt, "preference: blocked");
+        assert.notInclude(preferred.prompt, "Prefer native subagent tools");
+        const offCommand = yield* runTurn(17, defaultPolicy, "/compact", "off");
+        assert.isTrue(offCommand.prompt.startsWith("/compact"));
+        assert.notInclude(offCommand.prompt, "<t3_code_instructions>");
+        const restoredOff = yield* runTurn(18, defaultPolicy, "Continue normally.", "off");
+        assert.include(
+          restoredOff.prompt,
+          hasT3Mcp ? "Prefer native subagent tools" : "preference is off for this turn",
+        );
+        assert.notInclude(restoredOff.prompt, "preference: blocked");
+        assert.notInclude(
+          (yield* runTurn(19, defaultPolicy, "No repeated wrapper.", "off")).prompt,
+          "<t3_code_instructions>",
+        );
+      }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
   it.effect("starts a new replay message after ACP v2 plan boundaries", () =>

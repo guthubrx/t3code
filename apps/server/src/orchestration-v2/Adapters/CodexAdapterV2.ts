@@ -729,6 +729,8 @@ export function buildCodexTurnStartParams(input: {
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
   readonly modelSelection: ModelSelection;
   readonly hasT3Mcp?: boolean;
+  readonly bridgetDelegationPreference?: ProviderAdapterV2TurnInput["bridgetDelegationPreference"];
+  readonly hasBridgetMcp?: boolean;
   readonly browserToolsAvailable?: boolean;
   readonly deviceToolsAvailable?: boolean;
   /** ChatGPT token sharing does not accept service tiers. */
@@ -769,20 +771,22 @@ export function buildCodexTurnStartParams(input: {
         { kind: "untrusted" as const, value: entry.text },
       ]),
     );
-    const t3Context =
+    // Always send the current policy: omission cannot erase a saved ON developer message.
+    const t3Context = buildCodexAdditionalContext(
+      { model: input.modelSelection.model, reasoningEffort: effort ?? "medium" },
       input.hasT3Mcp === true
-        ? buildCodexAdditionalContext(
-            { model: input.modelSelection.model, reasoningEffort: effort ?? "medium" },
-            {
-              browser: input.browserToolsAvailable ?? true,
-              device: input.deviceToolsAvailable ?? false,
-            },
-          )
-        : undefined;
-    const additionalContext =
-      t3Context === undefined && Object.keys(appContext).length === 0
-        ? undefined
-        : { ...t3Context, ...appContext };
+        ? {
+            browser: input.browserToolsAvailable ?? true,
+            device: input.deviceToolsAvailable ?? false,
+          }
+        : false,
+      {
+        bridgetDelegationPreference: input.bridgetDelegationPreference,
+        hasBridgetMcp: input.hasBridgetMcp ?? false,
+        hasT3Mcp: input.hasT3Mcp === true,
+      },
+    );
+    const additionalContext = { ...t3Context, ...appContext };
     const collaborationMode: CodexSchema.ClientRequest__CollaborationMode | undefined =
       input.runtimePolicy.interactionMode !== "plan" && developerInstructions === undefined
         ? undefined
@@ -1804,7 +1808,10 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
         );
         const bridgetCredentialsByThread = new Map<
           ThreadId,
-          McpProviderSession.McpProviderSessionConfig | null
+          {
+            readonly credential: McpProviderSession.McpProviderSessionConfig | null;
+            readonly mounted: boolean;
+          }
         >();
         const currentMcpSession = (threadId: ThreadId) => {
           const current = McpProviderSession.readMcpProviderSession(threadId);
@@ -1832,7 +1839,11 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             const stillCurrent =
               params.threadId !== null && currentMcpSession(params.threadId) === session;
             if (params.threadId !== null) {
-              if (stillCurrent) bridgetCredentialsByThread.set(params.threadId, session ?? null);
+              if (stillCurrent)
+                bridgetCredentialsByThread.set(params.threadId, {
+                  credential: session ?? null,
+                  mounted: bridgetMcpServer !== undefined,
+                });
               else bridgetCredentialsByThread.delete(params.threadId);
             }
             return codexThreadRuntimeParams({
@@ -6290,7 +6301,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               const current = currentMcpSession(turnInput.threadId);
               if (
                 bridgetCredentialsByThread.has(turnInput.threadId) &&
-                bridgetCredentialsByThread.get(turnInput.threadId) === (current ?? null)
+                bridgetCredentialsByThread.get(turnInput.threadId)?.credential === (current ?? null)
               )
                 return current;
               yield* resumeNativeThread({
@@ -6303,7 +6314,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             const current = currentMcpSession(turnInput.threadId);
             if (
               bridgetCredentialsByThread.has(turnInput.threadId) &&
-              bridgetCredentialsByThread.get(turnInput.threadId) === (current ?? null)
+              bridgetCredentialsByThread.get(turnInput.threadId)?.credential === (current ?? null)
             )
               return current;
             return yield* toProtocolError(
@@ -6325,6 +6336,8 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               runtimePolicy: turnInput.runtimePolicy,
               modelSelection: turnInput.modelSelection,
               hasT3Mcp: mcpSession !== undefined,
+              bridgetDelegationPreference: turnInput.bridgetDelegationPreference,
+              hasBridgetMcp: bridgetCredentialsByThread.get(turnInput.threadId)?.mounted === true,
               browserToolsAvailable: mcpSession?.browserToolsAvailable ?? true,
               deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
               omitServiceTier: adapterOptions.resolveRuntime !== undefined,
@@ -6344,7 +6357,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             });
             if (
               mcpSession !== undefined &&
-              bridgetCredentialsByThread.get(turnInput.threadId) === mcpSession
+              bridgetCredentialsByThread.get(turnInput.threadId)?.credential === mcpSession
             ) {
               const revision = McpProviderSession.publishMcpProviderPermissions(
                 mcpSession,

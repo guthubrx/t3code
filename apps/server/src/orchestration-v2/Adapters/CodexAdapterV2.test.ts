@@ -58,6 +58,7 @@ import * as ServerConfig from "../../config.ts";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import type { EventNdjsonLogger } from "../../provider/EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
+import { buildCodexAdditionalContext } from "../../provider/CodexDeveloperInstructions.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectWorker from "../EffectWorker.ts";
 import * as Orchestrator from "../Orchestrator.ts";
@@ -478,9 +479,15 @@ describe("CodexAdapterV2 runtime policy", () => {
         modelSelection,
         appContext,
       });
-      assert.deepEqual(alone.additionalContext, {
-        "mcp_app_todos_list_todos_item-1": { kind: "untrusted", value: "Filtered to overdue" },
+      assert.deepEqual(alone.additionalContext?.["mcp_app_todos_list_todos_item-1"], {
+        kind: "untrusted",
+        value: "Filtered to overdue",
       });
+      assert.include(
+        alone.additionalContext!.t3_code_orchestration!.value,
+        "preference is off for this turn",
+      );
+      assert.isUndefined(alone.additionalContext!.t3_code_tools);
       // Alongside T3's own context, both are kept.
       const withT3 = yield* CodexAdapterV2.buildCodexTurnStartParams({
         nativeThreadId: "native-app-context",
@@ -495,6 +502,32 @@ describe("CodexAdapterV2 runtime policy", () => {
         value: "Filtered to overdue",
       });
       assert.isDefined(withT3.additionalContext?.["t3_code_runtime"]);
+    }),
+  );
+
+  it.effect("SPEC169 carries a blocked preference even without any T3 MCP configuration", () =>
+    Effect.gen(function* () {
+      for (const hasT3Mcp of [false, true]) {
+        const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
+          nativeThreadId: "native169",
+          codexInput: [{ type: "text", text: "delegate" }],
+          runtimePolicy: { runtimeMode: "full-access", interactionMode: "default", cwd: null },
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "parent" },
+          hasT3Mcp,
+          bridgetDelegationPreference: "prefer",
+          hasBridgetMcp: false,
+        });
+        assert.include(
+          params.additionalContext!.t3_code_orchestration!.value,
+          "preference: blocked",
+        );
+        assert.equal(params.additionalContext!.t3_code_orchestration!.kind, "application");
+        if (!hasT3Mcp) assert.isUndefined(params.additionalContext!.t3_code_tools);
+        assert.notInclude(
+          params.additionalContext!.t3_code_orchestration!.value,
+          "Prefer native subagent tools",
+        );
+      }
     }),
   );
 
@@ -1707,7 +1740,37 @@ function makeCodexReplayTranscript(input: {
     protocol: "codex.app-server",
     version: "0.144.0",
     scenario: input.scenario,
-    entries: input.entries,
+    // Legacy scenarios omit the now-required OFF reset. Keep strict frame comparison,
+    // while the dedicated resume oracle asserts its exact policy text independently.
+    entries: input.entries.map((entry) => {
+      if (entry.type !== "expect_outbound" || !Predicate.isObject(entry.frame)) return entry;
+      const frame = entry.frame;
+      if (
+        !("method" in frame) ||
+        frame.method !== "turn/start" ||
+        !("params" in frame) ||
+        !Predicate.isObject(frame.params)
+      )
+        return entry;
+      const params = frame.params;
+      if ("additionalContext" in params) return entry;
+      const model =
+        "model" in params && typeof params.model === "string" ? params.model : "gpt-5.4";
+      const reasoningEffort =
+        "effort" in params && typeof params.effort === "string" ? params.effort : "medium";
+      return {
+        ...entry,
+        frame: {
+          ...frame,
+          params: {
+            ...params,
+            additionalContext: buildCodexAdditionalContext({ model, reasoningEffort }, false, {
+              hasT3Mcp: false,
+            }),
+          },
+        },
+      };
+    }),
   };
 }
 
@@ -3221,6 +3284,97 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         assert.equal(harness.terminalEvents()[0]?.status, "completed");
       }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
     ),
+  );
+
+  it.effect(
+    "SPEC169 R2 sends OFF after native resume with an empty application-context cache",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const nativeThreadId = "native-policy169-restored";
+          const nativeTurnId = "native-policy169-restored-turn";
+          const entries = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Continue" });
+          const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
+            nativeThreadId,
+            codexInput: [{ type: "text", text: "Continue" }],
+            runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+            modelSelection: CODEX_TEST_MODEL_SELECTION,
+            hasT3Mcp: false,
+            bridgetDelegationPreference: "off",
+          });
+          assert.include(
+            params.additionalContext!.t3_code_orchestration!.value,
+            "preference is off for this turn",
+          );
+          assert.isUndefined(params.additionalContext!.t3_code_tools);
+          const transcript = makeCodexReplayTranscript({
+            scenario: "policy169-restored-off",
+            entries: [
+              ...entries.slice(0, 5),
+              {
+                type: "expect_outbound",
+                label: "resume existing native policy",
+                frame: {
+                  id: 3,
+                  method: "thread/resume",
+                  params: {
+                    threadId: nativeThreadId,
+                    excludeTurns: true,
+                    config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                frame: { id: 3, result: { thread: { id: nativeThreadId, updatedAt: 1782622450 } } },
+              },
+              {
+                type: "expect_outbound",
+                label: "replace persisted policy with OFF",
+                frame: { id: 4, method: "turn/start", params },
+              },
+              {
+                type: "emit_inbound",
+                frame: {
+                  id: 4,
+                  result: { turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }) },
+                },
+              },
+              entries[7]!,
+              {
+                type: "emit_inbound",
+                frame: {
+                  method: "turn/completed",
+                  params: {
+                    threadId: nativeThreadId,
+                    turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                  },
+                },
+              },
+            ],
+          });
+          const harness = yield* makeCodexReplayHarness(transcript);
+          const resumed = yield* harness.runtime.resumeThread({
+            providerThread: harness.providerThread,
+            modelSelection: CODEX_TEST_MODEL_SELECTION,
+            runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+          });
+          yield* harness.runtime.startTurn({
+            ...makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: resumed,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make("policy169-restored-off"),
+              text: "Continue",
+            }),
+            bridgetDelegationPreference: "off",
+            runOrdinal: 8,
+            providerTurnOrdinal: 8,
+          });
+          yield* harness.firstTerminal;
+          assert.equal(harness.terminalEvents()[0]?.status, "completed");
+        }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+      ),
   );
 
   it.effect("resumes a provider thread without requesting or decoding its history", () =>

@@ -8,13 +8,14 @@
  * Do not import t3code modules from the string body. The Pi process resolves
  * `@earendil-works/pi-coding-agent` and `typebox` from the user's pi install.
  */
-import { T3_CODE_ORCHESTRATION_INSTRUCTIONS } from "@t3tools/provider-core/server/orchestrationInstructions";
+import { t3OrchestrationInstructions } from "@t3tools/provider-core/server/orchestrationInstructions";
 
 export const PI_T3_MCP_EXTENSION_FILENAME = "pi-t3-mcp-extension.ts";
 
 export const T3_MCP_URL_ENV = "T3_MCP_URL";
 export const T3_MCP_BEARER_ENV = "T3_MCP_BEARER_TOKEN";
 export const T3_PI_RUNTIME_MODE_ENV = "T3_PI_RUNTIME_MODE";
+export const PI_DELEGATION_POLICY_COMMAND = "t3-bridget-policy";
 
 /**
  * Pi tools whose confirmations the bridge raises as file-change approvals.
@@ -29,7 +30,25 @@ import { Type } from "typebox";
 const URL_ENV = ${JSON.stringify(T3_MCP_URL_ENV)};
 const TOKEN_ENV = ${JSON.stringify(T3_MCP_BEARER_ENV)};
 const RUNTIME_MODE_ENV = ${JSON.stringify(T3_PI_RUNTIME_MODE_ENV)};
-const ORCHESTRATION_INSTRUCTIONS = ${JSON.stringify(T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim())};
+const POLICY_COMMAND = ${JSON.stringify(PI_DELEGATION_POLICY_COMMAND)};
+const ORCHESTRATION_INSTRUCTIONS = ${JSON.stringify({
+  off: t3OrchestrationInstructions().trim(),
+  prefer: t3OrchestrationInstructions({
+    bridgetDelegationPreference: "prefer",
+    hasBridgetMcp: false,
+  }).trim(),
+  blocked: t3OrchestrationInstructions({
+    bridgetDelegationPreference: "blocked",
+    hasBridgetMcp: false,
+  }).trim(),
+})};
+const BLOCKED_WITHOUT_T3 = ${JSON.stringify(
+  t3OrchestrationInstructions({
+    bridgetDelegationPreference: "blocked",
+    hasBridgetMcp: false,
+    hasT3Mcp: false,
+  }).trim(),
+)};
 const PROTOCOL = "2025-06-18";
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const FILE_CHANGE_TOOLS = new Set(${JSON.stringify(PI_FILE_CHANGE_TOOLS)});
@@ -260,6 +279,22 @@ export default async function t3McpExtension(pi: ExtensionAPI) {
 
   const endpoint = env(URL_ENV);
   const token = env(TOKEN_ENV);
+  let delegationPolicy: "off" | "prefer" | "blocked" = "blocked";
+  pi.registerCommand(POLICY_COMMAND, {
+    description: "Private T3 delegation guidance control",
+    handler: async (args, ctx) => {
+      const match = /^(off|prefer|blocked) ([0-9a-f]{16})$/.exec(args);
+      if (match === null) throw new Error("Invalid T3 delegation policy control.");
+      delegationPolicy = match[1] as "off" | "prefer" | "blocked";
+      // Pi reports handled even when a command throws: only this post-assignment receipt proves success.
+      ctx.ui.setStatus(POLICY_COMMAND + ":" + match[2], delegationPolicy);
+    },
+  });
+  pi.on("before_agent_start", (event) => ({
+    systemPrompt: delegationPolicy === "off" && (endpoint === undefined || token === undefined)
+      ? event.systemPrompt
+      : event.systemPrompt + "\\n\\n" + (endpoint === undefined || token === undefined ? BLOCKED_WITHOUT_T3 : ORCHESTRATION_INSTRUCTIONS[delegationPolicy]),
+  }));
   if (endpoint === undefined || token === undefined) {
     pi.on("session_start", async (_event, ctx) => {
       ctx.ui.notify(
@@ -361,8 +396,6 @@ export default async function t3McpExtension(pi: ExtensionAPI) {
   // Deliver orchestration guidance through pi's real system-prompt channel.
   // Wrapping the first user message instead would stop it from starting
   // with "/" and silently break slash-command expansion.
-  pi.on("before_agent_start", (event) => ({
-    systemPrompt: event.systemPrompt + "\\n\\n" + ORCHESTRATION_INSTRUCTIONS,
-  }));
+
 }
 `;

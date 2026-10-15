@@ -185,8 +185,11 @@ const makeOpenCodeRuntimeHarness = Effect.fn("makeOpenCodeRuntimeHarness")(funct
   const startTurn = (
     text = "hello",
     startProviderThread: OrchestrationV2ProviderThread = providerThread,
+    bridgetDelegationPreference?: ProviderAdapter.BridgetDelegationPreference,
+    ordinal = 1,
   ) =>
     runtime.startTurn({
+      bridgetDelegationPreference,
       appThread: {
         id: threadId,
         projectId: ProjectId.make(`project-opencode-${suffix}`),
@@ -211,10 +214,12 @@ const makeOpenCodeRuntimeHarness = Effect.fn("makeOpenCodeRuntimeHarness")(funct
         deletedAt: null,
       },
       threadId,
-      runId: RunId.make(`run-opencode-${suffix}`),
-      runOrdinal: 1,
-      providerTurnOrdinal: 1,
-      attemptId: RunAttemptId.make(`attempt-opencode-${suffix}`),
+      runId: RunId.make(`run-opencode-${suffix}${ordinal === 1 ? "" : `-${ordinal}`}`),
+      runOrdinal: ordinal,
+      providerTurnOrdinal: ordinal,
+      attemptId: RunAttemptId.make(
+        `attempt-opencode-${suffix}${ordinal === 1 ? "" : `-${ordinal}`}`,
+      ),
       rootNodeId: NodeId.make(`node-opencode-${suffix}`),
       providerThread: startProviderThread,
       message: {
@@ -240,6 +245,58 @@ const makeOpenCodeRuntimeHarness = Effect.fn("makeOpenCodeRuntimeHarness")(funct
 });
 
 describe("OpenCodeAdapterV2", () => {
+  it.effect("SPEC169 refreshes system policy on each reused OpenCode 1 turn", () =>
+    Effect.gen(function* () {
+      const nativeEvents = asyncEventStream();
+      const systems: Array<string> = [];
+      let promptId = "";
+      const harness = yield* makeOpenCodeRuntimeHarness("policy169", "root", {
+        event: { subscribe: async () => ({ stream: nativeEvents.stream }) },
+        session: {
+          create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+          promptAsync: async (input: { messageID: string; system?: string }) => {
+            promptId = input.messageID;
+            systems.push(input.system ?? "");
+            return { data: true };
+          },
+          abort: async () => ({ data: true }),
+          children: async () => ({ data: [] }),
+        },
+      });
+      let ordinal = 0;
+      for (const preference of ["prefer", "off", "prefer"] as const) {
+        ordinal += 1;
+        yield* harness.startTurn("Review", harness.providerThread, preference, ordinal);
+        const terminal = yield* harness.runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        yield* Effect.promise(() =>
+          nativeEvents.push({
+            type: "message.updated",
+            properties: {
+              sessionID: "root",
+              info: { id: promptId, role: "user", time: { created: 1 } },
+            },
+          }),
+        );
+        for (const type of ["busy", "idle"]) {
+          yield* Effect.promise(() =>
+            nativeEvents.push({
+              type: "session.status",
+              properties: { sessionID: "root", status: { type } },
+            }),
+          );
+        }
+        yield* Fiber.join(terminal);
+      }
+      assert.include(systems[0]!, "preference: blocked");
+      assert.notInclude(systems[0]!, "Prefer native subagent tools");
+      assert.notInclude(systems[1]!, "preference:");
+      assert.equal(systems[2], systems[0]);
+    }).pipe(Effect.scoped, Effect.provide(IdAllocator.layer)),
+  );
   it.effect.each(["completed", "failed", "unresolved", "unavailable", "reconnect"] as const)(
     "normalizes OpenCode step usage for %s turns",
     (ending) =>

@@ -166,14 +166,17 @@ export const layer = HttpApiBuilder.group(
         "threadSnapshot",
         Effect.fn("environment.orchestration.threadSnapshot")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
-          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          const principal = yield* requireEnvironmentScope(AuthOrchestrationReadScope);
           const snapshot = yield* loadThreadSnapshot(
             args.params.threadId,
             "orchestration_thread_snapshot_failed",
           ).pipe(traceLocalHandlerWork);
           return {
             snapshotSequence: snapshot.snapshotSequence,
-            projection: snapshot.projection,
+            projection:
+              principal.subject === "bridget"
+                ? { ...snapshot.projection, visibleTurnItems: [] }
+                : snapshot.projection,
           };
         }),
       )

@@ -67,7 +67,11 @@ const modelSelection = (model: string): ModelSelection => ({
   model,
 });
 
+type PolicyBehavior = "normal" | "missing" | "foreign" | "ack-only" | "stale" | "rejected";
+
 interface FakePi {
+  readonly setPolicyBehavior: (mode: PolicyBehavior) => void;
+  readonly takePolicyRequest: Effect.Effect<PiRpcRecord>;
   readonly spawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
   readonly emit: (record: PiRpcRecord) => Effect.Effect<void>;
   readonly takeRequest: (type: string) => Effect.Effect<PiRpcRecord>;
@@ -133,6 +137,8 @@ const recordedIdleState = (sessionFile: string) => ({
 const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
   const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done>();
   const requests = yield* Queue.unbounded<PiRpcRecord>();
+  const policyRequests = yield* Queue.unbounded<PiRpcRecord>();
+  let policyBehavior: PolicyBehavior = "normal";
   const entriesQueue: Array<unknown> = [];
   const messagesQueue: Array<unknown> = [];
   const stateQueue: Array<Record<string, unknown>> = [];
@@ -191,8 +197,29 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
         return { ...base, data: messagesQueue.shift() ?? { messages: [] } };
       case "get_session_stats":
         return { ...base, data: statsQueue.shift() ?? {} };
-      case "get_commands":
-        return { ...base, ...(commandsQueue.shift() ?? { data: { commands: [] } }) };
+      case "get_commands": {
+        const queued = commandsQueue.shift();
+        if (queued?.success === false) return { ...base, ...queued };
+        const data = (queued?.data ?? { commands: [] }) as { commands: unknown[] };
+        const extensionIndex = lastSpawn.args.indexOf("--extension");
+        const own = {
+          name: "t3-bridget-policy",
+          source: "extension",
+          sourceInfo: {
+            path:
+              policyBehavior === "foreign"
+                ? "/foreign/extension.ts"
+                : lastSpawn.args[extensionIndex + 1],
+          },
+        };
+        return {
+          ...base,
+          data: {
+            ...data,
+            commands: [...(data.commands ?? []), ...(policyBehavior === "missing" ? [] : [own])],
+          },
+        };
+      }
       case "fork":
         return { ...base, data: { text: "Hello pi", cancelled: false } };
       default:
@@ -211,6 +238,31 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
         if (line.length === 0) continue;
         const record = decodeJsonLine(line) as PiRpcRecord;
         allRequests.push(record);
+        if (
+          record["type"] === "prompt" &&
+          typeof record["message"] === "string" &&
+          record["message"].startsWith("/t3-bridget-policy ")
+        ) {
+          yield* Queue.offer(policyRequests, record);
+          const [, mode, nonce] = record["message"].split(" ");
+          if (policyBehavior === "normal" || policyBehavior === "stale")
+            yield* emit({
+              type: "extension_ui_request",
+              method: "setStatus",
+              statusKey:
+                "t3-bridget-policy:" + (policyBehavior === "stale" ? "ffffffffffffffff" : nonce),
+              statusText: mode,
+            });
+          yield* emit({
+            type: "response",
+            id: record["id"],
+            command: "prompt",
+            success: policyBehavior !== "rejected",
+            data: { disposition: "handled" },
+            ...(policyBehavior === "rejected" ? { error: "policy control rejected" } : {}),
+          });
+          continue;
+        }
         yield* Queue.offer(requests, record);
         if (record["type"] === "get_state" && deferState) {
           deferState = false;
@@ -263,6 +315,10 @@ const makeFakePi: Effect.Effect<FakePi> = Effect.gen(function* () {
     });
 
   return {
+    setPolicyBehavior: (mode) => {
+      policyBehavior = mode;
+    },
+    takePolicyRequest: Queue.take(policyRequests),
     spawner,
     emit,
     takeRequest,
@@ -401,10 +457,12 @@ const startTurn = Effect.fnUntraced(function* (
   runOrdinal = 1,
   threadId = THREAD_ID,
   continuation = false,
+  bridgetDelegationPreference?: ProviderAdapter.BridgetDelegationPreference,
 ) {
   const appThread = yield* makeAppThread(model, threadId);
   const runId = RunId.make(`run:${threadId}:${runOrdinal}`);
   yield* runtime.startTurn({
+    bridgetDelegationPreference,
     appThread,
     threadId,
     runId,
@@ -1111,7 +1169,17 @@ describe("PiAdapterV2", () => {
         true,
       );
       yield* takeEvent((event) => event.type === "turn.terminal");
-      assert.equal(fake.allRequests().filter((request) => request["type"] === "prompt").length, 1);
+      assert.deepEqual(
+        fake
+          .allRequests()
+          .filter(
+            (request) =>
+              request["type"] === "prompt" &&
+              !(request["message"] as string).startsWith("/t3-bridget-policy "),
+          )
+          .map((request) => request["message"]),
+        ["/hello"],
+      );
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
@@ -3202,6 +3270,157 @@ describe("PiAdapterV2", () => {
       const terminal = yield* takeEvent((event) => event.type === "turn.terminal");
       assert.isTrue(terminal.type === "turn.terminal" && terminal.status === "completed");
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+});
+
+describe("SPEC169 Pi private policy handshake", () => {
+  it.effect("consumes its private receipt before a user turn claims native background work", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const offers =
+        yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+      const { runtime } = yield* openRuntime(fake, "default", THREAD_ID, SESSION_ID, undefined, {
+        offer: (request) => Queue.offer(offers, request).pipe(Effect.asVoid),
+      });
+      const thread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* fake.emit({ type: "agent_start" });
+      yield* Queue.take(offers);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+      yield* startTurn(
+        runtime,
+        thread,
+        "default",
+        [],
+        "Continue authorized work",
+        undefined,
+        1,
+        THREAD_ID,
+        false,
+        "prefer",
+      );
+      assert.match(
+        (yield* fake.takePolicyRequest)["message"] as string,
+        /^\/t3-bridget-policy blocked [0-9a-f]{16}$/,
+      );
+      assert.equal((yield* fake.takeRequest("prompt"))["message"], "Continue authorized work");
+      assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+  it.effect("requires the first OFF receipt and preserves the user slash command", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime } = yield* openRuntime(fake);
+      const thread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, thread, "default", [], "/example");
+      const control = yield* fake.takePolicyRequest;
+      assert.match(control["message"] as string, /^\/t3-bridget-policy off [0-9a-f]{16}$/);
+      assert.equal((yield* fake.takeRequest("prompt"))["message"], "/example");
+      assert.isBelow(
+        fake.allRequests().indexOf(control),
+        fake.allRequests().findIndex((r) => r["message"] === "/example"),
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+  it.effect.each([
+    "/t3-bridget-policy off 0123456789abcdef",
+    "  /t3-bridget-policy:1 off 0123456789abcdef",
+  ])("refuses user access to the private command: %s", (message) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime } = yield* openRuntime(fake);
+      const thread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      assert.equal(
+        (yield* startTurn(
+          runtime,
+          thread,
+          "default",
+          [],
+          message,
+          undefined,
+          1,
+          THREAD_ID,
+          false,
+          "prefer",
+        ).pipe(Effect.exit))._tag,
+        "Failure",
+      );
+      assert.isFalse(fake.allRequests().some((request) => request["type"] === "prompt"));
+      yield* startTurn(
+        runtime,
+        thread,
+        "default",
+        [],
+        "/example",
+        undefined,
+        1,
+        THREAD_ID,
+        false,
+        "prefer",
+      );
+      const control = yield* fake.takePolicyRequest;
+      assert.match(control["message"] as string, /^\/t3-bridget-policy blocked [0-9a-f]{16}$/);
+      assert.equal((yield* fake.takeRequest("prompt"))["message"], "/example");
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+  it.effect.each(["missing", "foreign"] as const)(
+    "never sends an internal model prompt for a %s control",
+    (behavior) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        fake.setPolicyBehavior(behavior);
+        const { runtime } = yield* openRuntime(fake);
+        const thread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        assert.equal((yield* startTurn(runtime, thread).pipe(Effect.exit))._tag, "Failure");
+        assert.isFalse(fake.allRequests().some((r) => r["type"] === "prompt"));
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+  it.effect.each(["ack-only", "stale", "rejected"] as const)(
+    "withholds the real prompt after %s and retries with a new nonce",
+    (behavior) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        fake.setPolicyBehavior(behavior);
+        const { runtime } = yield* openRuntime(fake);
+        const thread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        const pending = yield* startTurn(runtime, thread).pipe(Effect.exit, Effect.forkChild);
+        const first = yield* fake.takePolicyRequest;
+        yield* TestClock.adjust("3 seconds");
+        assert.equal((yield* Fiber.join(pending))._tag, "Failure");
+        assert.isFalse(
+          fake
+            .allRequests()
+            .some(
+              (r) =>
+                r["type"] === "prompt" &&
+                !(r["message"] as string).startsWith("/t3-bridget-policy "),
+            ),
+        );
+        fake.setPolicyBehavior("normal");
+        yield* startTurn(runtime, thread);
+        const second = yield* fake.takePolicyRequest;
+        assert.notEqual(second["message"], first["message"]);
+        assert.equal((yield* fake.takeRequest("prompt"))["message"], "Hello pi");
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 });
 

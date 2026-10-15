@@ -63,6 +63,7 @@ import { ChildProcessSpawner } from "effect/process";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { mcpToolPresentation } from "@t3tools/provider-core/server/mcpToolPresentation";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
+import { PI_DELEGATION_POLICY_COMMAND } from "./mcpExtensionSource.ts";
 import {
   expandPiSkillReference,
   parsePiCompactCommand,
@@ -458,12 +459,31 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             }),
         ),
       );
+      let policyCommandVerified = false;
+      let policyAttemptOrdinal = 0;
+      let lastAcknowledgedDelegationPolicy: ProviderAdapter.BridgetDelegationPreference | undefined;
+      let pendingDelegationReceipt:
+        | {
+            readonly nonce: string;
+            readonly mode: ProviderAdapter.BridgetDelegationPreference;
+            readonly received: Deferred.Deferred<void>;
+          }
+        | undefined;
       const discoverSkillNames = connection
         .request({ type: "get_commands" }, PI_SKILL_DISCOVERY_TIMEOUT_MS)
         .pipe(
-          Effect.map(
-            (data) => new Set(parsePiDiscoveredCommands(data).skills.map((skill) => skill.name)),
-          ),
+          Effect.map((data) => {
+            const commands = recordField(data, "commands");
+            policyCommandVerified =
+              Array.isArray(commands) &&
+              commands.some(
+                (command) =>
+                  recordString(command, "name") === PI_DELEGATION_POLICY_COMMAND &&
+                  recordString(command, "source") === "extension" &&
+                  recordString(recordField(command, "sourceInfo"), "path") === extensionPath,
+              );
+            return new Set(parsePiDiscoveredCommands(data).skills.map((skill) => skill.name));
+          }),
         );
       let skillNames: Set<string> | null = null;
 
@@ -603,6 +623,40 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
 
       const request = (record: PiRpcRecord, timeoutMs = PI_REQUEST_TIMEOUT_MS) =>
         connection.request(record, timeoutMs);
+
+      const applyDelegationPolicy = Effect.fnUntraced(function* (
+        preference: ProviderAdapter.BridgetDelegationPreference = "off",
+      ) {
+        const mode: ProviderAdapter.BridgetDelegationPreference =
+          preference === "off" ? "off" : "blocked";
+        if (lastAcknowledgedDelegationPolicy === mode) return;
+        if (!policyCommandVerified) yield* discoverSkillNames;
+        if (!policyCommandVerified)
+          return yield* protocolError("Pi delegation policy control is unavailable");
+        const nonce = (++policyAttemptOrdinal).toString(16).padStart(16, "0");
+        if (!/^[0-9a-f]{16}$/.test(nonce))
+          return yield* protocolError("Pi delegation policy counter is exhausted");
+        const received = yield* Deferred.make<void>();
+        const pending = { nonce, mode, received };
+        pendingDelegationReceipt = pending;
+        yield* Effect.gen(function* () {
+          const ack = yield* request({
+            type: "prompt",
+            message: "/" + PI_DELEGATION_POLICY_COMMAND + " " + mode + " " + nonce,
+          });
+          const disposition = recordString(ack, "disposition");
+          if (disposition !== undefined && disposition !== "handled")
+            return yield* protocolError("Pi did not handle its delegation policy control");
+          yield* Deferred.await(received).pipe(Effect.timeout("2 seconds"));
+          lastAcknowledgedDelegationPolicy = mode;
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (pendingDelegationReceipt === pending) pendingDelegationReceipt = undefined;
+            }),
+          ),
+        );
+      });
 
       const nonNegativeInteger = (input: unknown, key: string): number | undefined => {
         const value = recordNumber(input, key);
@@ -1214,6 +1268,21 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const method = recordString(event, "method");
         const nativeRequestId = recordString(event, "id");
         if (method === undefined) return;
+        if (
+          method === "setStatus" &&
+          recordString(event, "statusKey")?.startsWith(PI_DELEGATION_POLICY_COMMAND + ":")
+        ) {
+          const pending = pendingDelegationReceipt;
+          if (
+            pending !== undefined &&
+            recordString(event, "statusKey") ===
+              PI_DELEGATION_POLICY_COMMAND + ":" + pending.nonce &&
+            recordString(event, "statusText") === pending.mode
+          ) {
+            yield* Deferred.succeed(pending.received, undefined);
+          }
+          return;
+        }
         if (method === "notify") {
           const state = threadState;
           const turn = state?.activeTurn ?? null;
@@ -1607,10 +1676,17 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         const interactiveUiRequest =
           event["type"] === "extension_ui_request" &&
           ["select", "confirm", "input", "editor"].includes(String(event["method"]));
+        // The control receipt must arrive before startTurn can claim a native wake.
+        // It carries no user output and is consumed privately by its correlated waiter.
+        const delegationPolicyReceipt =
+          event["type"] === "extension_ui_request" &&
+          event["method"] === "setStatus" &&
+          recordString(event, "statusKey")?.startsWith(PI_DELEGATION_POLICY_COMMAND + ":");
         if (
           threadState?.activeTurn === null &&
           pendingWake !== null &&
           !interactiveUiRequest &&
+          !delegationPolicyReceipt &&
           !String(event["type"]).startsWith("t3.") &&
           event["type"] !== "response"
         ) {
@@ -2329,6 +2405,10 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         text: string,
         attachments: ReadonlyArray<ChatAttachment>,
       ) {
+        // Only the correlated adapter handshake may change this private state.
+        if (/^\/t3-bridget-policy(?::[0-9]+)?(?:\s|$)/.test(text.trimStart())) {
+          return yield* protocolError("The Pi delegation policy command is private to T3");
+        }
         // Provider discovery and the live session are separate Pi processes.
         // Retry a failed session-local lookup once at first use so a transient
         // startup failure cannot leave a visible $ skill inert for this session.
@@ -2471,6 +2551,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               !continuation && compactCommand === null
                 ? yield* resolvePromptPayload(turnInput.message.text, turnInput.message.attachments)
                 : null;
+            if (!continuation && compactCommand === null)
+              yield* applyDelegationPolicy(turnInput.bridgetDelegationPreference);
             const startedAt = yield* DateTime.now;
             const syntheticNativeTurnId = `${state.providerThread.id}:attempt:${turnInput.attemptId}`;
             const providerTurn: OrchestrationV2ProviderTurn = {

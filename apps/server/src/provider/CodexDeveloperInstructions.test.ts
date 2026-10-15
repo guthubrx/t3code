@@ -113,3 +113,26 @@ function toolInstructions(
 ) {
   return buildCodexAdditionalContext(runtime, available).t3_code_tools?.value ?? "";
 }
+
+describe("SPEC169 application delegation context", () => {
+  it("uses application context for ON, blocks missing mounts and restores the exact OFF text", () => {
+    const runtime = { model: "selected-parent", reasoningEffort: "high" };
+    const off = buildCodexAdditionalContext(runtime, false);
+    const on = buildCodexAdditionalContext(runtime, false, {
+      bridgetDelegationPreference: "prefer",
+      hasBridgetMcp: true,
+    });
+    NodeAssert.equal(on.t3_code_orchestration?.kind, "application");
+    NodeAssert.match(on.t3_code_orchestration!.value, /bridget_auto_delegate/);
+    NodeAssert.doesNotMatch(on.t3_code_orchestration!.value, /Prefer native subagent tools/);
+    const blocked = buildCodexAdditionalContext(runtime, false, {
+      bridgetDelegationPreference: "prefer",
+      hasBridgetMcp: false,
+    });
+    NodeAssert.match(blocked.t3_code_orchestration!.value, /preference: blocked/);
+    NodeAssert.deepEqual(
+      buildCodexAdditionalContext(runtime, false, { bridgetDelegationPreference: "off" }),
+      off,
+    );
+  });
+});

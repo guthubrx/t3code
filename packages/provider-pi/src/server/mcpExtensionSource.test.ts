@@ -2,7 +2,7 @@ import * as NodeModule from "node:module";
 import * as NodeVM from "node:vm";
 import { assert, describe, it } from "@effect/vitest";
 
-import { PI_T3_MCP_EXTENSION_SOURCE } from "./mcpExtensionSource.ts";
+import { PI_DELEGATION_POLICY_COMMAND, PI_T3_MCP_EXTENSION_SOURCE } from "./mcpExtensionSource.ts";
 
 type RequestHook = (
   event: { payload: unknown },
@@ -33,12 +33,24 @@ type AgentStartHook = (
 async function loadMcpBridge(
   options: {
     readonly modern?: boolean;
+    readonly hasT3Mcp?: boolean;
+    readonly initialPolicy?: "off" | "blocked";
     readonly toolSearchAvailable?: boolean;
     readonly toolSearchDisabled?: boolean;
     readonly allowsTool?: (name: string) => boolean;
   } = {},
 ) {
   const handlers = new Map<string, AgentStartHook>();
+  const commands = new Map<
+    string,
+    {
+      handler: (
+        args: string,
+        ctx: { ui: { setStatus: (key: string, value: string) => void } },
+      ) => Promise<void>;
+    }
+  >();
+  const receipts: Array<[string, string]> = [];
   const tools: RegisteredTool[] = [];
   const requests: Array<{ readonly method: string; readonly params?: unknown }> = [];
   let activeTools = ["read"];
@@ -62,7 +74,10 @@ async function loadMcpBridge(
   );
   await NodeVM.runInNewContext(`${source}\nt3McpExtension(pi)`, {
     process: {
-      env: { T3_MCP_URL: "http://fixture.invalid/mcp", T3_MCP_BEARER_TOKEN: "fixture-token" },
+      env:
+        options.hasT3Mcp === false
+          ? {}
+          : { T3_MCP_URL: "http://fixture.invalid/mcp", T3_MCP_BEARER_TOKEN: "fixture-token" },
     },
     AbortSignal,
     Type: { Unsafe: (schema: unknown) => schema },
@@ -89,6 +104,15 @@ async function loadMcpBridge(
     },
     pi: {
       on: (name: string, handler: AgentStartHook) => handlers.set(name, handler),
+      registerCommand: (
+        name: string,
+        command: {
+          handler: (
+            args: string,
+            ctx: { ui: { setStatus: (key: string, value: string) => void } },
+          ) => Promise<void>;
+        },
+      ) => commands.set(name, command),
       registerTool: (tool: RegisteredTool) => {
         if (options.allowsTool && !options.allowsTool(tool.name)) return;
         const index = tools.findIndex((current) => current.name === tool.name);
@@ -114,7 +138,18 @@ async function loadMcpBridge(
         : {}),
     },
   });
+  const setPolicy = (args: string) =>
+    commands.get(PI_DELEGATION_POLICY_COMMAND)!.handler(args, {
+      ui: {
+        setStatus: (key, value) => {
+          receipts.push([key, value]);
+        },
+      },
+    });
+  if (options.initialPolicy !== "blocked") await setPolicy("off 0000000000000001");
   return {
+    setPolicy,
+    receipts,
     handlers,
     tools,
     requests,
@@ -279,6 +314,7 @@ describe("Pi tool discovery permissions", () => {
     await NodeVM.runInNewContext(`${source}\nt3McpExtension(pi)`, {
       process: { env: { T3_PI_RUNTIME_MODE: "approval-required" } },
       pi: {
+        registerCommand: () => undefined,
         on: (name: string, handler: ToolCallHook) => {
           if (name === "tool_call") toolCall = handler;
         },
@@ -322,7 +358,10 @@ async function loadRequestHook(): Promise<RequestHook> {
   );
   await NodeVM.runInNewContext(`${source}\nt3McpExtension(pi)`, {
     process: { env: {} },
-    pi: { on: (name: string, handler: RequestHook) => handlers.set(name, handler) },
+    pi: {
+      registerCommand: () => undefined,
+      on: (name: string, handler: RequestHook) => handlers.set(name, handler),
+    },
   });
   const hook = handlers.get("before_provider_request");
   assert.isDefined(hook);
@@ -357,5 +396,63 @@ describe("Pi upstream output-budget workaround", () => {
     assert.isUndefined(
       hook({ payload: { max_tokens: 231_969 } }, { model: { provider: "anthropic" } }),
     );
+  });
+});
+
+describe("SPEC169 private Pi policy control", () => {
+  it("keeps ON blocked without advertising a missing T3 mount", async () => {
+    const bridge = await loadMcpBridge({ hasT3Mcp: false, initialPolicy: "blocked" });
+    const render = async () =>
+      (
+        await bridge.handlers.get("before_agent_start")!(
+          { systemPrompt: "Pi" },
+          { ui: { notify: () => undefined } },
+        )
+      ).systemPrompt;
+    assert.include(await render(), "preference: blocked");
+    assert.notInclude(await render(), "orchestrator_capabilities");
+    await bridge.setPolicy("off 0123456789abcdef");
+    assert.equal(await render(), "Pi");
+    await bridge.setPolicy("blocked fedcba9876543210");
+    assert.include(await render(), "preference: blocked");
+    assert.notInclude(await render(), "orchestrator_capabilities");
+    assert.equal(bridge.tools.length, 0);
+    assert.equal(bridge.requests.length, 0);
+  });
+  it("starts blocked, acknowledges only valid correlated assignments and restores OFF", async () => {
+    const bridge = await loadMcpBridge({ initialPolicy: "blocked" });
+    const render = async () =>
+      (
+        await bridge.handlers.get("before_agent_start")!(
+          { systemPrompt: "Pi" },
+          { ui: { notify: () => undefined } },
+        )
+      ).systemPrompt;
+    assert.include(await render(), "preference: blocked");
+    assert.equal(bridge.receipts.length, 0);
+    await bridge.setPolicy("off 0123456789abcdef");
+    assert.include(await render(), "Prefer native subagent tools");
+    assert.deepEqual(bridge.receipts.at(-1), ["t3-bridget-policy:0123456789abcdef", "off"]);
+    for (const invalid of [
+      "prefer",
+      "off x",
+      "blocked 0123456789abcdef extra",
+      "untrusted 0123456789abcdef",
+      "prefer 0123456789abcdeG",
+    ]) {
+      let rejected = false;
+      try {
+        await bridge.setPolicy(invalid);
+      } catch {
+        rejected = true;
+      }
+      assert.isTrue(rejected);
+      assert.include(await render(), "Prefer native subagent tools");
+      assert.equal(bridge.receipts.length, 1);
+    }
+    await bridge.setPolicy("prefer fedcba9876543210");
+    assert.include(await render(), "preference: blocked");
+    assert.notInclude(await render(), "Prefer native subagent tools");
+    assert.deepEqual(bridge.receipts.at(-1), ["t3-bridget-policy:fedcba9876543210", "prefer"]);
   });
 });

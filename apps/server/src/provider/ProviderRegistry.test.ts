@@ -350,6 +350,11 @@ function makeMutableServerSettingsService(
       start: Effect.void,
       ready: Effect.void,
       getSettings: Ref.get(settingsRef),
+      getBridgetDelegationPreference: Ref.get(settingsRef).pipe(
+        Effect.map((settings) =>
+          settings.preferBridgetDelegation ? ("prefer" as const) : ("off" as const),
+        ),
+      ),
       updateSettings: (patch) =>
         Effect.gen(function* () {
           const current = yield* Ref.get(settingsRef);

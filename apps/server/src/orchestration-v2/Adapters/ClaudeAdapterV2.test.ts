@@ -2,6 +2,7 @@ import * as NodeOS from "node:os";
 
 import type {
   Query as ClaudeQuery,
+  McpServerStatus,
   SDKMessage,
   SDKResultMessage,
   SDKUserMessage,
@@ -29,6 +30,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -62,6 +64,7 @@ import { ThreadToolkit } from "../../mcp/toolkits/thread/tools.ts";
 import { OrchestratorToolkit } from "../../mcp/toolkits/orchestrator/tools.ts";
 import { ClaudeExecutableFileCheck } from "../../provider/Drivers/ClaudeExecutable.ts";
 import type { EventNdjsonLogger } from "../../provider/EventNdjsonLogger.ts";
+import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
 import {
   ProviderAdapterV2RuntimePolicy,
   type ProviderAdapterV2Event,
@@ -159,7 +162,302 @@ function makeClaudeTestTurnInput(input: {
   };
 }
 
+describe("SPEC169 R2 Claude actual MCP preparation", () => {
+  type Preparation = "mounted" | "disabled" | "explicit_config" | "user_server" | "sdk_error";
+  const makeHarness = Effect.fnUntraced(function* (
+    preparations: ReadonlyArray<Preparation>,
+    gateIndex?: number,
+  ) {
+    const fs = yield* FileSystem.FileSystem;
+    const home = yield* fs.makeTempDirectoryScoped({ prefix: "c169-" });
+    const threadId = ThreadId.make("claude169-preparation");
+    const credential: McpProviderSession.McpProviderSessionConfig = {
+      environmentId: EnvironmentId.make("environment-private169"),
+      threadId,
+      providerSessionId: "provider-private169",
+      providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      endpoint: "http://127.0.0.1:43123/mcp",
+      authorizationHeader: "Bearer private-fixture169",
+      browserToolsAvailable: false,
+      t3codeHome: home,
+    };
+    McpProviderSession.setMcpProviderSession(credential);
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+    );
+    const gate = Promise.withResolvers<void>();
+    const returnStarted = Promise.withResolvers<void>();
+    const candidates: Array<{
+      options: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions;
+      prompts: Array<SDKUserMessage>;
+      received: ReturnType<typeof Promise.withResolvers<void>>;
+      returnStarted: boolean;
+      returned: boolean;
+    }> = [];
+    const sdkQuery: NonNullable<Parameters<typeof ClaudeAdapterV2.makeQueryRunnerLayer>[0]> = ({
+      prompt,
+      options,
+    }) => {
+      assert.isNotString(prompt);
+      const index = candidates.length;
+      const preparation = preparations[index];
+      assert.isDefined(preparation, "no third candidate may be created");
+      const candidate = {
+        options: options as ClaudeAdapterV2.ClaudeAgentSdkQueryOptions,
+        prompts: [] as Array<SDKUserMessage>,
+        received: Promise.withResolvers<void>(),
+        returnStarted: false,
+        returned: false,
+      };
+      candidates.push(candidate);
+      // Consume the actual runner queue. A retired reader must never steal the final prompt.
+      void (async () => {
+        if (typeof prompt === "string") return;
+        for await (const message of prompt) {
+          candidate.prompts.push(message);
+          candidate.received.resolve();
+        }
+      })();
+      let statuses: McpServerStatus[] =
+        preparation === "disabled"
+          ? [{ name: "bridget", status: "disabled" }]
+          : preparation === "user_server"
+            ? [
+                {
+                  name: "bridget",
+                  status: "connected",
+                  config: { type: "http", url: "http://foreign.invalid/mcp" },
+                },
+              ]
+            : [];
+      return {
+        mcpServerStatus: async () => {
+          if (preparation === "sdk_error") throw new Error("private SDK preparation failure");
+          return statuses;
+        },
+        setMcpServers: async () => {
+          statuses = [
+            {
+              name: "bridget",
+              status: "connected",
+              source: "dynamic",
+              tools: [
+                { name: "bridget_thread" },
+                { name: "bridget_capabilities" },
+                { name: "bridget_task_status" },
+              ],
+            },
+          ];
+          return { added: ["bridget"], removed: [], errors: {} };
+        },
+        applyFlagSettings: async () => {},
+        return: async () => {
+          candidate.returnStarted = true;
+          if (index === gateIndex) {
+            returnStarted.resolve();
+            await gate.promise;
+          }
+          candidate.returned = true;
+          return { done: true, value: undefined };
+        },
+        close: () => {},
+      } as unknown as ClaudeQuery;
+    };
+    const runner = yield* ClaudeAdapterV2.ClaudeAgentSdkQueryRunner.pipe(
+      Effect.provide(
+        ClaudeAdapterV2.makeQueryRunnerLayer(sdkQuery).pipe(
+          Layer.provide(
+            Layer.succeed(
+              ProviderEventLoggers.ProviderEventLoggers,
+              ProviderEventLoggers.NoOpProviderEventLoggers,
+            ),
+          ),
+        ),
+      ),
+    );
+    const input = (resume: boolean): ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput => ({
+      threadId,
+      providerSessionId: ProviderSessionId.make("provider-private169"),
+      bridgetCredential: credential,
+      bridgetDelegationPreference: "prefer",
+      options: ClaudeAdapterV2.makeClaudeQueryOptions({
+        modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+        nativeThreadId: "native-private169",
+        resume,
+        ...(resume ? { resumeSessionAt: "native-head169" } : {}),
+        cwd: home,
+        environment: {
+          HOME: home,
+          T3CODE_BRIDGET_EXECUTABLE: "/usr/bin/true",
+          PATH: "/usr/bin:/bin",
+        },
+        mcpServers: { "t3-code": { type: "http", url: "http://fixture.invalid/mcp" } },
+        bridgetDelegationPreference: "prefer",
+        hasBridgetMcp: false,
+        ...(preparations[0] === "explicit_config"
+          ? {
+              settings: {
+                ...DEFAULT_CLAUDE_SETTINGS,
+                launchArgs: "--mcp-config /private/config169",
+              },
+            }
+          : {}),
+      }),
+    });
+    return { runner, input, candidates, gate, returnStarted };
+  });
+  const withNode = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(Effect.provide(NodeServices.layer));
+  it.effect.each([
+    ["mounted", false],
+    ["mounted", true],
+    ["disabled", false],
+    ["disabled", true],
+    ["explicit_config", false],
+    ["explicit_config", true],
+    ["user_server", false],
+    ["user_server", true],
+  ] as const)("uses the actual %s preparation before offer (resume %s)", ([preparation, resume]) =>
+    Effect.scoped(
+      withNode(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness([preparation, preparation]);
+          const session = yield* harness.runner.open(harness.input(resume));
+          assert.equal(session.bridgetMcpMounted, preparation === "mounted");
+          assert.lengthOf(harness.candidates, preparation === "mounted" ? 1 : 2);
+          const final = harness.candidates.at(-1)!;
+          const finalPrompt = final.options.systemPrompt as { append: string; snapshot: boolean };
+          assert.include(
+            finalPrompt.append,
+            preparation === "mounted" ? "preference: prefer" : "preference: blocked",
+          );
+          assert.isFalse(finalPrompt.snapshot);
+          for (const candidate of harness.candidates) {
+            assert.lengthOf(candidate.prompts, 0);
+            if (resume) {
+              assert.equal(candidate.options.resume, "native-private169");
+              assert.equal(candidate.options.resumeSessionAt, "native-head169");
+              assert.isUndefined(candidate.options.sessionId);
+            } else {
+              assert.equal(candidate.options.sessionId, "native-private169");
+              assert.isUndefined(candidate.options.resume);
+              assert.isUndefined(candidate.options.resumeSessionAt);
+            }
+          }
+          if (harness.candidates.length === 2) assert.isTrue(harness.candidates[0]!.returned);
+          const message: SDKUserMessage = {
+            type: "user",
+            message: { role: "user", content: "Continue main work" },
+            parent_tool_use_id: null,
+            session_id: "native-private169",
+          };
+          yield* session.offer(message);
+          yield* Effect.promise(() => final.received.promise);
+          assert.deepEqual(final.prompts, [message]);
+          for (const retired of harness.candidates.slice(0, -1))
+            assert.lengthOf(retired.prompts, 0);
+          yield* session.close;
+        }),
+      ),
+    ),
+  );
+  it.effect("awaits the physical first Query.return before opening a blocked replacement", () =>
+    Effect.scoped(
+      withNode(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness(["disabled", "disabled"], 0);
+          const opening = yield* harness.runner.open(harness.input(false)).pipe(Effect.forkChild);
+          yield* Effect.promise(() => harness.returnStarted.promise).pipe(
+            Effect.raceFirst(
+              Fiber.join(opening).pipe(
+                Effect.andThen(Effect.die("SDK open ended before reaching the cleanup gate")),
+              ),
+            ),
+          );
+          assert.lengthOf(harness.candidates, 1);
+          assert.isFalse(harness.candidates[0]!.returned);
+          harness.gate.resolve();
+          const session = yield* Fiber.join(opening);
+          assert.lengthOf(harness.candidates, 2);
+          assert.isTrue(harness.candidates[0]!.returned);
+          yield* session.close;
+        }),
+      ),
+    ),
+  );
+  it.effect("awaits second-candidate cleanup before propagating a preparation exception", () =>
+    Effect.scoped(
+      withNode(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness(["disabled", "sdk_error"], 1);
+          const opening = yield* harness.runner
+            .open(harness.input(false))
+            .pipe(Effect.exit, Effect.forkChild);
+          yield* Effect.promise(() => harness.returnStarted.promise).pipe(
+            Effect.raceFirst(
+              Fiber.join(opening).pipe(
+                Effect.andThen(Effect.die("SDK open ended before reaching the cleanup gate")),
+              ),
+            ),
+          );
+          assert.lengthOf(harness.candidates, 2);
+          assert.isFalse(harness.candidates[1]!.returned);
+          harness.gate.resolve();
+          const exit = yield* Fiber.join(opening);
+          assert.isTrue(Exit.isFailure(exit));
+          assert.isTrue(
+            harness.candidates.every(
+              (candidate) => candidate.returned && candidate.prompts.length === 0,
+            ),
+          );
+        }),
+      ),
+    ),
+  );
+  it.effect(
+    "closes both candidates and refuses before offer if their actual mount facts diverge",
+    () =>
+      Effect.scoped(
+        withNode(
+          Effect.gen(function* () {
+            const harness = yield* makeHarness(["disabled", "mounted"]);
+            const exit = yield* harness.runner.open(harness.input(true)).pipe(Effect.exit);
+            assert.isTrue(Exit.isFailure(exit));
+            if (Exit.isFailure(exit))
+              assert.include(Cause.pretty(exit.cause), "ClaudeBridgetMcpPreparationChangedError");
+            assert.lengthOf(harness.candidates, 2);
+            assert.isTrue(
+              harness.candidates.every(
+                (candidate) => candidate.returned && candidate.prompts.length === 0,
+              ),
+            );
+          }),
+        ),
+      ),
+  );
+});
+
 describe("ClaudeAdapterV2 runtime query policy", () => {
+  it.each([false, true])(
+    "SPEC169 renders the factual Bridget mount into SDK append: %s",
+    (hasBridgetMcp) => {
+      const options = ClaudeAdapterV2.makeClaudeQueryOptions({
+        modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+        nativeThreadId: "policy169-mounted",
+        resume: true,
+        cwd: "/workspace",
+        mcpServers: { "t3-code": { type: "http", url: "http://fixture.invalid/mcp" } },
+        bridgetDelegationPreference: "prefer",
+        hasBridgetMcp,
+      });
+      const system = options.systemPrompt as { append: string; snapshot: boolean };
+      assert.isFalse(system.snapshot);
+      assert.include(system.append, hasBridgetMcp ? "preference: prefer" : "preference: blocked");
+      if (hasBridgetMcp) assert.include(system.append, "bridget_auto_delegate");
+      assert.notInclude(system.append, "Prefer native subagent tools");
+      assert.notInclude(system.append, "For every T3 delegated review round");
+    },
+  );
   it.each([false, true])("requests thinking summaries with resume=%s", (resume) => {
     const options = ClaudeAdapterV2.makeClaudeQueryOptions({
       modelSelection: CLAUDE_TEST_MODEL_SELECTION,
@@ -2426,6 +2724,120 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.isTrue(yield* harness.hasPendingBackgroundWork);
         }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
       ),
+  );
+
+  it.effect(
+    "SPEC169 refreshes the real Claude query options after ON and OFF without compaction",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarnessWithOptions({ freshQueueOnReopen: true });
+          let previous: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+          for (const [ordinal, preference] of [
+            [1, "off"],
+            [2, "prefer"],
+            [3, "prefer"],
+            [4, "off"],
+          ] as const) {
+            const turn = makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make("attempt169-" + ordinal),
+              text: "Continue",
+              attachments: [],
+              providerTurnOrdinal: ordinal,
+            });
+            yield* harness.runtime.startTurn({ ...turn, bridgetDelegationPreference: preference });
+            const options = harness.getOpenedOptions()!;
+            if (ordinal === 3) assert.strictEqual(options, previous);
+            else assert.notStrictEqual(options, previous);
+            assert.isTrue(
+              typeof options.systemPrompt === "object" && !Array.isArray(options.systemPrompt),
+            );
+            const system = options.systemPrompt as { append: string; snapshot: boolean };
+            assert.isFalse(system.snapshot);
+            if (preference === "prefer") assert.include(system.append, "preference: blocked");
+            else assert.notInclude(system.append, "preference: blocked");
+            previous = options;
+            yield* Queue.offer(
+              harness.processQueues.at(-1)!,
+              makeResultFrame({
+                uuid: `00000000-0000-4000-8000-${String(ordinal).padStart(12, "0")}`,
+                result: "Main work completed.",
+              }),
+            );
+            yield* Queue.take(harness.terminalReceipts);
+          }
+          assert.lengthOf(harness.offeredMessages, 4);
+        }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+      ),
+  );
+
+  it.effect("SPEC169 refuses a policy toggle while preserving Claude background work", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const turn = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt169-background"),
+          text: "Continue",
+          attachments: [],
+        });
+        yield* harness.runtime.startTurn({ ...turn, bridgetDelegationPreference: "off" });
+        const options = harness.getOpenedOptions();
+        yield* harness.offerAndWait(wakeTaskStarted);
+        yield* harness.offerAndWait(turnOneResult);
+        yield* Queue.take(harness.terminalReceipts);
+        const refused = yield* harness.runtime
+          .startTurn({
+            ...turn,
+            bridgetDelegationPreference: "prefer",
+            attemptId: RunAttemptId.make("attempt169-refused"),
+            providerTurnOrdinal: 2,
+          })
+          .pipe(Effect.result);
+        assert.equal(refused._tag, "Failure");
+        if (refused._tag === "Failure")
+          assert.instanceOf(
+            refused.failure.cause,
+            ClaudeAdapterV2.ClaudeBackgroundWorkBlocksQueryReplacementError,
+          );
+        assert.strictEqual(harness.getOpenedOptions(), options);
+        assert.lengthOf(harness.offeredMessages, 1);
+        assert.isTrue(yield* harness.hasPendingBackgroundWork);
+        // Finish the original background work through its native continuation.
+        yield* harness.offerAndWait(wakeNotification);
+        yield* harness.offerAndWait(wakeTurnInit);
+        yield* harness.runtime.startTurn({
+          ...turn,
+          bridgetDelegationPreference: "off",
+          attemptId: RunAttemptId.make("attempt169-background-finish"),
+          providerTurnOrdinal: 2,
+          message: { ...turn.message, createdBy: "agent", creationSource: "provider" },
+        });
+        yield* harness.offerAndWait(wakeAssistant);
+        yield* harness.offerAndWait(wakeResult);
+        yield* Queue.take(harness.terminalReceipts);
+        assert.isFalse(yield* harness.hasPendingBackgroundWork);
+        yield* harness.runtime.startTurn({
+          ...turn,
+          bridgetDelegationPreference: "prefer",
+          attemptId: RunAttemptId.make("attempt169-after-background"),
+          providerTurnOrdinal: 3,
+        });
+        const updated = harness.getOpenedOptions()!;
+        assert.notStrictEqual(updated, options);
+        const system = updated.systemPrompt as { append: string; snapshot: boolean };
+        assert.include(system.append, "preference: blocked");
+        assert.isFalse(system.snapshot);
+        assert.lengthOf(harness.offeredMessages, 2);
+        yield* harness.offerAndWait(turnOneResult);
+        yield* Queue.take(harness.terminalReceipts);
+      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    ),
   );
 
   it.effect.each(["completed", "interrupted"] as const)(

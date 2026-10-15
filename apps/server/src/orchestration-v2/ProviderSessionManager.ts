@@ -391,6 +391,15 @@ export const layerWithOptions = (
           );
         },
       );
+      const delegationPreference = Option.isNone(serverSettings)
+        ? Effect.succeed("off" as const)
+        : serverSettings.value.getBridgetDelegationPreference.pipe(
+            Effect.catch(() =>
+              Effect.logWarning("Could not read Bridget delegation preference.").pipe(
+                Effect.as("blocked" as const),
+              ),
+            ),
+          );
       const layerScope = yield* Effect.scope;
       // Ctrl+C, or a stop that signals the whole process group, reaches the
       // provider CLIs with the server. They report their own background work
@@ -1820,7 +1829,10 @@ export const layerWithOptions = (
                     ),
                   ),
                   () =>
-                    runtime.startTurn(input).pipe(turnMetrics("send", input.modelSelection.model)),
+                    Effect.gen(function* () {
+                      const bridgetDelegationPreference = yield* delegationPreference;
+                      return yield* runtime.startTurn({ ...input, bridgetDelegationPreference });
+                    }).pipe(turnMetrics("send", input.modelSelection.model)),
                   (_, exit) =>
                     Exit.isFailure(exit)
                       ? observeActivity(
