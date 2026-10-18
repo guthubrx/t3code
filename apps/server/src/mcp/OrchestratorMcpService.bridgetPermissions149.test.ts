@@ -85,7 +85,12 @@ const projection = (runs: unknown[]) =>
     ...idleThreadProjection(liveThreadShell(ThreadId.make("thread:a"))),
     runs,
   }) as unknown as OrchestrationV2ThreadProjection;
-const layer = (records: (threadId: ThreadId) => Effect.Effect<OrchestrationV2ThreadProjection>) =>
+const layer = (
+  records: (
+    threadId: ThreadId,
+    fields?: ReadonlyArray<string>,
+  ) => Effect.Effect<OrchestrationV2ThreadProjection>,
+) =>
   Service.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -269,4 +274,36 @@ describe("refusals that never downgrade to v1", () => {
       }),
     ).pipe(Effect.provide(layer(() => Effect.succeed(projection([run()]))))),
   );
+});
+
+describe("SPEC172 bounded session attestation", () => {
+  it.effect("reads only live run records before and after source verification", () => {
+    const reads: boolean[] = [];
+    let verified = false;
+    return withCleanup(
+      Effect.gen(function* () {
+        const credential = mountedCredential();
+        McpProviderSession.publishMcpProviderPermissions(credential, fact(), binding, async () => {
+          verified = true;
+          return true;
+        });
+        const service = yield* Service.OrchestratorMcpService;
+        const result = yield* service.sessionIdentity(scope());
+        assert.equal(result.version, 2);
+        assert.deepEqual(reads, [false, true]);
+      }),
+    ).pipe(
+      Effect.provide(
+        layer((_id, fields) =>
+          Effect.sync(() => {
+            assert.deepEqual(fields, ["runs"], "attestation must not load conversation history");
+            reads.push(verified);
+            const value = projection([run()]);
+            // No messages, provider turns or tools are needed to prove this live run.
+            return { thread: value.thread, runs: value.runs } as OrchestrationV2ThreadProjection;
+          }),
+        ),
+      ),
+    );
+  });
 });

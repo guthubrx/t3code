@@ -913,6 +913,12 @@ const make = Effect.gen(function* () {
         ),
       );
 
+  // Une attestation n’a besoin que du fil et de ses exécutions, jamais de son historique.
+  const loadSessionProjection = (threadId: ThreadId) =>
+    threadManagement
+      .getThreadRecords(threadId, ["runs"])
+      .pipe(Effect.mapError(threadManagementFailure));
+
   const loadProjectThread = (
     projectId: OrchestrationV2ThreadProjection["thread"]["projectId"],
     threadId: ThreadId,
@@ -1782,7 +1788,9 @@ const make = Effect.gen(function* () {
 
     sessionIdentity: (callerScope) =>
       Effect.gen(function* () {
-        const { scope, parent } = yield* loadThreadCaller(callerScope, "bridget_session");
+        yield* requireCapability(callerScope);
+        const scope = yield* requireThreadScope(callerScope, "bridget_session");
+        const parent = yield* loadSessionProjection(scope.thread.threadId);
         if (parent.thread.deletedAt !== null) {
           return yield* failure("parent_not_active", "The calling thread has been deleted.");
         }
@@ -1808,7 +1816,7 @@ const make = Effect.gen(function* () {
           }),
         );
         // Source verification does I/O. Recheck the live run and credential after it.
-        const current = yield* loadProjection(scope.thread.threadId);
+        const current = yield* loadSessionProjection(scope.thread.threadId);
         yield* assertLiveCaller(scope, current);
         const currentRun = ThreadManagementService.latestActiveRun(current);
         if (
