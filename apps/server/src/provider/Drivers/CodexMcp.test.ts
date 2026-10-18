@@ -50,6 +50,7 @@ describe("SPEC148 Codex private MCP identity", () => {
         assert.deepEqual(a, {
           command: "/usr/bin/true",
           args: ["mcp"],
+          tool_timeout_sec: 3700,
           env: {
             HOME: f.home,
             BRIDGET_HOME: `${f.home}/.cache/bridget-core`,
@@ -221,9 +222,9 @@ describe("SPEC149 Codex official global Bridget refresh", () => {
         // Pinned to the canonical absolute path, never the user's string (symlink).
         assert.equal(result.command, yield* f.fs.realPath(f.real));
         assert.notEqual(result.command, f.link);
-        // Safe existing options survive.
+        // Startup options survive; the tool budget covers Bridget waits.
         assert.equal(result.startup_timeout_sec, 45);
-        assert.equal(result.tool_timeout_sec, 120);
+        assert.equal(result.tool_timeout_sec, 3700);
         assert.deepEqual(result.env, canonicalEnv(f));
         assert.notInclude(JSON.stringify(result), "stale");
         // No credential mutation: the user's config object and the process env stay as read.
@@ -429,5 +430,33 @@ describe("SPEC149 Codex official global Bridget refresh", () => {
         );
       }).pipe(Effect.provide(NodeServices.layer)),
     ),
+  );
+});
+
+describe("SPEC172 Bridget remote transport budget", () => {
+  it.effect.each([undefined, 30, 3700, 7200])(
+    "covers native waits without lowering a longer timeout (%s)",
+    (timeout) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* officialFixture();
+          const definition = {
+            command: f.link,
+            args: ["mcp"],
+            ...(timeout === undefined ? {} : { tool_timeout_sec: timeout }),
+          };
+          const config = { config: { mcp_servers: { bridget: definition } } };
+          const before = structuredClone(config);
+          const result = asServer(
+            yield* prepareCodexBridgetMcp({
+              ...f,
+              readConfig: () => Effect.succeed(config),
+            }),
+          );
+          assert.equal(result.tool_timeout_sec, Math.max(timeout ?? 0, 3700));
+          assert.deepEqual(config, before);
+          assert.deepEqual(result.env, canonicalEnv(f));
+        }).pipe(Effect.provide(NodeServices.layer)),
+      ),
   );
 });

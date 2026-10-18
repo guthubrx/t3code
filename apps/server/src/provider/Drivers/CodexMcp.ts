@@ -3,6 +3,10 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { refreshBridgetMcpServer } from "../../bridget/BridgetMcp.ts";
 
+// Même plafond que le wrapper Codex natif Bridget : attente métier de 3600 s
+// plus attestation et transport. Les délais des missions restent indépendants.
+const BRIDGET_TOOL_TIMEOUT_SECONDS = 3700;
+
 const decodeConfig = Schema.decodeUnknownEffect(
   Schema.Struct({
     config: Schema.Struct({
@@ -28,7 +32,13 @@ export const prepareCodexBridgetMcp = Effect.fn("prepareCodexBridgetMcp")(functi
     );
     if (mount.code !== "ready") return undefined;
     const { type: _type, ...server } = mount.server;
-    return server satisfies Schema.Json;
+    return {
+      ...server,
+      tool_timeout_sec: Math.max(
+        typeof server.tool_timeout_sec === "number" ? server.tool_timeout_sec : 0,
+        BRIDGET_TOOL_TIMEOUT_SECONDS,
+      ),
+    } satisfies Schema.Json;
   }).pipe(
     Effect.timeout("6 seconds"),
     Effect.catch(() => Effect.succeed(undefined)),
