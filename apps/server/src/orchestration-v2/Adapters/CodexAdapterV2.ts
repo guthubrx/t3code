@@ -4492,6 +4492,13 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                 nativeTurnId: payload.turn.id,
                 startedAt: codexTimestamp(payload.turn.startedAt),
               });
+              // Native goal turns share one run and its exact effective policy.
+              // Transfer retirement ownership to the continuation, without a new grant.
+              const permissionOwner = bridgetPermissionOwners.get(goalHold.context.input);
+              if (permissionOwner !== undefined) {
+                bridgetPermissionOwners.delete(goalHold.context.input);
+                bridgetPermissionOwners.set(next.input, permissionOwner);
+              }
               const goalRun = goalRuns.get(goalHold.context.providerTurnId) ?? [goalHold.context];
               goalRun.push(next);
               goalRuns.set(goalHold.context.providerTurnId, goalRun);
@@ -5639,6 +5646,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           context: ActiveCodexTurnContext,
           event: CodexRootTerminalEvent,
         ) {
+          retireBridgetPermissions(context.input);
           const current =
             event.status === "failed" && event.failure.class === "usage_limit"
               ? {
@@ -5798,7 +5806,6 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               if (current !== input.context) {
                 return false;
               }
-              if (input.context.subagent === null) retireBridgetPermissions(input.context.input);
               const providerRetry = yield* Ref.modify(providerRetries, (current) => {
                 const retry = current.get(input.context.providerTurnId);
                 if (retry === undefined) {
@@ -5855,6 +5862,8 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                 nativeThreadId != null &&
                 (goalsByNativeThread.get(nativeThreadId)?.status === "active" ||
                   (activation !== undefined && !activation.stopped));
+              if (input.context.subagent === null && !holdsForGoal)
+                retireBridgetPermissions(input.context.input);
               const completedTurn: OrchestrationV2ProviderTurn = {
                 id: input.context.providerTurnId,
                 providerThreadId: input.context.providerThread.id,

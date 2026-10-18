@@ -27,6 +27,7 @@ import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexReplay from "effect-codex-app-server/replay";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -1189,6 +1190,7 @@ const openCodexPermissionSession = (input: {
   readonly suffix: string;
   readonly entries: ReadonlyArray<CodexReplay.CodexAppServerReplayEntry>;
   readonly credentialInstanceId?: string;
+  readonly beforeEmitInbound?: CodexReplay.CodexAppServerReplayDriver["beforeEmitInbound"];
 }) =>
   Effect.gen(function* () {
     const now = yield* DateTime.now;
@@ -1209,11 +1211,14 @@ const openCodexPermissionSession = (input: {
       scenario: `perm-149-g3-${input.suffix}`,
       entries: input.entries,
     });
+    const driver = yield* CodexReplay.makeReplayDriver(transcript, {
+      ...(input.beforeEmitInbound ? { beforeEmitInbound: input.beforeEmitInbound } : {}),
+    });
     const fileSystem = yield* FileSystem.FileSystem;
     const serverConfig = yield* makeReplayServerConfig(transcript.scenario).pipe(Effect.orDie);
     const clientFactory: CodexAdapterV2.CodexAppServerClientFactoryShape = {
       open: (openInput) =>
-        Layer.build(CodexReplay.layerReplay(transcript)).pipe(
+        Layer.build(CodexReplay.layerReplayWithDriver(driver)).pipe(
           Effect.mapError(
             (cause) =>
               new ProviderAdapterOpenSessionError({
@@ -1500,5 +1505,114 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
           assert.equal(stillOk.permissions.run_id, "run-attempt-g3-ok");
       }).pipe(Effect.ensuring(Effect.all([ok.cleanup, failing.cleanup])));
     }).pipe(Effect.scoped, Effect.provide(codexG3Layer)),
+  );
+});
+
+describe("Codex goal permission lifetime (spec172)", () => {
+  it.effect.each(["completed", "interrupted", "failed"] as const)(
+    "spec172 preserves the permission fact across goal continuations until %s",
+    (status) =>
+      Effect.gen(function* () {
+        const nativeThreadId = `native-goal-permissions-${status}`;
+        const secondStarted = yield* Deferred.make<void>();
+        const thirdStarted = yield* Deferred.make<void>();
+        const finishSecond = yield* Deferred.make<void>();
+        const finishThird = yield* Deferred.make<void>();
+        const terminal = yield* Deferred.make<void>();
+        const goal = (state: "active" | "complete", tokensUsed: number) => ({
+          threadId: nativeThreadId,
+          objective: "Verify remote delegation",
+          status: state,
+          tokenBudget: null,
+          tokensUsed,
+          timeUsedSeconds: 1,
+          createdAt: 1782622440,
+          updatedAt: 1782622441,
+        });
+        const notification = (label: string, method: string, params: unknown) => ({
+          type: "emit_inbound" as const,
+          label,
+          frame: { method, params },
+        });
+        const h = yield* openCodexPermissionSession({
+          suffix: `goal-${status}`,
+          beforeEmitInbound: (entry) =>
+            entry.label === "finish-second"
+              ? Deferred.await(finishSecond)
+              : entry.label === "finish-third"
+                ? Deferred.await(finishThird)
+                : Effect.void,
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId: "goal-first", prompt: "hello" }),
+            notification("goal-active", "thread/goal/updated", {
+              threadId: nativeThreadId,
+              turnId: "goal-first",
+              goal: goal("active", 1),
+            }),
+            codexTurnCompleted({ nativeThreadId, nativeTurnId: "goal-first", status: "completed" }),
+            notification("second-started", "turn/started", {
+              threadId: nativeThreadId,
+              turn: codexReplayTurn("goal-second", "inProgress"),
+            }),
+            {
+              ...codexTurnCompleted({
+                nativeThreadId,
+                nativeTurnId: "goal-second",
+                status: "completed",
+              }),
+              label: "finish-second",
+            },
+            notification("third-started", "turn/started", {
+              threadId: nativeThreadId,
+              turn: codexReplayTurn("goal-third", "inProgress"),
+            }),
+            notification("finish-third", "thread/goal/updated", {
+              threadId: nativeThreadId,
+              turnId: "goal-third",
+              goal: goal(status === "completed" ? "complete" : "active", 3),
+            }),
+            codexTurnCompleted({ nativeThreadId, nativeTurnId: "goal-third", status }),
+          ],
+        });
+        yield* Effect.gen(function* () {
+          yield* h.runtime.events.pipe(
+            Stream.runForEach((event) => {
+              if (event.type === "turn.terminal") return Deferred.succeed(terminal, undefined);
+              if (event.type !== "provider_turn.updated" || event.providerTurn.status !== "running")
+                return Effect.void;
+              const nativeId = event.providerTurn.nativeTurnRef?.nativeId;
+              return nativeId === "goal-second"
+                ? Deferred.succeed(secondStarted, undefined)
+                : nativeId === "goal-third"
+                  ? Deferred.succeed(thirdStarted, undefined)
+                  : Effect.void;
+            }),
+            Effect.forkScoped,
+          );
+          const turnInput = h.turn(`attempt-goal-${status}`);
+          yield* h.runtime.startTurn(turnInput);
+          yield* Deferred.await(secondStarted);
+          const second = yield* h.read(turnInput);
+          assert.equal(
+            second.status,
+            "valid",
+            "the automatic second turn must retain its permission fact",
+          );
+          yield* Deferred.succeed(finishSecond, undefined);
+          yield* Deferred.await(thirdStarted);
+          assert.deepEqual(
+            yield* h.read(turnInput),
+            second,
+            "continuations inherit the exact original rights and revision",
+          );
+          yield* Deferred.succeed(finishThird, undefined);
+          yield* Deferred.await(terminal);
+          assert.deepEqual(
+            yield* h.read(turnInput),
+            { status: "unavailable" },
+            "the last turn must retire the original owner",
+          );
+        }).pipe(Effect.ensuring(h.cleanup));
+      }).pipe(Effect.scoped, Effect.provide(codexG3Layer)),
   );
 });
