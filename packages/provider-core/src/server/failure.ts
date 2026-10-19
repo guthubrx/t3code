@@ -13,10 +13,9 @@ import type {
 import * as DateTime from "effect/DateTime";
 import * as Cause from "effect/Cause";
 
-import type * as IdAllocator from "./IdAllocator.ts";
+import * as IdAllocator from "./IdAllocator.ts";
 import * as Schema from "effect/Schema";
 
-/** Raised when portable history does not fit the target provider's context window. */
 export class ContextHandoffBudgetError extends Schema.TaggedError<ContextHandoffBudgetError>()(
   "ContextHandoffBudgetError",
   {},
@@ -31,7 +30,6 @@ export const MAX_PROVIDER_FAILURE_CODE_LENGTH = 128;
 
 const DEFAULT_PROVIDER_FAILURE_MESSAGE = "Provider turn failed.";
 
-/** Translate known categories without exposing arbitrary provider defect text. */
 function causeMessage(cause: unknown): string | undefined {
   const seen = new Set<unknown>();
   let message: string | undefined;
@@ -47,6 +45,7 @@ function causeMessage(cause: unknown): string | undefined {
         case "ContextHandoffBudgetError":
           return new ContextHandoffBudgetError().message;
         case "ClaudeBackgroundWorkBlocksQueryReplacementError":
+        case "CursorModelUnavailableError":
           return stringField(cause, "message");
         case "ContextHandoffDeliveryUncertainError":
           return "T3 could not confirm whether conversation history reached the provider. Retry the turn to recover the session.";
@@ -116,7 +115,6 @@ function replaceUnsafeControlCharacters(value: string): string {
   return sanitized.join("");
 }
 
-/** Removes common credential forms before provider text crosses a transport boundary. */
 function redactProviderFailureText(value: string): string {
   return replaceUnsafeControlCharacters(value)
     .replace(/\bhttps?:\/\/[^\s<>"']+/giu, redactUrl)
@@ -172,7 +170,6 @@ export function makeProviderFailure(input: {
 }
 
 export function makeProviderFailureTurnItem(input: {
-  readonly idAllocator: IdAllocator.IdAllocatorV2Shape;
   readonly driver: ProviderDriverKind;
   readonly threadId: ThreadId;
   readonly runId: RunId | null;
@@ -186,7 +183,7 @@ export function makeProviderFailureTurnItem(input: {
   readonly occurredAt: DateTime.Utc;
 }): Extract<OrchestrationV2TurnItem, { readonly type: "error" }> {
   return {
-    id: input.idAllocator.derive.turnItemFromProviderItem({
+    id: IdAllocator.derive.turnItemFromProviderItem({
       driver: input.driver,
       nativeItemId: `terminal-failure:${input.providerTurnId}`,
     }),
@@ -210,7 +207,6 @@ export function makeProviderFailureTurnItem(input: {
 }
 
 export function makeProviderRetryTurnItem(input: {
-  readonly idAllocator: IdAllocator.IdAllocatorV2Shape;
   readonly driver: ProviderDriverKind;
   readonly threadId: ThreadId;
   readonly runId: RunId | null;
@@ -237,7 +233,7 @@ export function makeProviderRetryTurnItem(input: {
     title = "Provider retry stopped";
   }
   return {
-    id: input.idAllocator.derive.turnItemFromProviderItem({
+    id: IdAllocator.derive.turnItemFromProviderItem({
       driver: input.driver,
       nativeItemId: `terminal-failure:${input.providerTurnId}`,
     }),

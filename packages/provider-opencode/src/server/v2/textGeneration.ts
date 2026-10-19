@@ -1,10 +1,7 @@
 /**
- * Text generation on an OpenCode 2 server. Both of its `generate` endpoints
- * answer 403 on OpenCode's free tier ("free tier can only be used from within
- * OpenCode"), so each request runs as a prompt in a temporary session, as 1.x
+ * Both of its `generate` endpoints answer 403 on OpenCode's free tier ("free tier can only be
+ * used from within OpenCode"), so each request runs as a prompt in a temporary session, as 1.x
  * does, and the session is removed afterwards.
- *
- * @module textGeneration/OpenCode2TextGeneration
  */
 import { AbsolutePath, Location, Model, Provider, Session } from "@opencode/client/effect";
 import { TextGenerationError } from "@t3tools/contracts";
@@ -21,18 +18,16 @@ import * as TextGenerationOperations from "@t3tools/provider-core/server/textGen
 
 const isTextGenerationError = Schema.is(TextGenerationError);
 
-/** A generation that takes this long is stuck; its session is stopped and removed. */
 const GENERATION_TIMEOUT = "3 minutes";
 
 /**
- * Nothing in a text generation needs a tool, so every tool asks and T3 is not
- * there to answer. Denying `shell` or `read` outright gets the whole session
- * refused on OpenCode's free models, and an ask that is never answered would
- * hang, so asks are rejected as they arrive.
+ * Denying `shell` or `read` outright gets the whole session refused on
+ * OpenCode's free models, and an ask that is never answered would hang, so asks
+ * are rejected as they arrive.
  */
 const GENERATION_PERMISSIONS = [{ action: "*", resource: "*", effect: "ask" }] as const;
 
-/** How a generation ended. A failure's cause is the provider's own error, kept out of `detail`. */
+/** A failure's cause is the provider's own error, kept out of `detail`. */
 type Outcome =
   | { readonly _tag: "text"; readonly text: string }
   | { readonly _tag: "failed"; readonly detail: string; readonly cause?: unknown };
@@ -40,9 +35,9 @@ type Outcome =
 const runOnServer = (
   connection: OpenCode2Server.OpenCode2Connection,
   input: TextGenerationOperations.Request<Schema.Top>,
-  resolveAttachmentPath: ProviderHost.ProviderHost["Service"]["resolveAttachmentPath"],
 ) =>
   Effect.gen(function* () {
+    const { resolveAttachmentPath } = yield* ProviderHost.ProviderHost;
     const { client } = connection;
     const parsed = OpenCodeRuntime.parseOpenCodeModelSlug(input.modelSelection.model);
     if (parsed === null) {
@@ -181,14 +176,14 @@ const runOnServer = (
     return result.text;
   }).pipe(Effect.scoped);
 
-/** Text generation for an instance whose server is OpenCode 2. */
 export const make = Effect.fn("OpenCode2TextGeneration.make")(function* () {
   const server = yield* OpenCode2Server.OpenCode2Server;
-  const { resolveAttachmentPath } = yield* ProviderHost.ProviderHost;
+  const host = yield* ProviderHost.ProviderHost;
   const run: TextGenerationOperations.Runner = (input) =>
     server
-      .withConnection((connection) => runOnServer(connection, input, resolveAttachmentPath))
+      .withConnection((connection) => runOnServer(connection, input))
       .pipe(
+        Effect.provideService(ProviderHost.ProviderHost, host),
         Effect.mapError((cause) =>
           isTextGenerationError(cause)
             ? cause
@@ -200,5 +195,8 @@ export const make = Effect.fn("OpenCode2TextGeneration.make")(function* () {
         ),
         Effect.flatMap((raw) => TextGenerationOperations.decodeJsonReply(input, "OpenCode", raw)),
       );
-  return TextGenerationOperations.fromRunner("OpenCode2TextGeneration", run);
+  return TextGenerationOperations.fromRunner(
+    "OpenCode2TextGeneration",
+    TextGenerationOperations.withoutInvestigation("OpenCode", run),
+  );
 });

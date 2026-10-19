@@ -24,10 +24,14 @@ const state = vi.hoisted(() => ({
   cancelNative: vi.fn().mockResolvedValue({ _tag: "Success" }),
 }));
 
+vi.mock("@effect/atom-react", () => ({ useAtomValue: () => true }));
+vi.mock("../../state/environments", () => ({ useEnvironmentProviders: () => new Map() }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => state.navigate }));
 vi.mock("../../state/entities", () => ({
   useThreadProjection: () => ({ projection: state.projection }),
   useThreadShells: () => state.shells,
+  useThreadRelationshipShells: () =>
+    state.shells.map((value) => (value as { source: unknown }).source),
   useProjects: () => state.projects,
   useServerConfigs: () => state.configs,
 }));

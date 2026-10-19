@@ -1,3 +1,8 @@
+// Native bridge interop: real Node APIs form the boundary under test.
+// @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics globalTimers:off
+// @effect-diagnostics globalDate:off
+// @effect-diagnostics globalFetchInEffect:off
 import type * as NodeHttp from "node:http";
 import { assert, describe, it } from "@effect/vitest";
 import { observeWrittenMcpSession } from "./BridgetRustInterop.testkit.ts";

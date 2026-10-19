@@ -17,10 +17,11 @@ export const resolveBridgetExecutable = Effect.fn("resolveBridgetExecutable")(fu
         path.join(environment.HOME, ".local", "bin", "bridget"),
         { env: environment },
       ).pipe(Effect.option);
-      if (Option.isSome(userBinary)) return userBinary.value;
+      if (Option.isSome(userBinary) && userBinary.value !== null) return userBinary.value;
     }
     return yield* resolveCommandPath("bridget", { env: environment });
   }).pipe(Effect.mapError(() => new BridgetReadError({ code: "unavailable" })));
+  if (executable === null) return yield* new BridgetReadError({ code: "unavailable" });
   if (/\.(cmd|bat)$/i.test(executable)) return yield* new BridgetReadError({ code: "unavailable" });
   return executable;
 });

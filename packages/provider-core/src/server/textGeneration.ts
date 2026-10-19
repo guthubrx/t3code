@@ -2,6 +2,7 @@ import type {
   BranchNamingOptions,
   ChatAttachment,
   ModelSelection,
+  PullRequestReviewGuide,
   TextGenerationError,
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
@@ -13,17 +14,14 @@ export interface CommitMessageGenerationInput {
   branch: string | null;
   stagedSummary: string;
   stagedPatch: string;
-  /** When true, the model also returns a semantic branch name for the change. */
   includeBranch?: boolean;
   policy?: TextGenerationPolicy | undefined;
-  /** What model and provider to use for generation. */
   modelSelection: ModelSelection;
 }
 
 export interface CommitMessageGenerationResult {
   subject: string;
   body: string;
-  /** Only present when `includeBranch` was set on the input. */
   branch?: string | undefined;
 }
 
@@ -36,7 +34,6 @@ export interface PrContentGenerationInput {
   diffPatch: string;
   changeRequestTemplate?: string | undefined;
   policy?: TextGenerationPolicy | undefined;
-  /** What model and provider to use for generation. */
   modelSelection: ModelSelection;
 }
 
@@ -50,7 +47,6 @@ export interface BranchNameGenerationInput {
   cwd: string;
   message: string;
   attachments?: ReadonlyArray<ChatAttachment> | undefined;
-  /** What model and provider to use for generation. */
   modelSelection: ModelSelection;
 }
 
@@ -62,10 +58,8 @@ export interface ThreadTitleGenerationInput {
   linkedContext?: string | undefined;
   cwd: string;
   message: string;
-  /** Present when replacing an existing title from the current thread history. */
   previousTitle?: string | undefined;
   attachments?: ReadonlyArray<ChatAttachment> | undefined;
-  /** What model and provider to use for generation. */
   modelSelection: ModelSelection;
 }
 
@@ -74,31 +68,49 @@ export interface ThreadTitleGenerationResult {
   needsRefinement?: boolean | undefined;
 }
 
-/** Commit, change request, branch, and title generation backed by one provider instance. */
+export interface ReviewGuideStackLayer {
+  readonly number: number;
+  readonly title: string | null;
+  readonly headSha: string | null;
+  readonly state: "open" | "closed" | "merged";
+}
+
+export interface ReviewGuideGenerationInput {
+  cwd: string;
+  number: number;
+  title: string;
+  description: string;
+  baseBranch: string;
+  baseCommit: string;
+  settledReview: string;
+  instructions?: string | undefined;
+  stack?: ReadonlyArray<ReviewGuideStackLayer> | undefined;
+  modelSelection: ModelSelection;
+}
+
+export type ReviewGuideGenerationResult = Omit<
+  PullRequestReviewGuide,
+  "headSha" | "generatedAt" | "modelSelection"
+>;
+
 export interface ProviderTextGeneration {
-  /**
-   * Generate a commit message from staged change context.
-   */
   readonly generateCommitMessage: (
     input: CommitMessageGenerationInput,
   ) => Effect.Effect<CommitMessageGenerationResult, TextGenerationError>;
 
-  /**
-   * Generate change request title/body from branch and diff context.
-   */
   readonly generatePrContent: (
     input: PrContentGenerationInput,
   ) => Effect.Effect<PrContentGenerationResult, TextGenerationError>;
 
-  /**
-   * Generate a concise branch name from a user message.
-   */
   readonly generateBranchName: (
     input: BranchNameGenerationInput,
   ) => Effect.Effect<BranchNameGenerationResult, TextGenerationError>;
 
-  /** Generate a concise thread title from a first message or thread history. */
   readonly generateThreadTitle: (
     input: ThreadTitleGenerationInput,
   ) => Effect.Effect<ThreadTitleGenerationResult, TextGenerationError>;
+
+  readonly generateReviewGuide: (
+    input: ReviewGuideGenerationInput,
+  ) => Effect.Effect<ReviewGuideGenerationResult, TextGenerationError>;
 }

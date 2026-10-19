@@ -21,11 +21,8 @@ import {
   decodeClaudeModelAdapter,
   decodeClaudeProfileAdapter,
 } from "./ClaudeModelManifest.ts";
-import {
-  BUNDLED_MODEL_MANIFEST,
-  type ModelManifestData,
-  resolveProviderCatalog,
-} from "./ModelManifest.ts";
+import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
+import { BUNDLED_MODEL_MANIFEST, resolveProviderCatalog } from "./ModelManifest.ts";
 
 const CLAUDE = ProviderDriverKind.make("claudeAgent");
 const EMPTY_CAPABILITIES: ModelCapabilities = { optionDescriptors: [] };
@@ -40,8 +37,9 @@ export interface ClaudeModelCatalog {
   readonly models: ReadonlyArray<ClaudeCatalogModel>;
 }
 
-function tryResolveClaudeModelCatalog(manifest: ModelManifestData): ClaudeModelCatalog | null {
-  const resolved = resolveProviderCatalog(manifest, CLAUDE);
+function tryResolveClaudeModelCatalog(
+  resolved: ModelCatalog.ProviderCatalog | undefined,
+): ClaudeModelCatalog | null {
   if (!resolved) return null;
 
   const models: Array<ClaudeCatalogModel> = [];
@@ -50,7 +48,7 @@ function tryResolveClaudeModelCatalog(manifest: ModelManifestData): ClaudeModelC
     const adapter = decodeClaudeModelAdapter(entry.adapter ?? {});
     if (Option.isNone(profile) || Option.isNone(adapter)) return null;
     models.push({
-      model: entry.model,
+      model: ModelCatalog.catalogServerModel(resolved, entry),
       runtime: profile.value.claudeCode ?? {},
       compatibility: adapter.value.claudeCode ?? {},
     });
@@ -61,25 +59,24 @@ function tryResolveClaudeModelCatalog(manifest: ModelManifestData): ClaudeModelC
   };
 }
 
-export function resolveClaudeModelCatalog(manifest: ModelManifestData): ClaudeModelCatalog {
+const BUNDLED_CLAUDE_PROVIDER_CATALOG =
+  resolveProviderCatalog(BUNDLED_MODEL_MANIFEST, CLAUDE) ?? undefined;
+
+export function resolveClaudeModelCatalog(
+  catalog: ModelCatalog.ProviderCatalog | undefined,
+): ClaudeModelCatalog {
   return (
-    tryResolveClaudeModelCatalog(manifest) ??
-    tryResolveClaudeModelCatalog(BUNDLED_MODEL_MANIFEST) ?? {
+    tryResolveClaudeModelCatalog(catalog) ??
+    tryResolveClaudeModelCatalog(BUNDLED_CLAUDE_PROVIDER_CATALOG) ?? {
       models: [],
     }
   );
 }
 
-export const BUNDLED_CLAUDE_MODEL_CATALOG = resolveClaudeModelCatalog(BUNDLED_MODEL_MANIFEST);
+export const BUNDLED_CLAUDE_MODEL_CATALOG = resolveClaudeModelCatalog(
+  BUNDLED_CLAUDE_PROVIDER_CATALOG,
+);
 
-/**
- * Scope the catalog to one instance's settings: custom model slugs stay opaque
- * (a built-in alias they shadow is dropped, canonical slugs and capabilities
- * are preserved), and custom entries that declare their own capabilities are
- * appended so the adapter resolves effort / fast mode / thinking against the
- * user's descriptors instead of the empty default. Custom entries carry no
- * runtime profile, so option values pass through to Claude Code verbatim.
- */
 export function scopeClaudeModelCatalog(
   catalog: ClaudeModelCatalog,
   customModels: ReadonlyArray<CustomModelSetting>,
@@ -168,10 +165,6 @@ export function resolveClaudeModelsForVersion(
     .map((entry) => entry.model);
 }
 
-/**
- * Current catalog models the installed Claude Code is too old to run, so the
- * picker can show them as "update to use" instead of hiding them.
- */
 export function resolveClaudeUpdateRequiredModels(
   catalog: ClaudeModelCatalog,
   version: string | null | undefined,
@@ -216,6 +209,13 @@ export function resolveClaudeCatalogEffort(
   model: string | null | undefined,
   raw: string | null | undefined,
 ): string | undefined {
+  if (!resolveClaudeCatalogModel(catalog, model)) {
+    const effort = raw?.trim();
+    return effort && ["low", "medium", "high", "xhigh", "max"].includes(effort)
+      ? effort
+      : undefined;
+  }
+
   const caps = getClaudeCatalogModelCapabilities(catalog, model);
   const descriptors = getProviderOptionDescriptors({
     caps,

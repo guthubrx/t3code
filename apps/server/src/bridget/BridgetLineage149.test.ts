@@ -175,7 +175,7 @@ const harness = Effect.fn("BridgetLineage149.harness")(function* (options: Harne
   } as unknown as Orchestrator.OrchestratorV2["Service"]);
 
   const crypto = Crypto.Crypto.of({
-    randomUUIDv4: Effect.succeed(FIXED_UUID),
+    randomUUIDv4: () => Effect.succeed(FIXED_UUID),
   } as unknown as Crypto.Crypto);
 
   const lineage = yield* BridgetLineage.BridgetLineage.pipe(

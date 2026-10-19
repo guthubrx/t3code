@@ -94,7 +94,7 @@ const layerDeviceServiceMock = Layer.mock(DeviceService.DeviceService)({
       platform: input.platform,
       openedAt: "2026-09-08T00:00:00.000Z",
     }),
-  // UDID-1 is open in the test thread; UDID-2 exists but belongs to another thread.
+
   sessionsForThread: (id) =>
     Effect.succeed(
       id === threadId
@@ -197,6 +197,9 @@ it.effect("rejects unavailable agent access before booting or opening a device",
         Layer.provideMerge(McpServer.McpServer.layer),
         Layer.provideMerge(McpToolAccessTestkit.liveThreadsLayer),
         Layer.provide(layerUnavailable),
+        Layer.provide(
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-device-toolkit-test-" }),
+        ),
         Layer.provide(NodeServices.layer),
       ),
     ),

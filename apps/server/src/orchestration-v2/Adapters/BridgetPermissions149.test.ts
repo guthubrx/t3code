@@ -1,3 +1,4 @@
+import * as BridgetTestSessions from "../../bridget/BridgetSessions.testkit.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -20,7 +21,7 @@ import {
   ProviderAdapterV2RuntimePolicy,
   type ProviderAdapterV2TurnInput,
 } from "@t3tools/provider-core/server/ProviderAdapter";
-import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
+import { Environment as HostProcessEnvironment } from "@t3tools/shared/HostProcess";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as CodexClient from "effect-codex-app-server/client";
@@ -40,7 +41,7 @@ import {
   buildCodexAdditionalContext,
   buildCodexDeveloperInstructions,
 } from "../../provider/CodexDeveloperInstructions.ts";
-import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
+import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
 import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
 import { makeReplayServerConfig, withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
@@ -137,6 +138,7 @@ const makeFixture = Effect.gen(function* () {
     .mockResolvedValue([
       {
         name: "bridget",
+        source: "dynamic",
         status: "connected",
         tools: [
           { name: "bridget_thread" },
@@ -145,9 +147,16 @@ const makeFixture = Effect.gen(function* () {
         ],
       },
     ]);
-  sdk.query
-    .mockReset()
-    .mockReturnValue({ close, setMcpServers, applyFlagSettings, mcpServerStatus: status });
+  sdk.query.mockReset().mockReturnValue({
+    close,
+    return: async () => {
+      close();
+      return { done: true, value: undefined };
+    },
+    setMcpServers,
+    applyFlagSettings,
+    mcpServerStatus: status,
+  });
   const open = (overrides: Record<string, unknown> = {}, env: Record<string, string> = {}) =>
     runner.open({
       threadId,
@@ -604,6 +613,9 @@ const makePermissionHarness = (credentialOverrides: Record<string, unknown> = {}
             ) as unknown as ClaudeAdapterV2.ClaudeAgentSdkQuerySession["messages"],
             offer: () => Effect.void,
             setModel: () => Effect.void,
+            applyFlagSettings: () => Effect.void,
+            stopTask: () => Effect.void,
+            backgroundTasks: () => Effect.succeed(false),
             setPermissionMode: () => Effect.void,
             interrupt: Effect.void,
             close: Effect.void,
@@ -745,7 +757,12 @@ describe("Claude adapter permission publication (spec 149)", () => {
         const after = yield* h.read();
         assert.deepEqual(after, { status: "unavailable" });
       }).pipe(Effect.ensuring(h.cleanup));
-    }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, NodeServices.layer, BridgetTestSessions.layer),
+      ),
+    ),
   );
 
   it.live("publishes nothing for a credential mounted from another provider instance", () =>
@@ -760,7 +777,12 @@ describe("Claude adapter permission publication (spec 149)", () => {
         const after = yield* h.read();
         assert.deepEqual(after, { status: "unavailable" });
       }).pipe(Effect.ensuring(h.cleanup));
-    }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, NodeServices.layer, BridgetTestSessions.layer),
+      ),
+    ),
   );
 });
 
@@ -888,14 +910,19 @@ const codexReplayPreamble = (input: {
       id: 3,
       method: "thread/start",
       params: {
+        cwd: "/workspace",
+        model: "gpt-5.4",
         config: {
           ...CodexAdapterV2.CODEX_THREAD_CONFIG,
           // A mounted credential always carries its private t3-code mount
           // (CodexAdapterV2 thread params); the stdio bridget server stays
           // absent because this fixture's environment has no BRIDGET_HOME.
-          "mcp_servers.t3-code": {
-            url: "http://127.0.0.1:9/private-endpoint",
-            http_headers: { Authorization: "Bearer private-proof-149" },
+          mcp_servers: {
+            "t3-code": {
+              tool_timeout_sec: 3900,
+              url: "http://127.0.0.1:9/private-endpoint",
+              http_headers: { Authorization: "Bearer private-proof-149" },
+            },
           },
         },
       },
@@ -1072,7 +1099,7 @@ describe("Codex adapter permission publication (spec 149)", () => {
               ),
             ),
         };
-        const adapter = CodexAdapterV2.makeCodexAdapterV2({
+        const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
           instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
           settings: DEFAULT_CODEX_SETTINGS,
           environment: {},
@@ -1130,7 +1157,12 @@ describe("Codex adapter permission publication (spec 149)", () => {
       }).pipe(
         Effect.ensuring(Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
       );
-    }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, NodeServices.layer, BridgetTestSessions.layer),
+      ),
+    ),
   );
 });
 
@@ -1235,7 +1267,7 @@ const openCodexPermissionSession = (input: {
           ),
         ),
     };
-    const adapter = CodexAdapterV2.makeCodexAdapterV2({
+    const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
       instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
       settings: DEFAULT_CODEX_SETTINGS,
       environment: {},
@@ -1290,7 +1322,11 @@ const openCodexPermissionSession = (input: {
     };
   });
 
-const codexG3Layer = Layer.merge(IdAllocator.layer, NodeServices.layer);
+const codexG3Layer = Layer.mergeAll(
+  IdAllocator.layer,
+  NodeServices.layer,
+  BridgetTestSessions.layer,
+);
 
 describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
   it.effect("retires the published fact when the app-server rejects turn/start", () =>
@@ -1324,7 +1360,7 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
         // rather than a fact that never existed ("absent") or one that leaked.
         assert.deepEqual(yield* h.read(turnInput), { status: "unavailable" });
       }).pipe(Effect.ensuring(h.cleanup));
-    }).pipe(Effect.scoped, Effect.provide(codexG3Layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(codexG3Layer, BridgetTestSessions.layer))),
   );
 
   it.live.each(["completed", "interrupted", "failed"] as const)(
@@ -1351,7 +1387,7 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
           yield* Effect.sleep("100 millis");
           assert.deepEqual(yield* h.read(turnInput), { status: "unavailable" });
         }).pipe(Effect.ensuring(h.cleanup));
-      }).pipe(Effect.scoped, Effect.provide(codexG3Layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(codexG3Layer, BridgetTestSessions.layer))),
   );
 
   it.effect("retires the fact when the adapter session scope closes", () =>
@@ -1375,7 +1411,7 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
         // The session scope is closed; the running turn never ended natively.
         assert.deepEqual(yield* opened.h.read(opened.turnInput), { status: "unavailable" });
       }).pipe(Effect.ensuring(opened.h.cleanup));
-    }).pipe(Effect.scoped, Effect.provide(codexG3Layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(codexG3Layer, BridgetTestSessions.layer))),
   );
 
   it.live("keeps the fact of a newer run when an older run on the same thread ends", () =>
@@ -1464,7 +1500,7 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
         // Run B's own completion finally retires it.
         yield* h.waitForStatus(turnB, "unavailable");
       }).pipe(Effect.ensuring(h.cleanup));
-    }).pipe(Effect.scoped, Effect.provide(codexG3Layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(codexG3Layer, BridgetTestSessions.layer))),
   );
 
   it.live("a failing turn on one thread leaves the fact of another bound thread valid", () =>
@@ -1504,7 +1540,7 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
         if (stillOk.status === "valid")
           assert.equal(stillOk.permissions.run_id, "run-attempt-g3-ok");
       }).pipe(Effect.ensuring(Effect.all([ok.cleanup, failing.cleanup])));
-    }).pipe(Effect.scoped, Effect.provide(codexG3Layer)),
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(codexG3Layer, BridgetTestSessions.layer))),
   );
 });
 
@@ -1560,7 +1596,6 @@ describe("Codex goal permission lifetime (spec172)", () => {
                 nativeTurnId: "goal-second",
                 status: "completed",
               }),
-              label: "finish-second",
             },
             notification("third-started", "turn/started", {
               threadId: nativeThreadId,
@@ -1613,6 +1648,6 @@ describe("Codex goal permission lifetime (spec172)", () => {
             "the last turn must retire the original owner",
           );
         }).pipe(Effect.ensuring(h.cleanup));
-      }).pipe(Effect.scoped, Effect.provide(codexG3Layer)),
+      }).pipe(Effect.scoped, Effect.provide(Layer.merge(codexG3Layer, BridgetTestSessions.layer))),
   );
 });

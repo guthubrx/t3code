@@ -16,10 +16,10 @@ const decodeConfig = Schema.decodeUnknownEffect(
 );
 
 /** Effective project config is authoritative; uncertain policy leaves native threads available. */
-export const prepareCodexBridgetMcp = Effect.fn("prepareCodexBridgetMcp")(function* (input: {
+export const prepareCodexBridgetMcp = Effect.fn("prepareCodexBridgetMcp")(function* <E>(input: {
   readonly session: McpProviderSessionConfig | undefined;
   readonly environment: NodeJS.ProcessEnv;
-  readonly readConfig: () => Effect.Effect<unknown, unknown>;
+  readonly readConfig: () => Effect.Effect<unknown, E>;
 }) {
   if (!input.session) return undefined;
   return yield* Effect.gen(function* () {
@@ -31,13 +31,19 @@ export const prepareCodexBridgetMcp = Effect.fn("prepareCodexBridgetMcp")(functi
       Object.hasOwn(servers, "bridget") ? [servers.bridget] : [],
     );
     if (mount.code !== "ready") return undefined;
+    const existing = servers.bridget;
+    const configuredTimeout =
+      typeof existing === "object" &&
+      existing !== null &&
+      !Array.isArray(existing) &&
+      "tool_timeout_sec" in existing &&
+      typeof existing.tool_timeout_sec === "number"
+        ? existing.tool_timeout_sec
+        : 0;
     const { type: _type, ...server } = mount.server;
     return {
       ...server,
-      tool_timeout_sec: Math.max(
-        typeof server.tool_timeout_sec === "number" ? server.tool_timeout_sec : 0,
-        BRIDGET_TOOL_TIMEOUT_SECONDS,
-      ),
+      tool_timeout_sec: Math.max(configuredTimeout, BRIDGET_TOOL_TIMEOUT_SECONDS),
     } satisfies Schema.Json;
   }).pipe(
     Effect.timeout("6 seconds"),

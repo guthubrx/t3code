@@ -1,3 +1,4 @@
+import { FetchHttpClient } from "effect/http";
 import {
   BridgetReadError,
   EnvironmentId,
@@ -70,7 +71,8 @@ const makeHumanRuntime = Effect.fn("HumanRuntimeTest.make")(function* (
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
   const atoms = createOrchestrationEnvironmentAtoms(
     Atom.runtime(
-      Layer.merge(
+      Layer.mergeAll(
+        FetchHttpClient.layer,
         Layer.succeed(EnvironmentRegistry, service),
         Layer.succeed(Clock.Clock, yield* Clock.Clock),
       ),
@@ -500,7 +502,9 @@ it.effect("routes human reads by environment and refreshes only the selected ato
         followStream,
         stateChanges,
       } as unknown as EnvironmentRegistry["Service"]);
-      const runtime = Atom.runtime(Layer.succeed(EnvironmentRegistry, registryService));
+      const runtime = Atom.runtime(
+        Layer.merge(FetchHttpClient.layer, Layer.succeed(EnvironmentRegistry, registryService)),
+      );
       const family = createOrchestrationEnvironmentAtoms(runtime).bridgetRead;
       const input = {
         threadId: ThreadId.make("8b09a229-dc14-4b38-91b5-2bf0e2a294ac"),
@@ -608,7 +612,9 @@ it.effect(
           followStream,
           stateChanges,
         } as unknown as EnvironmentRegistry["Service"]);
-        const runtime = Atom.runtime(Layer.succeed(EnvironmentRegistry, registryService));
+        const runtime = Atom.runtime(
+          Layer.merge(FetchHttpClient.layer, Layer.succeed(EnvironmentRegistry, registryService)),
+        );
         const family = createOrchestrationEnvironmentAtoms(runtime).bridgetRead;
         const inputA = {
           threadId: threadA,

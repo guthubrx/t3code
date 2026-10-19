@@ -1,3 +1,4 @@
+import { FetchHttpClient } from "effect/http";
 import {
   BridgetLineageError,
   EnvironmentId,
@@ -80,7 +81,8 @@ const makeLineageRuntime = Effect.fn("LineageRuntimeTest.make")(function* (
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
   const atoms = createOrchestrationEnvironmentAtoms(
     Atom.runtime(
-      Layer.merge(
+      Layer.mergeAll(
+        FetchHttpClient.layer,
         Layer.succeed(EnvironmentRegistry, service),
         Layer.succeed(Clock.Clock, yield* Clock.Clock),
       ),

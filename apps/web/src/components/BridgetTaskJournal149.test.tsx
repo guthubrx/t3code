@@ -951,3 +951,15 @@ describe("BridgetTaskJournal remote metadata (162)", () => {
     expect(pendingReads).toEqual([]);
   });
 });
+
+vi.mock("~/lib/observeResize", () => ({
+  observeResize: (
+    element: Element,
+    callback: (entries: readonly ResizeObserverEntry[]) => void,
+  ) => {
+    if (typeof ResizeObserver === "undefined") return () => undefined;
+    const observer = new ResizeObserver((entries) => callback(entries));
+    observer.observe(element);
+    return () => observer.disconnect();
+  },
+}));

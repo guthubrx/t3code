@@ -1,3 +1,4 @@
+import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 // Session 149 — server lineage lot (L). Oracles: the virtual projection is provider-free,
 // the read-only guard protects it, thread.stop cancels natives through the real BridgetReader
 // without creating runs, and no transport means refusal with no fallback.
@@ -40,7 +41,8 @@ import * as BridgetReader from "../bridget/BridgetReader.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
-import type { ProviderAdapterV2Shape } from "@t3tools/provider-core/server/ProviderAdapter";
+import type { ProviderAdapterV2 } from "@t3tools/provider-core/server/ProviderAdapter";
+type ProviderAdapterV2Shape = ProviderAdapterV2["Service"];
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -1177,10 +1179,11 @@ const makeMatrixLayer = () => {
     ServerSettings.layerTest().pipe(Layer.orDie),
     IdAllocator.layer,
     EffectOutbox.layer.pipe(Layer.provide(layerDatabase)),
+    CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase)),
   );
   const layer = ProviderRuntimeRecovery.layer.pipe(
     Layer.provideMerge(layerRecoveryDeps),
-    Layer.provideMerge(ThreadManagementService.layer),
+    Layer.provideMerge(ThreadManagementService.layer.pipe(Layer.provide(layerRecoveryDeps))),
     Layer.provideMerge(h.layer),
   );
   return { layer, calls, cancelInputs: h.cancelInputs };

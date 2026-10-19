@@ -1,3 +1,8 @@
+import { it as effectIt } from "@effect/vitest";
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as ScopedSessions from "./McpProviderSessions.ts";
 import { describe, expect, it } from "vite-plus/test";
 import type { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import {
@@ -321,3 +326,38 @@ describe("source verification and closed payload", () => {
     }
   });
 });
+
+effectIt.effect(
+  "keeps identical thread ids in separate environments from revoking each other's permissions",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const first = Context.get(
+          yield* Layer.build(Layer.fresh(ScopedSessions.layer)),
+          ScopedSessions.McpProviderSessions,
+        );
+        const second = Context.get(
+          yield* Layer.build(Layer.fresh(ScopedSessions.layer)),
+          ScopedSessions.McpProviderSessions,
+        );
+        const a = credential();
+        const b = credential({ threadId: a.threadId, environmentId: "environment:other" });
+        yield* first.set(a);
+        yield* second.set(b);
+        expect(publishMcpProviderPermissions(a, fact(), binding())).toBe(1);
+        expect(publishMcpProviderPermissions(b, fact(), binding())).toBe(1);
+        expect(
+          yield* Effect.promise(() => readMcpProviderPermissions(a, "run-1", binding())),
+        ).toMatchObject({ status: "valid" });
+        yield* first.clear(a.threadId);
+        expect(
+          yield* Effect.promise(() => readMcpProviderPermissions(a, "run-1", binding())),
+        ).toEqual({ status: "unavailable" });
+        expect(
+          yield* Effect.promise(() => readMcpProviderPermissions(b, "run-1", binding())),
+        ).toMatchObject({ status: "valid" });
+        expect(yield* second.read(b.threadId)).toBe(b);
+        yield* second.clear(b.threadId);
+      }),
+    ),
+);

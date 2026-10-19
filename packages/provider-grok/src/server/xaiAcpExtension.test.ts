@@ -1,5 +1,3 @@
-// @effect-diagnostics nodeBuiltinImport:off -- plan-path tests resolve the OS home dir.
-import * as NodeOS from "node:os";
 import { it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -87,7 +85,6 @@ describe("xAiPromptCompleteFromSessionUpdate", () => {
   });
 });
 
-// Runs a recorded Grok tool_call_update through the adapter's parse path.
 function parseRecordedToolCallUpdate(update: Record<string, unknown>): AcpToolCallState {
   const [event] = parseSessionUpdateEvent({
     sessionId: "01a0d660-c1bb-7842-91a3-02d91dc8b0d2",
@@ -466,7 +463,6 @@ describe("XAiAcpExtension", () => {
   });
 
   it("finishes monitors from the recorded task_completed snapshot", () => {
-    // Fields from the grok_monitor recording (Grok 1.0.41).
     const completed = {
       sessionId: "01a0d660-c1bb-7842-91a3-02d91dc8b0d2",
       update: {
@@ -524,9 +520,6 @@ describe("XAiAcpExtension", () => {
   });
 
   it("completes status-less Bash results despite generic titles", () => {
-    // A Bash result that carries no status (empty rawInput, generic title) is
-    // terminalized from its exit_code. An explicit in_progress status wins:
-    // that is how Grok streams a still-running monitor.
     const toolCall = {
       toolCallId: "call-wake-1",
       title: "Tool",
@@ -629,7 +622,6 @@ describe("XAiAcpExtension", () => {
     });
     expect(normalized.title).toBe("Monitor: Wait 30s then list directory");
     expect(normalized.status).toBe("inProgress");
-    // Non-generic titles from the CLI are preserved.
     expect(
       resolveXAiAcpToolTitle({
         toolCallId: "call-read",
@@ -820,7 +812,6 @@ describe("XAiAcpExtension", () => {
       { taskId: "call-bg-1", status: "completed", appendOutput: "" },
       { taskId: "call-bg-2", status: "completed", appendOutput: "" },
     ]);
-    // Singular task_id shape, matched by variant when the title is generic.
     expect(
       extractXAiKilledBackgroundTasks({
         toolCallId: "call-kill-2",
@@ -829,7 +820,6 @@ describe("XAiAcpExtension", () => {
         data: { rawInput: { variant: "kill", task_id: "call-bg-3" } },
       }),
     ).toEqual([]);
-    // In-flight kill calls and unrelated tools contribute nothing.
     expect(
       extractXAiKilledBackgroundTasks({
         toolCallId: "call-kill-3",
@@ -849,7 +839,6 @@ describe("XAiAcpExtension", () => {
   });
 
   it("maps task lifecycle notifications to background mutations", () => {
-    // task_backgrounded carries the cancelled call's tool_call_id as task_id.
     expect(
       xAiBackgroundTaskLifecycleMutation(
         {
@@ -863,7 +852,6 @@ describe("XAiAcpExtension", () => {
         "running",
       ),
     ).toEqual({ sessionId: "session-1", taskId: "call-bg-1", status: "running" });
-    // task_completed nests the id inside task_snapshot.
     expect(
       xAiBackgroundTaskLifecycleMutation(
         {
@@ -971,8 +959,6 @@ describe("XAiAcpExtension", () => {
   });
 
   it("keeps a standalone TaskOutput completion terminal through normalize", () => {
-    // Must remain offer evidence post-settle: normalize must not demote it to
-    // inProgress the way monitor start ACKs are.
     expect(
       normalizeXAiAcpToolCallState({
         toolCallId: "call-c29e64dd-ce5d-4eac-a6ca-c20513fefac3-1",
@@ -1020,7 +1006,6 @@ describe("XAiAcpExtension", () => {
         status: "completed",
       },
     ]);
-    // Description/output may contain "error" without meaning the monitor failed.
     expect(
       extractXAiAcpBackgroundToolMutation(
         [
@@ -1493,7 +1478,6 @@ describe("XAiAcpExtension", () => {
     expect(
       finished({ status: "cancelled", error: "interrupted by process restart" }),
     ).toMatchObject({ status: "cancelled", result: "interrupted by process restart" });
-    // A failed subagent's error is its result; `output` only accompanies success.
     expect(finished({ status: "failed", output: "partial" })).toMatchObject({ result: null });
     expect(finished({ status: "timed_out" })).toBeNull();
     expect(finished({})).toBeNull();
@@ -1529,8 +1513,6 @@ describe("XAiAcpExtension", () => {
       } as unknown as AcpSessionRuntime.AcpSessionRuntime["Service"];
       const runtime = yield* makeXAiPromptCompletionRuntime(baseRuntime);
       const notices: Array<unknown> = [];
-      // Registered after the wrapper, as the adapter does: it must not replace
-      // the wrapper's prompt completion on the shared method.
       yield* registerXAiSubagentFinished(runtime, (notice) =>
         Effect.sync(() => notices.push(notice)),
       );
@@ -1902,13 +1884,14 @@ describe("Grok exit_plan_mode capture (#8358)", () => {
     expect(extractXAiExitPlanMarkdown(wrapped)).toBe(XAI_EMPTY_PLAN_MARKDOWN);
   });
   it("identifies Grok plan.md paths and extracts markdown from tool call data", () => {
-    const linuxHost = { platform: "linux" as const, environment: {} };
-    const windowsHost = { platform: "win32" as const, environment: {} };
+    const home = "/home/ada";
+    const linuxHost = { platform: "linux" as const, environment: {}, homeDirectory: home };
+    const windowsHost = { platform: "win32" as const, environment: {}, homeDirectory: home };
     const grokHomeHost = {
       platform: "linux" as const,
       environment: { GROK_HOME: "/opt/grok-data" },
+      homeDirectory: home,
     };
-    const home = NodeOS.homedir().replace(/\\/g, "/");
     const sessionPlan = `${home}/.grok/sessions/abc/plan.md`;
     const nestedSessionPlan = `${home}/.grok/sessions/%2Fhome%2Fproj/019fd20e-c563-70a0-b801-a6bc51815a9b/plan.md`;
     expect(isGrokPlanMarkdownPath(sessionPlan, linuxHost)).toBe(true);
@@ -1935,12 +1918,12 @@ describe("Grok exit_plan_mode capture (#8358)", () => {
       isGrokPlanMarkdownPath("/OPT/GROK-DATA/sessions/sess/plan.md", {
         platform: "win32",
         environment: { GROK_HOME: "/opt/grok-data" },
+        homeDirectory: home,
       }),
     ).toBe(true);
     expect(isGrokPlanMarkdownPath("/OPT/GROK-DATA/sessions/sess/plan.md", grokHomeHost)).toBe(
       false,
     );
-    // Workspace plan.md must not be treated as the session plan file.
     expect(isGrokPlanMarkdownPath("plan.md", linuxHost)).toBe(false);
     expect(isGrokPlanMarkdownPath("/repo/docs/plan.md", linuxHost)).toBe(false);
     expect(isGrokPlanMarkdownPath("/tmp/other.md", linuxHost)).toBe(false);

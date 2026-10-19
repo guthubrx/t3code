@@ -200,11 +200,6 @@ function openCodeCapabilitiesForModel(input: {
   readonly agents: ReadonlyArray<Agent>;
 }): ModelCapabilities {
   const rawVariantValues = Object.keys(input.model.variants ?? {});
-  // When a model advertises no variants, synthesize the standard reasoning
-  // levels so the composer still offers a Reasoning selector (mirrors the
-  // Codex/Grok experience where reasoning is always configurable). The set
-  // covers the common OpenCode variant spectrum; `inferDefaultVariant`
-  // picks the provider-appropriate default (e.g. medium for openai/opencode).
   const variantValues =
     rawVariantValues.length > 0 ? rawVariantValues : ["low", "medium", "high", "xhigh"];
   const defaultVariant = inferDefaultVariant(input.providerID, variantValues);
@@ -378,12 +373,27 @@ export const makePendingOpenCodeProvider = (
     });
   });
 
-/** One model an OpenCode 2 server lists, as the status check reads it. */
 export interface OpenCode2Model {
   readonly providerID: string;
   readonly id: string;
   readonly name: string;
+  readonly providerName?: string;
   readonly variants: ReadonlyArray<{ readonly id: string }>;
+}
+
+/**
+ * One OpenCode instance fronts several providers, and their catalogues overlap:
+ * OpenCode Zen and OpenCode Go both list Step 5 Preview Free. Naming the
+ * sub-provider is what tells two such rows apart.
+ */
+function subProviderLabelFor(input: {
+  readonly providerID: string;
+  readonly providerName?: string;
+}): string | undefined {
+  const label = nonEmptyTrimmed(input.providerName) ?? input.providerID;
+  return label.toLowerCase() === OPENCODE_PRESENTATION.displayName.toLowerCase()
+    ? undefined
+    : label;
 }
 
 /**
@@ -410,7 +420,6 @@ export const makeOpenCode2ModelLoader = <E>(
     );
   });
 
-/** A workspace's skills and commands, as an OpenCode 2 server lists them for its directory. */
 export interface OpenCode2Workspace {
   readonly skills: ReadonlyArray<{
     readonly id: string;
@@ -425,11 +434,10 @@ export interface OpenCode2Workspace {
 }
 
 /**
- * A server scans a directory it has not served yet in the background: its
- * first read lists no commands at all (not even the built-ins), and
- * `command.updated` plus `skill.updated` for the directory end the scan. A
- * directory it already serves lists everything at once. `scanned` must be
- * listening before `read` runs, since the read is what starts the scan.
+ * A server scans a directory it has not served yet in the background: its first read lists
+ * no commands at all (not even the built-ins), and `command.updated` plus `skill.updated`
+ * for the directory end the scan. `scanned` must be listening before `read` runs, since
+ * the read is what starts the scan.
  */
 export const loadOpenCode2Workspace = <E>(
   read: Effect.Effect<OpenCode2Workspace, E>,
@@ -475,9 +483,8 @@ export function openCode2CommandsToServerProviderSlashCommands(
 }
 
 /**
- * Every mode maps onto OpenCode 2 session rules. Auto asks like Supervised:
- * OpenCode has no reviewer that approves routine actions. Plan mode is its
- * `plan` agent, so the composer's mode toggle drives it.
+ * Auto asks like Supervised: OpenCode has no reviewer that approves routine
+ * actions.
  */
 const OPENCODE_2_PRESENTATION = {
   ...OPENCODE_PRESENTATION,
@@ -523,7 +530,6 @@ const checkOpenCode2 = Effect.fn("checkOpenCode2")(function* (
     message,
   });
   if (result._tag === "Failure") {
-    // The detail can carry a response body; it stays in the log, not the status.
     yield* Effect.logWarning("OpenCode 2 model list failed", result.cause);
     return buildServerProvider({
       presentation: OPENCODE_2_PRESENTATION,
@@ -534,19 +540,22 @@ const checkOpenCode2 = Effect.fn("checkOpenCode2")(function* (
         settings.customModels,
         DEFAULT_OPENCODE_MODEL_CAPABILITIES,
       ),
-      // Compaction does not depend on the model catalog.
       slashCommands: [COMPACT_SLASH_COMMAND],
       probe: probe("error", "OpenCode could not load its model list."),
     });
   }
   const models = providerModelsFromSettings(
     result.value
-      .map((model) => ({
-        slug: `${model.providerID}/${model.id}`,
-        name: model.name,
-        isCustom: false,
-        capabilities: openCode2ModelCapabilities(model),
-      }))
+      .map((model) => {
+        const subProvider = subProviderLabelFor(model);
+        return {
+          slug: `${model.providerID}/${model.id}`,
+          name: model.name,
+          ...(subProvider ? { subProvider } : {}),
+          isCustom: false,
+          capabilities: openCode2ModelCapabilities(model),
+        };
+      })
       .toSorted((left, right) => left.name.localeCompare(right.name)),
     settings.customModels,
     DEFAULT_OPENCODE_MODEL_CAPABILITIES,
@@ -556,7 +565,6 @@ const checkOpenCode2 = Effect.fn("checkOpenCode2")(function* (
     enabled: true,
     checkedAt,
     models,
-    // Every session can compact; a workspace snapshot adds that directory's commands.
     slashCommands: [COMPACT_SLASH_COMMAND],
     probe:
       result.value.length > 0
@@ -568,11 +576,6 @@ const checkOpenCode2 = Effect.fn("checkOpenCode2")(function* (
   });
 });
 
-/**
- * `probeRuntime` is the driver's memoized version probe: `opencode --version` for a local binary,
- * the version endpoints for a configured server. The status check refreshes it, so an in-place
- * upgrade re-routes the instance.
- */
 export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatus")(function* (
   openCodeSettings: OpenCodeSettings,
   cwd: string,

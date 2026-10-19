@@ -9,6 +9,7 @@ import {
   T3_MCP_BEARER_ENV,
   T3_MCP_URL_ENV,
   T3_PI_RUNTIME_MODE_ENV,
+  T3_PI_MCP_EXTENSION_PATH_ENV,
 } from "./mcpExtensionSource.ts";
 
 const RESERVED_PI_LAUNCH_ARGUMENTS = new Set([
@@ -99,11 +100,6 @@ function normalizePiBuiltInEqualsArguments(args: ReadonlyArray<string>): Readonl
   });
 }
 
-/**
- * Pi launch arguments may configure resources, models, tools, trust, and
- * storage. T3 owns RPC mode and session identity, so arguments that select a
- * different execution mode or native session are rejected before spawn.
- */
 export function resolvePiLaunchArgs(launchArgs: string): PiLaunchArgsResolution {
   // Pi parses equals-form tokens only as extension flags, even when their name
   // matches a built-in option. Split known built-ins while leaving arbitrary
@@ -160,9 +156,6 @@ export function resolvePiLaunchArgs(launchArgs: string): PiLaunchArgsResolution 
       message: `Pi launch arguments cannot include positional prompt '${arg}'.`,
     };
   }
-  // Pi 1.0 exits at startup on `--provider` without `--model`; older versions
-  // silently ran another provider's default model. Rejecting it here makes
-  // every spawn site report the reason instead of a bare exit code.
   if (hasProvider && !hasModel) {
     return { ok: false, message: "Pi launch argument '--provider' requires '--model'." };
   }
@@ -291,11 +284,15 @@ export function buildPiRpcLaunch(input: {
   // credentials inherited from the server or a parent provider process.
   delete environment[T3_MCP_URL_ENV];
   delete environment[T3_MCP_BEARER_ENV];
+  delete environment[T3_PI_MCP_EXTENSION_PATH_ENV];
 
   return {
     args,
     env: {
       ...environment,
+      ...(hasT3Extension && input.extensionPath !== undefined
+        ? { [T3_PI_MCP_EXTENSION_PATH_ENV]: input.extensionPath }
+        : {}),
       ...(hasT3Extension && input.runtimeMode !== undefined
         ? {
             [T3_PI_RUNTIME_MODE_ENV]:

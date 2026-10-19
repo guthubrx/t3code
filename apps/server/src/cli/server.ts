@@ -1,4 +1,4 @@
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
@@ -7,6 +7,7 @@ import { Command, GlobalFlag } from "effect/cli";
 import * as CliError from "effect/cli/CliError";
 
 import * as ServerConfig from "../config.ts";
+import { awaitLauncherLoss } from "../launcherWatch.ts";
 import { runServer } from "../server.ts";
 import { type CliServerFlags, resolveServerConfig, sharedServerCommandFlags } from "./config.ts";
 
@@ -23,16 +24,23 @@ const runServerCommand = (
   Effect.gen(function* () {
     const logLevel = yield* GlobalFlag.LogLevel;
     const config = yield* resolveServerConfig(flags, logLevel, options);
-    return yield* runServer.pipe(Effect.provideService(ServerConfig.ServerConfig, config));
+    const run = runServer.pipe(Effect.provideService(ServerConfig.ServerConfig, config));
+    if (config.mode !== "desktop" || config.desktopBootstrapToken === undefined) return yield* run;
+    return yield* Effect.raceFirst(
+      run,
+      awaitLauncherLoss().pipe(
+        // End like SIGTERM does (interrupt-only exit, so the runtime forces process exit).
+        Effect.andThen(Effect.interrupt),
+      ),
+    );
   });
 
-/** Bare words can name existing directories, but must not create typo projects. */
 export const runDefaultServerCommand = (flags: CliServerFlags) =>
   Effect.gen(function* () {
     if (Option.isSome(flags.cwd)) {
       const cwd = flags.cwd.value.trim();
       const fs = yield* FileSystem.FileSystem;
-      const platform = yield* HostProcessPlatform;
+      const platform = yield* HostProcess.Platform;
       const explicitPath =
         cwd === "." ||
         cwd === ".." ||

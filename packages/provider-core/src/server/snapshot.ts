@@ -3,9 +3,9 @@ import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 import type { ProviderMaintenanceCapabilities } from "./maintenance.ts";
 
-export interface ServerProviderShape {
+export interface ManagedServerProvider {
   /**
-   * Ownership-derived update capabilities. Cached between reads; pass
+   * Cached between reads; pass
    * `{ fresh: true }` before executing an update so it never trusts a
    * resolution older than the click.
    */
@@ -16,8 +16,7 @@ export interface ServerProviderShape {
   readonly refresh: Effect.Effect<ServerProvider>;
   readonly streamChanges: Stream.Stream<ServerProvider>;
   /**
-   * Fold a runtime rate-limit update into the published snapshot without
-   * waiting for the next status probe. Sparse: windows merge by id and an
+   * Sparse: windows merge by id and an
    * update with no usable window leaves the snapshot untouched.
    */
   readonly applyUsageLimits: (

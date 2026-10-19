@@ -1,7 +1,3 @@
-// @effect-diagnostics nodeBuiltinImport:off -- The excerpt sanitizer masks the home directory, which only the Node os module can resolve.
-import * as NodeOS from "node:os";
-
-/** Last few KiB of ACP child stderr kept for startup / exit diagnostics. */
 export const ACP_STDERR_TAIL_MAX_CHARS = 4_096;
 
 const PAIRING_URL_PATTERN = /https?:\/\/[^\s]*\/pair#[^\s]*/gi;
@@ -16,13 +12,13 @@ export function appendAcpStderrTail(current: string, chunk: string): string {
   return next.length <= ACP_STDERR_TAIL_MAX_CHARS ? next : next.slice(-ACP_STDERR_TAIL_MAX_CHARS);
 }
 
-/** Bounded, redacted excerpt safe to put on user-facing adapter errors. */
 export function sanitizeAcpStderrExcerpt(
   text: string,
+  homeDirectory: string,
   environment: NodeJS.ProcessEnv = process.env,
 ): string {
   let result = text.replaceAll("\0", "");
-  const homes = [environment.HOME, environment.USERPROFILE, NodeOS.homedir()].filter(
+  const homes = [environment.HOME, environment.USERPROFILE, homeDirectory].filter(
     (value): value is string => typeof value === "string" && value.length > 1,
   );
   for (const home of new Set(homes)) {

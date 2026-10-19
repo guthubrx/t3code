@@ -12,7 +12,7 @@ import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { normalizeModelSlug } from "@t3tools/shared/model";
 
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
@@ -31,7 +31,6 @@ interface GrokAcpRuntimeInput extends Omit<
   AcpSessionRuntime.AcpSessionRuntimeOptions,
   "authMethodId" | "clientCapabilities" | "spawn"
 > {
-  readonly childProcessSpawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
   readonly grokSettings: GrokAcpRuntimeGrokSettings | null | undefined;
   readonly environment?: NodeJS.ProcessEnv;
   readonly runtimeMode?: RuntimeMode;
@@ -49,9 +48,8 @@ export const GROK_SUPPORTED_RUNTIME_MODES = [
 ] as const satisfies ReadonlyArray<RuntimeMode>;
 
 /**
- * Launch argv for a runtime mode. `--permission-mode` on the argv beats the
- * user's Grok config, so Supervised cannot inherit a configured always-approve.
- * A mode Grok does not offer launches asking.
+ * `--permission-mode` on the argv beats the user's Grok config, so Supervised
+ * cannot inherit a configured always-approve.
  */
 export function grokAcpSpawnArgs(runtimeMode?: RuntimeMode): ReadonlyArray<string> {
   switch (runtimeMode) {
@@ -106,8 +104,7 @@ export function grokAcpRuntimeProcessOwnership(
 
 /**
  * Current Grok treats Ctrl+C cancellation as a barrier against stale
- * background-task wake prompts until the next genuine user turn. Replay sends
- * the same metadata so recorded cancels match.
+ * background-task wake prompts until the next genuine user turn.
  */
 export const GROK_ACP_CANCEL_META = { cancelTrigger: "ctrl_c" } as const;
 
@@ -130,10 +127,6 @@ export const GROK_ACP_INITIALIZE_META = { clientType: "extension" } as const;
  */
 const GROK_ALLOW_EDITS_SESSION_OPTION_ID = "allow-edits-session";
 
-/**
- * The approval choices a Grok permission prompt can honor. The session choice
- * appears only where Grok's answer lasts for the session.
- */
 export function grokApprovalOptions(
   request: EffectAcpSchema.RequestPermissionRequest,
 ): ReadonlyArray<ProviderApprovalOption> {
@@ -157,10 +150,10 @@ export const makeGrokAcpRuntime = (
 ): Effect.Effect<
   AcpSessionRuntime.AcpSessionRuntime["Service"],
   EffectAcpErrors.AcpError,
-  Crypto.Crypto | Scope.Scope
+  ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto | Scope.Scope
 > =>
   Effect.gen(function* () {
-    const processGroupPlatform = yield* HostProcessPlatform.pipe(
+    const processGroupPlatform = yield* HostProcess.Platform.pipe(
       Effect.provide(NodeServices.layer),
     );
     const acpContext = yield* Layer.build(
@@ -176,11 +169,7 @@ export const makeGrokAcpRuntime = (
         cancelMeta: { ...input.cancelMeta, ...GROK_ACP_CANCEL_META },
         initializeMeta: GROK_ACP_INITIALIZE_META,
         ...grokAcpRuntimeProcessOwnership(processGroupPlatform),
-      }).pipe(
-        Layer.provide(
-          Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, input.childProcessSpawner),
-        ),
-      ),
+      }),
     );
     const runtime = yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(
       Effect.provide(acpContext),
@@ -189,8 +178,8 @@ export const makeGrokAcpRuntime = (
   });
 
 /**
- * T3's built-in Grok slug. It is the CLI's product name, not a model id the ACP accepts,
- * so selecting it means "use whatever model the Grok session currently runs on".
+ * It is the CLI's product name, not a model id the ACP accepts, so selecting it
+ * means "use whatever model the Grok session currently runs on".
  */
 export const GROK_DEFAULT_MODEL_SLUG = "grok-build";
 
@@ -251,7 +240,6 @@ export function applyGrokAcpModelSelection<E>(input: {
   readonly requestedReasoningEffort?: string | undefined;
   readonly mapError: (cause: EffectAcpErrors.AcpError) => E;
 }): Effect.Effect<string | undefined, E> {
-  // The product slug is never sent over the wire; it keeps the session's current model.
   const requestedModelId =
     input.requestedModelId === GROK_DEFAULT_MODEL_SLUG ? undefined : input.requestedModelId;
   const modelChanged = requestedModelId !== undefined && requestedModelId !== input.currentModelId;
@@ -267,11 +255,6 @@ export function applyGrokAcpModelSelection<E>(input: {
   }
   const reasoningMeta =
     reasoningProvided && reasoningEffort !== undefined ? { reasoningEffort } : undefined;
-  // When reasoning was explicitly provided but invalid (normalize => undefined), we deliberately
-  // send no meta so the invalid value is dropped rather than forwarded. When reasoning was not
-  // provided at all, we also send no meta, but we only reach this call when the model itself
-  // changed - an omitted reasoning preference must not be treated as an explicit clear of the
-  // CLI-advertised default (e.g. Extra High) on same-model reselections.
   return input.runtime
     .setSessionModel(targetModelId, reasoningMeta)
     .pipe(Effect.mapError(input.mapError), Effect.as(targetModelId));

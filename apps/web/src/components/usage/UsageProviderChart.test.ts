@@ -26,8 +26,6 @@ describe("chartScale", () => {
 
 describe("niceScale", () => {
   it("never puts the peak above the top of the scale", () => {
-    // Regression: an earlier version stopped at the last step below the peak,
-    // so the tallest day was drawn past the plot and clipped.
     for (const peak of [1122.71, 999, 1, 0.04, 1_400_000_000, 37.5, 5000, 100.001]) {
       const { max } = niceScale(peak, 4);
       expect(max, `peak ${peak}`).toBeGreaterThanOrEqual(peak);
@@ -69,15 +67,15 @@ describe("buildPeriodColumns", () => {
       "2026-08-01",
       {
         day: "2026-08-01",
-        costUsd: 30,
-        totalTokens: 300,
+        costUsd: 35,
+        totalTokens: 350,
         byProvider: new Map([
           ["codex" as const, { costUsd: 10, totalTokens: 100 }],
           ["claude" as const, { costUsd: 20, totalTokens: 200 }],
+          ["pi" as const, { costUsd: 5, totalTokens: 50 }],
         ]),
       },
     ],
-    // 2026-08-02 is deliberately absent: a day with no activity.
     [
       "2026-08-03",
       {
@@ -91,19 +89,17 @@ describe("buildPeriodColumns", () => {
 
   it("plots each day on its own", () => {
     expect(buildPeriodColumns(days, byDay, "cost").map((column) => column.total)).toEqual([
-      30, 0, 5,
+      35, 0, 5,
     ]);
   });
 
   it("reads the requested metric", () => {
     expect(buildPeriodColumns(days, byDay, "tokens").map((column) => column.total)).toEqual([
-      300, 0, 50,
+      350, 0, 50,
     ]);
   });
 
   it("keeps band values absolute rather than cumulative", () => {
-    // Regression: the bands were once stack offsets, which drew Claude Code
-    // permanently above Codex regardless of which provider spent more.
     const [first] = buildPeriodColumns(days, byDay, "cost");
 
     expect(first?.bands).toEqual([
@@ -113,6 +109,7 @@ describe("buildPeriodColumns", () => {
       { provider: "cursor", value: 0 },
       { provider: "opencode", value: 0 },
       { provider: "antigravity", value: 0 },
+      { provider: "pi", value: 5 },
     ]);
   });
 

@@ -19,23 +19,15 @@ export interface McpProviderSessionConfig {
   readonly endpoint: string;
   readonly authorizationHeader: string;
   /**
-   * Whether this credential includes the "preview" capability. Adapters read
-   * it to keep developer instructions truthful: when the user withholds agent
-   * browser access, the prompt must not advertise `preview_*` tools that every
-   * call would reject.
+   * Adapters read it to keep developer instructions truthful: when the user
+   * withholds agent browser access, the prompt must not advertise `preview_*`
+   * tools that every call would reject.
    */
   readonly browserToolsAvailable: boolean;
-  /** Capabilities the credential grants ("preview", "device"). */
   readonly capabilities?: ReadonlySet<string>;
-  /**
-   * Set when the session may drive devices. Adapters spread this into the
-   * provider subprocess environment so the `agent-device` CLI is on PATH and
-   * already pointed at the server's daemon; the agent never handles a token.
-   */
   readonly agentDeviceEnvironment?: Readonly<Record<string, string>>;
 }
 
-/** Provider env with the device variables applied over `base`, or `base` untouched. */
 export function withAgentDeviceEnvironment(
   base: NodeJS.ProcessEnv,
   config: Pick<McpProviderSessionConfig, "agentDeviceEnvironment"> | undefined,
@@ -62,7 +54,19 @@ type PermissionFact = {
   readonly permissions?: BridgetPermissions;
   readonly verify?: () => Promise<boolean>;
 };
-const permissionsByThread = new Map<ThreadId, PermissionFact>();
+const permissionsByThread = new WeakMap<McpProviderSessionConfig, PermissionFact>();
+const activeConfigs = new WeakSet<McpProviderSessionConfig>();
+
+export function activateMcpProviderSession(config: McpProviderSessionConfig): void {
+  activeConfigs.add(config);
+}
+export function deactivateMcpProviderSession(config: McpProviderSessionConfig): void {
+  activeConfigs.delete(config);
+  permissionsByThread.delete(config);
+}
+export function isMcpProviderSessionActive(config: McpProviderSessionConfig): boolean {
+  return activeConfigs.has(config);
+}
 
 /** O(1) lookup; the adapter's verifier rechecks only its bounded source inputs. */
 export async function readMcpProviderPermissions(
@@ -74,8 +78,8 @@ export async function readMcpProviderPermissions(
   | { readonly status: "unavailable" }
   | { readonly status: "valid"; readonly permissions: BridgetPermissions }
 > {
-  if (sessionsByThread.get(config.threadId) !== config) return { status: "unavailable" };
-  const fact = permissionsByThread.get(config.threadId);
+  if (!activeConfigs.has(config)) return { status: "unavailable" };
+  const fact = permissionsByThread.get(config);
   if (fact === undefined) return { status: "absent" };
   if (
     fact.owner !== config ||
@@ -93,15 +97,11 @@ export async function readMcpProviderPermissions(
       /* Never expose source contents or credentials. */
     }
     if (!valid) {
-      if (permissionsByThread.get(config.threadId) === fact)
-        invalidateMcpProviderPermissions(config, runId);
+      if (permissionsByThread.get(config) === fact) invalidateMcpProviderPermissions(config, runId);
       return { status: "unavailable" };
     }
   }
-  if (
-    sessionsByThread.get(config.threadId) !== config ||
-    permissionsByThread.get(config.threadId) !== fact
-  )
+  if (!activeConfigs.has(config) || permissionsByThread.get(config) !== fact)
     return { status: "unavailable" };
   return { status: "valid", permissions: fact.permissions };
 }
@@ -113,15 +113,15 @@ export function publishMcpProviderPermissions(
   binding: { readonly attemptId: string; readonly providerThreadId: string },
   verify?: () => Promise<boolean>,
 ): number | undefined {
-  if (sessionsByThread.get(config.threadId) !== config) return undefined;
-  const previous = permissionsByThread.get(config.threadId);
+  if (!activeConfigs.has(config)) return undefined;
+  const previous = permissionsByThread.get(config);
   const revision = (previous?.owner === config ? previous.revision : 0) + 1;
   const decoded = decodeBridgetPermissions({ ...permissions, revision });
   const valid =
     Option.isSome(decoded) &&
     decoded.value.provider_session_id === config.providerSessionId &&
     decoded.value.provider_instance_id === config.providerInstanceId;
-  permissionsByThread.set(config.threadId, {
+  permissionsByThread.set(config, {
     owner: config,
     runId: permissions.run_id,
     revision,
@@ -139,32 +139,29 @@ export function invalidateMcpProviderPermissions(
   runId: string,
   expectedRevision?: number,
 ): void {
-  if (sessionsByThread.get(config.threadId) !== config) return;
-  const current = permissionsByThread.get(config.threadId);
+  if (!activeConfigs.has(config)) return;
+  const current = permissionsByThread.get(config);
   if (current !== undefined && (current.owner !== config || current.runId !== runId)) return;
   if (expectedRevision !== undefined && current?.revision !== expectedRevision) return;
-  permissionsByThread.set(config.threadId, {
+  permissionsByThread.set(config, {
     owner: config,
     runId,
     revision: current?.revision ?? 0,
   });
 }
 
+// Legacy fixture helpers. Production ownership is environment-scoped in McpProviderSessions.
 export function setMcpProviderSession(config: McpProviderSessionConfig): void {
-  if (sessionsByThread.get(config.threadId) !== config) permissionsByThread.delete(config.threadId);
+  const previous = sessionsByThread.get(config.threadId);
+  if (previous !== undefined && previous !== config) deactivateMcpProviderSession(previous);
   sessionsByThread.set(config.threadId, config);
+  activateMcpProviderSession(config);
 }
-
 export function readMcpProviderSession(threadId: ThreadId): McpProviderSessionConfig | undefined {
   return sessionsByThread.get(threadId);
 }
-
 export function clearMcpProviderSession(threadId: ThreadId): void {
-  permissionsByThread.delete(threadId);
+  const previous = sessionsByThread.get(threadId);
+  if (previous !== undefined) deactivateMcpProviderSession(previous);
   sessionsByThread.delete(threadId);
-}
-
-function clearAllMcpProviderSessions(): void {
-  permissionsByThread.clear();
-  sessionsByThread.clear();
 }

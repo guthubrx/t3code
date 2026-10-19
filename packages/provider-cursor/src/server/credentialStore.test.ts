@@ -6,11 +6,11 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
-import { layerTestProviderHost } from "@t3tools/provider-testing/host";
+import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import * as Layer from "effect/Layer";
 import { makeCursorCredentialStore } from "./credentialStore.ts";
 
-const layerHost = Layer.provideMerge(layerTestProviderHost(), NodeServices.layer);
+const layerHost = Layer.provideMerge(TestProviderHost.layer(), NodeServices.layer);
 
 const legacyCredentials = {
   version: 1 as const,
@@ -18,7 +18,6 @@ const legacyCredentials = {
   apiKey: "test-only-legacy-key",
   createdAtMs: 100,
 };
-// The SDK's FileCredentialStore writes pretty-printed JSON.
 const legacyFileText = `{
   "version": 1,
   "backendUrl": "https://api.cursor.com",

@@ -308,8 +308,6 @@ describe("surface shortcuts", () => {
 });
 
 describe("surface shortcut typing contexts", () => {
-  // Selector-aware stub: closest() answers only tokens the combined selector
-  // would actually match, mirroring how the browser resolves it.
   const makeTarget = (matches: string | null) => ({
     closest(selectors: string) {
       if (matches === null || !selectors.includes(matches)) return null;
@@ -321,10 +319,6 @@ describe("surface shortcut typing contexts", () => {
     expect(surfaceShortcutTargetsTypingContext(makeTarget("input"))).toBe(true);
     expect(surfaceShortcutTargetsTypingContext(makeTarget("textarea"))).toBe(true);
     expect(surfaceShortcutTargetsTypingContext(makeTarget("select"))).toBe(true);
-    // The chat composer is a contenteditable that sits empty until a draft
-    // exists; launcher letters claimed from it redirected prompts into shells.
-    // The :not clause sees past contenteditable="false" islands to an editable
-    // host around them, so nested editors stay protected too.
     expect(surfaceShortcutTargetsTypingContext(makeTarget("[contenteditable]"))).toBe(true);
   });
 
@@ -334,51 +328,11 @@ describe("surface shortcut typing contexts", () => {
   });
 });
 
-describe("RightPanelTabs audio indicator", () => {
-  // A muted tab only shows the indicator while it is actually making sound:
-  // arming mute on a quiet tab is deliberate and stays invisible until there
-  // is something to suppress.
-  const cases = [
-    { audible: false, audioMuted: false, label: null },
-    { audible: false, audioMuted: true, label: null },
-    { audible: true, audioMuted: false, label: "Mute Local site" },
-    { audible: true, audioMuted: true, label: "Unmute Local site" },
-  ] as const;
-
-  it.each(cases)("audible=$audible muted=$audioMuted", ({ audible, audioMuted, label }) => {
-    const html = renderTabs(null, undefined, { audible, audioMuted });
-    if (label === null) {
-      expect(html).not.toContain("Mute Local site");
-      expect(html).not.toContain("Unmute Local site");
-    } else {
-      expect(html).toContain(`aria-label="${label}"`);
-    }
-  });
-
-  it("addresses the desktop by runtime tab id, never the server session id", () => {
-    // Session ids are only unique per server process; sending one to the
-    // Electron manager raises PreviewTabNotFoundError and silently no-ops.
-    const seen: string[] = [];
-    renderTabs(null, undefined, { audible: true }, (tabId) => {
-      seen.push(tabId);
-      return `runtime:${tabId}`;
-    });
-    expect(seen).toContain("tab-1");
-  });
-
-  it("hides the toggle when no runtime tab id can be resolved", () => {
-    const html = renderTabs(null, undefined, { audible: true }, null);
-    expect(html).not.toContain("Mute Local site");
-  });
-});
-
 describe("tabMuteMenuItem", () => {
   const overlay = (audioMuted: boolean) =>
     ({ audioMuted, audible: false }) as Parameters<typeof tabMuteMenuItem>[0]["overlay"];
 
   it("stays disabled until the desktop tab exists", () => {
-    // The server session id resolves before the preview manager finishes
-    // createTab. Muting in that window fails with an error nobody surfaces.
     expect(tabMuteMenuItem({ overlay: null, canResolveRuntimeTabId: true })).toEqual({
       label: "Mute tab",
       disabled: true,

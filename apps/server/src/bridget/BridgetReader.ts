@@ -15,7 +15,7 @@ import {
   type BridgetLineageCancelInput,
   type BridgetLineageJournalInput,
 } from "@t3tools/contracts";
-import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
+import { Environment as HostProcessEnvironment } from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";

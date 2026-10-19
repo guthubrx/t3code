@@ -1,3 +1,5 @@
+import { observeResize } from "~/lib/observeResize";
+import { useStableCallback } from "../hooks/useStableCallback";
 import { useAtomValue } from "@effect/atom-react";
 import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
 import type { BridgetJournalState } from "@t3tools/client-runtime/state/orchestration";
@@ -9,7 +11,6 @@ import {
   type BridgetJournalConflict,
   type BridgetJournalContinuityCut,
   type BridgetJournalGap,
-  type BridgetJournalProjection,
 } from "@t3tools/client-runtime/bridget-journal-presentation";
 import type {
   BridgetJournalEvent,
@@ -24,16 +25,7 @@ import type {
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
-import {
-  memo,
-  useCallback,
-  useEffect,
-  useId,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { memo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { orchestrationEnvironment } from "~/state/orchestration";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -286,7 +278,6 @@ export function BridgetTaskJournal({
   const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
   const [bottomInset, setBottomInset] = useState(0);
   const lastSeq = useRef(0);
-  const liveProjection = useRef<BridgetJournalProjection | null>(null);
   const requests = useRef(new Set<AbortController>());
   useLayoutEffect(() => {
     const overlay = scrollElement
@@ -297,10 +288,7 @@ export function BridgetTaskJournal({
     // Reserve its measured height once, while keeping the normal journal gap.
     const measure = () => setBottomInset(Math.max(0, overlay.getBoundingClientRect().height));
     measure();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measure);
-    observer.observe(overlay);
-    return () => observer.disconnect();
+    return observeResize(overlay, measure);
   }, [scrollElement]);
   useEffect(
     () => () => {
@@ -314,7 +302,7 @@ export function BridgetTaskJournal({
       setConnection((previous) => ({ afterSeq: lastSeq.current, visit: previous.visit + 1 }));
     }
   }, [visible]);
-  const onState = useCallback((state: BridgetJournalState) => {
+  const onState = useStableCallback((state: BridgetJournalState) => {
     lastSeq.current = Math.max(lastSeq.current, state.nextSeq);
     setCaughtUp(state.caughtUp);
     if (state.gap !== null) setGap(state.gap);
@@ -344,7 +332,7 @@ export function BridgetTaskJournal({
         ...continuity,
       };
     });
-  }, []);
+  });
   const read = async (input: BridgetLineageReadInput) => {
     const controller = new AbortController();
     requests.current.add(controller);
@@ -426,24 +414,23 @@ export function BridgetTaskJournal({
   };
   const nativeStatus = task?.status ?? ref.status;
   const terminal = ["result_available", "failed", "cancelled"].includes(nativeStatus);
-  const liveInput = useMemo(
-    () => ({
-      events: journal.events,
-      conflicts: journal.conflicts,
-      gaps: journal.gaps,
-      continuityCut: journal.continuityCut,
-      beginsWithExcerpt: journal.headCut,
-    }),
-    [journal],
-  );
-  const projectedLiveJournal = useMemo(
-    () => projectBridgetJournal(liveInput, liveProjection.current ?? undefined),
-    [liveInput],
-  );
-  useEffect(() => {
-    liveProjection.current = projectedLiveJournal;
-  }, [projectedLiveJournal]);
-  const projectedHistory = useMemo(() => {
+  const liveInput = (() => ({
+    events: journal.events,
+    conflicts: journal.conflicts,
+    gaps: journal.gaps,
+    continuityCut: journal.continuityCut,
+    beginsWithExcerpt: journal.headCut,
+  }))();
+  const [previousProjection, setPreviousProjection] = useState(() => ({
+    journal,
+    projection: projectBridgetJournal(liveInput),
+  }));
+  let projectedLiveJournal = previousProjection.projection;
+  if (previousProjection.journal !== journal) {
+    projectedLiveJournal = projectBridgetJournal(liveInput, previousProjection.projection);
+    setPreviousProjection({ journal, projection: projectedLiveJournal });
+  }
+  const projectedHistory = (() => {
     if (history === null) return null;
     const merged = mergeJournalEvents([], history.events);
     return projectBridgetJournal({
@@ -452,7 +439,7 @@ export function BridgetTaskJournal({
       gaps: history.gap === null ? [] : [history.gap],
       beginsWithExcerpt: historyAfterSeq !== 0 || history.gap !== null,
     });
-  }, [history, historyAfterSeq]);
+  })();
   const projection = projectedHistory ?? projectedLiveJournal;
   return (
     <section

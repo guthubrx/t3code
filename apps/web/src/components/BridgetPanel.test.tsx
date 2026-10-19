@@ -1,3 +1,4 @@
+import { FetchHttpClient } from "effect/http";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { RegistryContext } from "@effect/atom-react";
 import { createOrchestrationEnvironmentAtoms } from "@t3tools/client-runtime/state/orchestration";
@@ -770,7 +771,12 @@ describe("Bridget native reader", () => {
             stateChanges: () => SubscriptionRef.changes(supervisor.state),
           } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
           const atoms = createOrchestrationEnvironmentAtoms(
-            Atom.runtime(Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, service)),
+            Atom.runtime(
+              Layer.merge(
+                FetchHttpClient.layer,
+                Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, service),
+              ),
+            ),
           );
           nativeRegistry = AtomRegistry.make();
           nativeWatch = (target) => atoms.bridgetWatch(target);
@@ -1742,3 +1748,15 @@ describe("Bridget native reader", () => {
     expect(renderer!.root.findAllByProps({ "data-bridget-body": true })).toHaveLength(0);
   });
 });
+
+vi.mock("~/lib/observeResize", () => ({
+  observeResize: (
+    element: Element,
+    callback: (entries: readonly ResizeObserverEntry[]) => void,
+  ) => {
+    if (typeof ResizeObserver === "undefined") return () => undefined;
+    const observer = new ResizeObserver((entries) => callback(entries));
+    observer.observe(element);
+    return () => observer.disconnect();
+  },
+}));

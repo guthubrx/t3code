@@ -1,3 +1,12 @@
+// Native bridge interop: real Node APIs form the boundary under test.
+// @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics globalTimers:off
+// @effect-diagnostics globalDate:off
+// @effect-diagnostics globalFetchInEffect:off
+import * as BridgetTestSessions from "../bridget/BridgetSessions.testkit.ts";
+import * as TestGit from "../vcs/GitVcsDriver.ts";
+import * as TestLaunch from "../orchestration-v2/ThreadLaunchService.ts";
+import * as TestSettings from "../serverSettings.ts";
 import * as NodeHttp from "node:http";
 import { NodeHttpServer } from "@effect/platform-node";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -109,7 +118,15 @@ run(
           OrchestratorHandlers.layer,
         ).pipe(
           Layer.provideMerge(McpHttpServer.layerMcpTransport),
-          Layer.provide(OrchestratorService.layer.pipe(Layer.provideMerge(storageLayer))),
+          Layer.provide(
+            OrchestratorService.layer.pipe(
+              Layer.provideMerge(storageLayer),
+              Layer.provide(BridgetTestSessions.layer),
+              Layer.provide(Layer.mock(TestGit.GitVcsDriver)({})),
+              Layer.provide(Layer.mock(TestLaunch.ThreadLaunchService)({})),
+              Layer.provide(Layer.mock(TestSettings.ServerSettingsService)({})),
+            ),
+          ),
         );
         yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
           Layer.build,

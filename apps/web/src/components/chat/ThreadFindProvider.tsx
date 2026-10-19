@@ -1,8 +1,8 @@
 import {
   createContext,
   use,
-  useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   type ReactNode,
   type ComponentProps,
   type Ref,
@@ -49,7 +49,7 @@ export function ThreadFindProvider({
     find.open,
     find.close,
   ]);
-  useEffect(() => onOpenChange(find.isOpen), [find.isOpen, onOpenChange]);
+  useLayoutEffect(() => onOpenChange(find.isOpen), [find.isOpen, onOpenChange]);
   return (
     <ThreadFindBarContext value={find.barProps}>
       <ThreadFindTimelineContext value={find.timelineProps}>{children}</ThreadFindTimelineContext>

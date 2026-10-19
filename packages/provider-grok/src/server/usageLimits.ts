@@ -1,4 +1,3 @@
-import * as NodeOS from "node:os";
 import type { ServerProviderUsageWindow } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -6,12 +5,15 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
-import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
+import * as HttpClient from "effect/http/HttpClient";
+import * as HttpClientRequest from "effect/http/HttpClientRequest";
+import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import {
   clampPercent,
   makeUnavailableUsageLimits,
   makeUsageLimits,
 } from "@t3tools/provider-core/server/usageLimits";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 const GrokCredentials = Schema.Record(
   Schema.String,
@@ -45,11 +47,7 @@ export function grokUsageResponseToLimits(
     // A billing read that succeeded but carries no percentage is an account
     // with nothing metered yet, not one that can never report: xAI omits the
     // field entirely (rather than sending 0) until usage registers, then fills
-    // it in. Calling that `unsupported` would strand the account — the Limits
-    // view drops unsupported entries and deliberately mutes their notice, so a
-    // freshly signed-in Grok account would vanish with no explanation until it
-    // happened to be used, and `applyUsageLimitsUpdate` would refuse the
-    // mid-turn windows that could have recovered it.
+    // it in.
     return makeUsageLimits({ checkedAt, windows: [] });
   }
   const period = response.config?.currentPeriod;
@@ -66,10 +64,6 @@ export function grokUsageResponseToLimits(
   return makeUsageLimits({ checkedAt, windows: [window] });
 }
 
-/**
- * The grok.com login the CLI uses by default, or undefined when the CLI is
- * configured to pick another account, endpoint, or an API key.
- */
 const readGrokCredential = Effect.fn("readGrokCredential")(function* (
   environment: NodeJS.ProcessEnv,
 ) {
@@ -98,7 +92,10 @@ const readGrokCredential = Effect.fn("readGrokCredential")(function* (
   const path = yield* Path.Path;
   const home =
     environment.GROK_HOME?.trim() ||
-    path.join(environment.HOME || environment.USERPROFILE || NodeOS.homedir(), ".grok");
+    path.join(
+      environment.HOME || environment.USERPROFILE || (yield* HostProcess.HomeDirectory),
+      ".grok",
+    );
   for (const configPath of [
     path.join(home, "config.toml"),
     path.join(home, "managed_config.toml"),
@@ -133,10 +130,6 @@ const readGrokCredential = Effect.fn("readGrokCredential")(function* (
   return credential?.auth_mode === "api_key" ? undefined : credential;
 });
 
-/**
- * Reads the default grok.com login once and reports its usage limits along with
- * its email, so the email always names the account whose quota was read.
- */
 export const readGrokAccount = Effect.fn("readGrokAccount")(function* (
   environment: NodeJS.ProcessEnv = process.env,
 ) {
@@ -155,7 +148,6 @@ export const readGrokAccount = Effect.fn("readGrokAccount")(function* (
   if (!token) {
     return { email, usageLimits: makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" }) };
   }
-  // A failed quota request still knows which account it asked about.
   const usageLimits = yield* Effect.gen(function* () {
     const client = yield* HttpClient.HttpClient;
     const response = yield* client.execute(

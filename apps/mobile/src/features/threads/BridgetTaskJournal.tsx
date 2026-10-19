@@ -25,26 +25,16 @@ import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import {
-  Markdown,
-  type CustomRenderers,
-  type NodeStyleOverrides,
-  type PartialMarkdownTheme,
-} from "react-native-nitro-markdown";
 import { AppState, Pressable, ScrollView, View } from "react-native";
-import { AppText as Text } from "../../components/AppText";
-import {
-  resolveMarkdownFontSizes,
-  resolveNativeMarkdownTypography,
-} from "../../lib/appearancePreferences";
+import { AppText as Text } from "../../components/ui/AppText";
+import { resolveNativeMarkdownTypography } from "../../lib/appearancePreferences";
 import { orchestrationEnvironment } from "../../state/orchestration";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useEnvironmentScope } from "../../state/session";
-import { useFontFamily } from "../../lib/useFontFamily";
+import { FONT_FAMILIES } from "../../lib/fontFamilies";
 import { useUniwindTheme } from "../../lib/useUniwindTheme";
 import {
-  hasNativeSelectableMarkdownText,
   SelectableMarkdownText,
   type MarkdownImageRenderer,
   type NativeMarkdownTextStyle,
@@ -72,19 +62,6 @@ const contactLabels = {
   unknown: "Contact inconnu",
 } as const;
 
-const JOURNAL_MARKDOWN_RENDERERS: CustomRenderers = {
-  link: ({ children }) => (
-    <Text selectable className="text-foreground underline">
-      {children}
-    </Text>
-  ),
-  image: ({ node }) => (
-    <Text selectable className="text-foreground-secondary">
-      {node.alt ? `[image: ${node.alt}]` : "[image]"}
-    </Text>
-  ),
-};
-
 const ignoreJournalLink = (_href: string) => undefined;
 
 const renderInertJournalImage: MarkdownImageRenderer = ({ alt }) => (
@@ -93,157 +70,39 @@ const renderInertJournalImage: MarkdownImageRenderer = ({ alt }) => (
   </Text>
 );
 
-interface JournalMarkdownPresentation {
-  readonly nativeTextStyle: NativeMarkdownTextStyle;
-  readonly theme: PartialMarkdownTheme;
-  readonly styles: NodeStyleOverrides;
-}
-
-function useJournalMarkdownPresentation(): JournalMarkdownPresentation {
+function useJournalMarkdownPresentation(): NativeMarkdownTextStyle {
   const { appearance } = useAppearancePreferences();
-  const markdownFontSizes = useMemo(
-    () => resolveMarkdownFontSizes(appearance.baseFontSize),
-    [appearance.baseFontSize],
-  );
-  const nativeMarkdownTypography = useMemo(
-    () => resolveNativeMarkdownTypography(appearance.baseFontSize),
-    [appearance.baseFontSize],
-  );
+  const typography = resolveNativeMarkdownTypography(appearance.baseFontSize);
   const theme = useUniwindTheme();
-  const body = theme["--color-md-body"];
-  const strong = theme["--color-md-strong"];
-  const link = theme["--color-md-link"];
-  const blockquoteBorder = theme["--color-md-blockquote-border"];
-  const blockquoteBackground = theme["--color-md-blockquote-bg"];
-  const codeBackground = theme["--color-md-code-bg"];
-  const codeText = theme["--color-md-code-text"];
-  const horizontalRule = theme["--color-md-hr"];
-  const regularFontFamily = useFontFamily("regular");
-  const mediumFontFamily = useFontFamily("medium");
-  const boldFontFamily = useFontFamily("bold");
-
-  return useMemo(
-    () => ({
-      nativeTextStyle: {
-        color: body,
-        strongColor: strong,
-        mutedColor: body,
-        linkColor: link,
-        inlineCodeColor: codeText,
-        codeColor: codeText,
-        codeBackgroundColor: codeBackground,
-        codeBlockBackgroundColor: codeBackground,
-        fileTextColor: codeText,
-        skillTextColor: codeText,
-        quoteMarkerColor: blockquoteBorder,
-        dividerColor: horizontalRule,
-        fontSize: nativeMarkdownTypography.fontSize,
-        lineHeight: nativeMarkdownTypography.lineHeight,
-        headingFontSizes: nativeMarkdownTypography.headingFontSizes,
-        fontFamily: regularFontFamily,
-        headingFontFamily: boldFontFamily,
-        boldFontFamily,
-      },
-      theme: {
-        colors: {
-          text: body,
-          heading: strong,
-          link,
-          blockquote: blockquoteBorder,
-          border: horizontalRule,
-          surface: "transparent",
-          surfaceLight: blockquoteBackground,
-          accent: link,
-          tableBorder: horizontalRule,
-          tableHeader: blockquoteBackground,
-          tableHeaderText: strong,
-          tableRowOdd: blockquoteBackground,
-          tableRowEven: "transparent",
-          code: codeText,
-          codeBackground,
-        },
-        fontSizes: {
-          s: markdownFontSizes.s,
-          m: markdownFontSizes.m,
-          h1: markdownFontSizes.h1,
-          h2: markdownFontSizes.h2,
-          h3: markdownFontSizes.h3,
-          h4: markdownFontSizes.h4,
-          h5: markdownFontSizes.h5,
-          h6: markdownFontSizes.h6,
-        },
-        fontFamilies: {
-          regular: regularFontFamily,
-          heading: boldFontFamily,
-          mono: "ui-monospace",
-        },
-      },
-      styles: {
-        document: { flexShrink: 1 },
-        paragraph: { marginTop: 0, marginBottom: 10 },
-        text: {
-          color: body,
-          fontFamily: regularFontFamily,
-          fontSize: markdownFontSizes.m,
-          lineHeight: markdownFontSizes.bodyLineHeight,
-        },
-        heading: { color: strong, fontFamily: boldFontFamily },
-        bold: { color: strong, fontFamily: boldFontFamily },
-        link: { color: link, fontFamily: mediumFontFamily },
-        blockquote: {
-          backgroundColor: blockquoteBackground,
-          borderLeftColor: blockquoteBorder,
-          borderLeftWidth: 3,
-          paddingLeft: 12,
-        },
-        code_inline: {
-          backgroundColor: codeBackground,
-          color: codeText,
-          fontFamily: "ui-monospace",
-        },
-        code_block: { backgroundColor: codeBackground, borderRadius: 12, padding: 12 },
-        horizontal_rule: { backgroundColor: horizontalRule },
-      },
-    }),
-    [
-      blockquoteBackground,
-      blockquoteBorder,
-      body,
-      boldFontFamily,
-      codeBackground,
-      codeText,
-      horizontalRule,
-      link,
-      markdownFontSizes,
-      mediumFontFamily,
-      nativeMarkdownTypography,
-      regularFontFamily,
-      strong,
-    ],
-  );
+  return {
+    color: theme["--color-md-body"],
+    strongColor: theme["--color-md-strong"],
+    mutedColor: theme["--color-md-body"],
+    linkColor: theme["--color-md-link"],
+    inlineCodeColor: theme["--color-md-code-text"],
+    codeColor: theme["--color-md-code-text"],
+    codeBackgroundColor: theme["--color-md-code-bg"],
+    codeBlockBackgroundColor: theme["--color-md-code-bg"],
+    fileTextColor: theme["--color-md-code-text"],
+    skillTextColor: theme["--color-md-code-text"],
+    quoteMarkerColor: theme["--color-md-blockquote-border"],
+    dividerColor: theme["--color-md-hr"],
+    ...typography,
+    fontFamily: FONT_FAMILIES.regular,
+    headingFontFamily: FONT_FAMILIES.bold,
+    boldFontFamily: FONT_FAMILIES.bold,
+  };
 }
 
 const JournalMarkdown = memo(function JournalMarkdown({ markdown }: { readonly markdown: string }) {
-  const presentation = useJournalMarkdownPresentation();
-  if (hasNativeSelectableMarkdownText()) {
-    return (
-      <SelectableMarkdownText
-        markdown={markdown}
-        textStyle={presentation.nativeTextStyle}
-        onLinkPress={ignoreJournalLink}
-        renderImage={renderInertJournalImage}
-      />
-    );
-  }
+  const textStyle = useJournalMarkdownPresentation();
   return (
-    <Markdown
-      options={{ gfm: true }}
-      renderers={JOURNAL_MARKDOWN_RENDERERS}
-      styles={presentation.styles}
-      theme={presentation.theme}
-    >
-      {markdown}
-    </Markdown>
+    <SelectableMarkdownText
+      markdown={markdown}
+      textStyle={textStyle}
+      onLinkPress={ignoreJournalLink}
+      renderImage={renderInertJournalImage}
+    />
   );
 });
 

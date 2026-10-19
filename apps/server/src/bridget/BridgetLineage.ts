@@ -42,7 +42,7 @@ const make = Effect.gen(function* () {
   const reader = yield* BridgetReader.BridgetReader;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const crypto = yield* Crypto.Crypto;
-  const commandId = crypto.randomUUIDv4.pipe(
+  const commandId = crypto.randomUUIDv4().pipe(
     Effect.map((id) => CommandId.make(`bridget-lineage:${id}`)),
     Effect.orDie,
   );

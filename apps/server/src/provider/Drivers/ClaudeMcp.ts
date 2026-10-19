@@ -5,7 +5,7 @@ import type {
   Settings,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeSettings } from "@t3tools/contracts";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { Platform as HostProcessPlatform } from "@t3tools/shared/HostProcess";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
@@ -180,6 +180,7 @@ export const prepareClaudeMcp = Effect.fn("prepareClaudeMcp")(function* (input: 
     )
   )
     return { code: "inherited_identity" as const };
+  if (input.session === undefined) return { code: "identity_unavailable" as const };
   const sdk = <A>(run: () => Promise<A>) =>
     Effect.tryPromise({ try: run, catch: () => new ClaudeMcpError({ code: "sdk_failed" }) });
   const preparation = Effect.gen(function* () {

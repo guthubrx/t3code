@@ -1,14 +1,15 @@
+import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import { ProviderSessionId, ThreadId } from "@t3tools/contracts";
-import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
+import { EnvironmentId, ProviderInstanceId, ProviderSessionId, ThreadId } from "@t3tools/contracts";
+import { Environment as HostProcessEnvironment } from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
-import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
+import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ClaudeAdapter from "./ClaudeAdapterV2.ts";
 
 const sdk = vi.hoisted(() => ({ query: vi.fn() }));
@@ -48,12 +49,44 @@ const fixture = Effect.gen(function* () {
     .fn()
     .mockResolvedValueOnce([])
     .mockResolvedValue([
-      { name: "bridget", status: "connected", tools: [{ name: "bridget_thread" }] },
+      {
+        name: "bridget",
+        source: "dynamic",
+        status: "connected",
+        tools: [
+          { name: "bridget_thread" },
+          { name: "bridget_capabilities" },
+          { name: "bridget_task_status" },
+        ],
+      },
     ]);
-  sdk.query.mockReset().mockReturnValue({ close, setMcpServers, mcpServerStatus: status });
+  sdk.query.mockReset().mockReturnValue({
+    close,
+    applyFlagSettings: async () => undefined,
+    return: async () => {
+      close();
+      return { done: true, value: undefined };
+    },
+    setMcpServers,
+    mcpServerStatus: status,
+  });
+  const credential = {
+    environmentId: EnvironmentId.make("mcp-fixture"),
+    threadId: ThreadId.make("thread-mcp-test"),
+    providerSessionId: "session-mcp-test",
+    providerInstanceId: ProviderInstanceId.make("claude"),
+    endpoint: "http://fixture.invalid/mcp",
+    authorizationHeader: "Bearer fixture",
+    browserToolsAvailable: false,
+  };
+  McpProviderSession.setMcpProviderSession(credential);
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => McpProviderSession.clearMcpProviderSession(credential.threadId)),
+  );
   const open = runner.open({
     threadId: ThreadId.make("thread-mcp-test"),
     providerSessionId: ProviderSessionId.make("session-mcp-test"),
+    bridgetCredential: credential,
     options: {
       model: "test-model",
       tools: [],

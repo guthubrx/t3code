@@ -24,6 +24,7 @@ const makeStubTextGeneration = (
     generatePrContent: () => Effect.die("generatePrContent stub not configured for this test"),
     generateBranchName: () => Effect.die("generateBranchName stub not configured for this test"),
     generateThreadTitle: () => Effect.die("generateThreadTitle stub not configured for this test"),
+    generateReviewGuide: () => Effect.die("generateReviewGuide stub not configured for this test"),
     ...overrides,
   });
 
@@ -54,8 +55,6 @@ const makeStubRegistry = (
     listInstances: Effect.succeed(instances),
     listUnavailable: Effect.succeed([]),
     streamChanges: Stream.empty,
-    // Tests never drive changes through this stub; acquire a throwaway
-    // subscription on an unused PubSub so the shape is satisfied.
     subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), (pubsub) =>
       PubSub.subscribe(pubsub),
     ),

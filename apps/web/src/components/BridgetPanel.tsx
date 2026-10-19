@@ -1,3 +1,5 @@
+import { observeResize } from "~/lib/observeResize";
+import { useStableCallback } from "../hooks/useStableCallback";
 import { useAtomValue } from "@effect/atom-react";
 import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
 import type { BridgetReadInput } from "@t3tools/contracts";
@@ -9,7 +11,7 @@ import { environmentCatalog } from "~/connection/catalog";
 import { useRightPanelStore } from "~/rightPanelStore";
 import type { BridgetHumanView, EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { ChevronDown, ChevronUp, Copy, RefreshCw, X } from "lucide-react";
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 import { orchestrationEnvironment } from "~/state/orchestration";
 import { Button } from "~/components/ui/button";
@@ -178,305 +180,301 @@ function BridgetSession(context: Context) {
     };
   }, [connectedGeneration]);
 
-  const invalidate = useCallback(
-    (kind: LoadKind = "all") => {
-      const current = visit.current;
-      if (!current.active) return;
-      current.version++;
-      current.kind = current.dirty && current.kind !== kind ? "all" : kind;
-      current.dirty = true;
-      if (current.running) return;
-      const run = async () => {
-        current.running = true;
-        setPending(true);
-        while (current.active && current.dirty) {
-          current.dirty = false;
-          const version = current.version;
-          const kind = current.kind;
-          const sharedThreadId = current.selectedId;
-          const controller = new AbortController();
-          current.controller = controller;
-          const read = async (input: ReadRequest) => {
-            const result = await executeAtomQuery(
-              appAtomRegistry,
-              orchestrationEnvironment.bridgetRead({
-                environmentId: context.environmentId,
-                input: {
-                  ...input,
-                  threadId: context.threadId,
-                  projectId: context.projectId,
-                } as BridgetReadInput,
-              }),
-              {
-                refresh: true,
-                signal: controller.signal,
-                reportFailure: false,
-                reportDefect: false,
-              },
-            );
-            if (controller.signal.aborted || !current.active) throw { detail: "Lecture annulée." };
-            if (result._tag === "Failure") {
-              throw {
-                ...transportFailure(Cause.squash(result.cause)),
-                ...("sharedThreadId" in input ? { sharedThreadId: input.sharedThreadId } : {}),
-              } satisfies ReadFailure;
-            }
-            if (result.value.result.status === "error")
-              throw {
-                ...result.value.result,
-                ...("sharedThreadId" in input ? { sharedThreadId: input.sharedThreadId } : {}),
-              } satisfies ReadFailure;
-            if (
-              input.action === "show" &&
-              (result.value.result.status !== "shown" ||
-                result.value.result.thread_id !== input.sharedThreadId)
-            )
-              throw {
-                detail: "Réponse Bridget incompatible avec ce fil.",
-                sharedThreadId: input.sharedThreadId,
-              } satisfies ReadFailure;
-            return result.value.result;
-          };
-          const list = async () => {
-            if (kind === "detail" || kind === "older")
-              return { threads: current.model.threads, nextAfter: current.model.nextAfter };
-            let after: string | undefined =
-              kind === "list" ? (current.model.nextAfter ?? undefined) : undefined;
-            let nextAfter: string | null = null;
-            const byId = new Map<string, Listed["threads"][number]>(
-              kind === "list"
-                ? current.model.threads.map((thread) => [thread.thread_id, thread])
-                : [],
-            );
-            for (let page = 0; page < (kind === "list" ? 1 : current.listPages); page++) {
-              const result = await read({
-                action: "list_recent",
-                limit: 20,
-                ...(after ? { after } : {}),
-              });
-              if (result.status !== "listed_recent")
-                throw { detail: "Réponse Bridget incompatible." };
-              for (const thread of result.threads) byId.set(thread.thread_id, thread);
-              nextAfter = result.next_after;
-              if (nextAfter === null) break;
-              after = nextAfter;
-            }
-            // O(n log n), n is the loaded list segment, not the whole database.
-            const threads = [...byId.values()].sort(
-              (a, b) =>
-                b.last_activity_at - a.last_activity_at || a.thread_id.localeCompare(b.thread_id),
-            );
-            return { threads, nextAfter };
-          };
-          const detail = async () => {
-            if (kind === "list")
-              return {
-                detail: current.model.detail,
-                history: current.model.history,
-                historySegments: current.model.historySegments,
-              };
-            if (!sharedThreadId) return { detail: null, history: null, historySegments: [] };
-            const previousHistory = current.model.history;
-            if (
-              kind === "older" &&
-              previousHistory?.has_more &&
-              previousHistory.next_before_seq !== null
-            ) {
-              const result = await read({
-                action: "history_recent",
-                sharedThreadId,
-                limit: 50,
-                beforeSeq: previousHistory.next_before_seq,
-                toSeq: previousHistory.snapshot_seq,
-              });
-              if (
-                result.status !== "history_recent" ||
-                result.thread_id !== sharedThreadId ||
-                result.snapshot_seq !== previousHistory.snapshot_seq
-              )
-                throw {
-                  detail: "Réponse Bridget incompatible avec cet instantané.",
-                  sharedThreadId,
-                };
-              const sequences = new Set(previousHistory.entries.map((entry) => entry.seq));
-              return {
-                detail: current.model.detail,
-                history: {
-                  ...result,
-                  entries: [
-                    ...previousHistory.entries,
-                    ...result.entries.filter((entry) => !sequences.has(entry.seq)),
-                  ],
-                },
-                historySegments: [...current.model.historySegments, result.through_seq],
-              };
-            }
-            const [shown, head] = await Promise.all([
-              read({ action: "show", sharedThreadId }),
-              // No old toSeq: acquire the current head before rebuilding old relations.
-              read({ action: "history_recent", sharedThreadId, limit: 50 }),
-            ]);
-            if (
-              shown.status !== "shown" ||
-              shown.thread_id !== sharedThreadId ||
-              head.status !== "history_recent" ||
-              head.thread_id !== sharedThreadId
-            ) {
-              throw { detail: "Réponse Bridget incompatible avec ce fil.", sharedThreadId };
-            }
-            const snapshot = head.snapshot_seq;
-            if (previousHistory && snapshot < previousHistory.snapshot_seq)
-              throw { detail: "Réponse Bridget incompatible avec cet instantané.", sharedThreadId };
-            let tail = head;
-            const entries = new Map(head.entries.map((entry) => [entry.seq, entry]));
-            const segments = current.model.historySegments.length
-              ? [...current.model.historySegments]
-              : [head.through_seq];
-            // Fill only newly arrived messages between the latest page and the
-            // consulted segment. A burst larger than 50 must not leave a hidden gap.
-            while (
-              tail.has_more &&
-              tail.next_before_seq !== null &&
-              tail.next_before_seq > segments[0]!
-            ) {
-              const page = await read({
-                action: "history_recent",
-                sharedThreadId,
-                limit: 50,
-                beforeSeq: tail.next_before_seq,
-                toSeq: snapshot,
-              });
-              if (
-                page.status !== "history_recent" ||
-                page.thread_id !== sharedThreadId ||
-                page.snapshot_seq !== snapshot ||
-                (page.next_before_seq !== null && page.next_before_seq >= tail.next_before_seq)
-              )
-                throw {
-                  detail: "Réponse Bridget incompatible avec cet instantané.",
-                  sharedThreadId,
-                };
-              for (const entry of page.entries) entries.set(entry.seq, entry);
-              tail = page;
-            }
-            // Revalidate only consulted segments at the new common snapshot. This also
-            // updates superseded_by_seq hidden by the old snapshot on older pages.
-            for (let page = 0; page < segments.length; page++) {
-              if (segments[page] === head.through_seq) continue;
-              const result = await read({
-                action: "history_recent",
-                sharedThreadId,
-                limit: 50,
-                beforeSeq: segments[page],
-                toSeq: snapshot,
-              });
-              if (
-                result.status !== "history_recent" ||
-                result.thread_id !== sharedThreadId ||
-                result.snapshot_seq !== snapshot
-              ) {
-                throw {
-                  detail: "Réponse Bridget incompatible avec cet instantané.",
-                  sharedThreadId,
-                };
-              }
-              for (const entry of result.entries) entries.set(entry.seq, entry);
-              tail = result;
-            }
-            while (
-              segments.length < current.historyPages &&
-              tail.has_more &&
-              tail.next_before_seq !== null
-            ) {
-              const result = await read({
-                action: "history_recent",
-                sharedThreadId,
-                limit: 50,
-                beforeSeq: tail.next_before_seq,
-                toSeq: snapshot,
-              });
-              if (
-                result.status !== "history_recent" ||
-                result.thread_id !== sharedThreadId ||
-                result.snapshot_seq !== snapshot
-              )
-                throw {
-                  detail: "Réponse Bridget incompatible avec cet instantané.",
-                  sharedThreadId,
-                };
-              segments.push(result.through_seq);
-              for (const entry of result.entries) entries.set(entry.seq, entry);
-              tail = result;
-            }
-            const previous = new Map(
-              current.model.history?.entries.map((entry) => [entry.seq, entry]),
-            );
-            // O(P + B), P = consulted entries, B = their total body bytes. Preserve immutable bodies and
-            // references of unchanged lines so React leaves their text nodes in place.
-            const stable = [...entries.values()].map((entry) => {
-              const old = previous.get(entry.seq);
-              return old?.message_id === entry.message_id &&
-                JSON.stringify(old) === JSON.stringify(entry)
-                ? old
-                : entry;
-            });
-            return {
-              detail: shown,
-              history: { ...tail, entries: stable },
-              historySegments: segments,
-            };
-          };
-          try {
-            const [listed, selected] = await Promise.all([list(), detail()]);
-            if (
-              !current.active ||
-              controller.signal.aborted ||
-              version !== current.version ||
-              sharedThreadId !== current.selectedId
-            )
-              continue;
-            current.model = {
-              ...listed,
-              ...selected,
-              loadedEntries:
-                sharedThreadId && selected.history
-                  ? { ...current.model.loadedEntries, [sharedThreadId]: selected.history.entries }
-                  : current.model.loadedEntries,
-            };
-            setModel(current.model);
-            setError(null);
-          } catch (failure) {
-            controller.abort();
-            const refused = failure as ReadFailure;
-            const confirmed =
-              refused.code === "thread_unavailable" &&
-              refused.sharedThreadId === current.selectedId;
-            if (!current.active || (version !== current.version && !confirmed)) continue;
-            current.dirty = false;
-            current.version++;
-            const activeElement = typeof document === "undefined" ? null : document.activeElement;
-            const hadFocus =
-              activeElement !== null &&
-              refreshRef.current?.parentElement?.parentElement?.contains(activeElement);
-            current.model = emptyModel();
-            setModel(current.model);
-            setError(refused.detail);
-            if (confirmed) {
-              useRightPanelStore.getState().setBridgetSelection(contextKey, null);
-              current.selectedId = null;
-            }
-            // Business refusal is terminal until the user retries; no retry timer.
-            setWatchEnabled(false);
-            if (hadFocus) refreshRef.current?.focus({ preventScroll: true });
+  const invalidate = useStableCallback((kind: LoadKind = "all") => {
+    const current = visit.current;
+    if (!current.active) return;
+    current.version++;
+    current.kind = current.dirty && current.kind !== kind ? "all" : kind;
+    current.dirty = true;
+    if (current.running) return;
+    const run = async () => {
+      current.running = true;
+      setPending(true);
+      while (current.active && current.dirty) {
+        current.dirty = false;
+        const version = current.version;
+        const kind = current.kind;
+        const sharedThreadId = current.selectedId;
+        const controller = new AbortController();
+        current.controller = controller;
+        const read = async (input: ReadRequest) => {
+          const result = await executeAtomQuery(
+            appAtomRegistry,
+            orchestrationEnvironment.bridgetRead({
+              environmentId: context.environmentId,
+              input: {
+                ...input,
+                threadId: context.threadId,
+                projectId: context.projectId,
+              } as BridgetReadInput,
+            }),
+            {
+              refresh: true,
+              signal: controller.signal,
+              reportFailure: false,
+              reportDefect: false,
+            },
+          );
+          if (controller.signal.aborted || !current.active) throw { detail: "Lecture annulée." };
+          if (result._tag === "Failure") {
+            throw {
+              ...transportFailure(Cause.squash(result.cause)),
+              ...("sharedThreadId" in input ? { sharedThreadId: input.sharedThreadId } : {}),
+            } satisfies ReadFailure;
           }
+          if (result.value.result.status === "error")
+            throw {
+              ...result.value.result,
+              ...("sharedThreadId" in input ? { sharedThreadId: input.sharedThreadId } : {}),
+            } satisfies ReadFailure;
+          if (
+            input.action === "show" &&
+            (result.value.result.status !== "shown" ||
+              result.value.result.thread_id !== input.sharedThreadId)
+          )
+            throw {
+              detail: "Réponse Bridget incompatible avec ce fil.",
+              sharedThreadId: input.sharedThreadId,
+            } satisfies ReadFailure;
+          return result.value.result;
+        };
+        const list = async () => {
+          if (kind === "detail" || kind === "older")
+            return { threads: current.model.threads, nextAfter: current.model.nextAfter };
+          let after: string | undefined =
+            kind === "list" ? (current.model.nextAfter ?? undefined) : undefined;
+          let nextAfter: string | null = null;
+          const byId = new Map<string, Listed["threads"][number]>(
+            kind === "list"
+              ? current.model.threads.map((thread) => [thread.thread_id, thread])
+              : [],
+          );
+          for (let page = 0; page < (kind === "list" ? 1 : current.listPages); page++) {
+            const result = await read({
+              action: "list_recent",
+              limit: 20,
+              ...(after ? { after } : {}),
+            });
+            if (result.status !== "listed_recent")
+              throw { detail: "Réponse Bridget incompatible." };
+            for (const thread of result.threads) byId.set(thread.thread_id, thread);
+            nextAfter = result.next_after;
+            if (nextAfter === null) break;
+            after = nextAfter;
+          }
+          // O(n log n), n is the loaded list segment, not the whole database.
+          const threads = [...byId.values()].sort(
+            (a, b) =>
+              b.last_activity_at - a.last_activity_at || a.thread_id.localeCompare(b.thread_id),
+          );
+          return { threads, nextAfter };
+        };
+        const detail = async () => {
+          if (kind === "list")
+            return {
+              detail: current.model.detail,
+              history: current.model.history,
+              historySegments: current.model.historySegments,
+            };
+          if (!sharedThreadId) return { detail: null, history: null, historySegments: [] };
+          const previousHistory = current.model.history;
+          if (
+            kind === "older" &&
+            previousHistory?.has_more &&
+            previousHistory.next_before_seq !== null
+          ) {
+            const result = await read({
+              action: "history_recent",
+              sharedThreadId,
+              limit: 50,
+              beforeSeq: previousHistory.next_before_seq,
+              toSeq: previousHistory.snapshot_seq,
+            });
+            if (
+              result.status !== "history_recent" ||
+              result.thread_id !== sharedThreadId ||
+              result.snapshot_seq !== previousHistory.snapshot_seq
+            )
+              throw {
+                detail: "Réponse Bridget incompatible avec cet instantané.",
+                sharedThreadId,
+              };
+            const sequences = new Set(previousHistory.entries.map((entry) => entry.seq));
+            return {
+              detail: current.model.detail,
+              history: {
+                ...result,
+                entries: [
+                  ...previousHistory.entries,
+                  ...result.entries.filter((entry) => !sequences.has(entry.seq)),
+                ],
+              },
+              historySegments: [...current.model.historySegments, result.through_seq],
+            };
+          }
+          const [shown, head] = await Promise.all([
+            read({ action: "show", sharedThreadId }),
+            // No old toSeq: acquire the current head before rebuilding old relations.
+            read({ action: "history_recent", sharedThreadId, limit: 50 }),
+          ]);
+          if (
+            shown.status !== "shown" ||
+            shown.thread_id !== sharedThreadId ||
+            head.status !== "history_recent" ||
+            head.thread_id !== sharedThreadId
+          ) {
+            throw { detail: "Réponse Bridget incompatible avec ce fil.", sharedThreadId };
+          }
+          const snapshot = head.snapshot_seq;
+          if (previousHistory && snapshot < previousHistory.snapshot_seq)
+            throw { detail: "Réponse Bridget incompatible avec cet instantané.", sharedThreadId };
+          let tail = head;
+          const entries = new Map(head.entries.map((entry) => [entry.seq, entry]));
+          const segments = current.model.historySegments.length
+            ? [...current.model.historySegments]
+            : [head.through_seq];
+          // Fill only newly arrived messages between the latest page and the
+          // consulted segment. A burst larger than 50 must not leave a hidden gap.
+          while (
+            tail.has_more &&
+            tail.next_before_seq !== null &&
+            tail.next_before_seq > segments[0]!
+          ) {
+            const page = await read({
+              action: "history_recent",
+              sharedThreadId,
+              limit: 50,
+              beforeSeq: tail.next_before_seq,
+              toSeq: snapshot,
+            });
+            if (
+              page.status !== "history_recent" ||
+              page.thread_id !== sharedThreadId ||
+              page.snapshot_seq !== snapshot ||
+              (page.next_before_seq !== null && page.next_before_seq >= tail.next_before_seq)
+            )
+              throw {
+                detail: "Réponse Bridget incompatible avec cet instantané.",
+                sharedThreadId,
+              };
+            for (const entry of page.entries) entries.set(entry.seq, entry);
+            tail = page;
+          }
+          // Revalidate only consulted segments at the new common snapshot. This also
+          // updates superseded_by_seq hidden by the old snapshot on older pages.
+          for (let page = 0; page < segments.length; page++) {
+            if (segments[page] === head.through_seq) continue;
+            const result = await read({
+              action: "history_recent",
+              sharedThreadId,
+              limit: 50,
+              beforeSeq: segments[page],
+              toSeq: snapshot,
+            });
+            if (
+              result.status !== "history_recent" ||
+              result.thread_id !== sharedThreadId ||
+              result.snapshot_seq !== snapshot
+            ) {
+              throw {
+                detail: "Réponse Bridget incompatible avec cet instantané.",
+                sharedThreadId,
+              };
+            }
+            for (const entry of result.entries) entries.set(entry.seq, entry);
+            tail = result;
+          }
+          while (
+            segments.length < current.historyPages &&
+            tail.has_more &&
+            tail.next_before_seq !== null
+          ) {
+            const result = await read({
+              action: "history_recent",
+              sharedThreadId,
+              limit: 50,
+              beforeSeq: tail.next_before_seq,
+              toSeq: snapshot,
+            });
+            if (
+              result.status !== "history_recent" ||
+              result.thread_id !== sharedThreadId ||
+              result.snapshot_seq !== snapshot
+            )
+              throw {
+                detail: "Réponse Bridget incompatible avec cet instantané.",
+                sharedThreadId,
+              };
+            segments.push(result.through_seq);
+            for (const entry of result.entries) entries.set(entry.seq, entry);
+            tail = result;
+          }
+          const previous = new Map(
+            current.model.history?.entries.map((entry) => [entry.seq, entry]),
+          );
+          // O(P + B), P = consulted entries, B = their total body bytes. Preserve immutable bodies and
+          // references of unchanged lines so React leaves their text nodes in place.
+          const stable = [...entries.values()].map((entry) => {
+            const old = previous.get(entry.seq);
+            return old?.message_id === entry.message_id &&
+              JSON.stringify(old) === JSON.stringify(entry)
+              ? old
+              : entry;
+          });
+          return {
+            detail: shown,
+            history: { ...tail, entries: stable },
+            historySegments: segments,
+          };
+        };
+        try {
+          const [listed, selected] = await Promise.all([list(), detail()]);
+          if (
+            !current.active ||
+            controller.signal.aborted ||
+            version !== current.version ||
+            sharedThreadId !== current.selectedId
+          )
+            continue;
+          current.model = {
+            ...listed,
+            ...selected,
+            loadedEntries:
+              sharedThreadId && selected.history
+                ? { ...current.model.loadedEntries, [sharedThreadId]: selected.history.entries }
+                : current.model.loadedEntries,
+          };
+          setModel(current.model);
+          setError(null);
+        } catch (failure) {
+          controller.abort();
+          const refused = failure as ReadFailure;
+          const confirmed =
+            refused.code === "thread_unavailable" && refused.sharedThreadId === current.selectedId;
+          if (!current.active || (version !== current.version && !confirmed)) continue;
+          current.dirty = false;
+          current.version++;
+          const activeElement = typeof document === "undefined" ? null : document.activeElement;
+          const hadFocus =
+            activeElement !== null &&
+            refreshRef.current?.parentElement?.parentElement?.contains(activeElement);
+          current.model = emptyModel();
+          setModel(current.model);
+          setError(refused.detail);
+          if (confirmed) {
+            useRightPanelStore.getState().setBridgetSelection(contextKey, null);
+            current.selectedId = null;
+          }
+          // Business refusal is terminal until the user retries; no retry timer.
+          setWatchEnabled(false);
+          if (hadFocus) refreshRef.current?.focus({ preventScroll: true });
         }
-        current.running = false;
-        if (current.active) setPending(false);
-      };
-      void run();
-    },
-    [context.environmentId, context.projectId, context.threadId, contextKey],
-  );
+      }
+      current.running = false;
+      if (current.active) setPending(false);
+    };
+    void run();
+  });
 
   useEffect(() => {
     const current = visit.current;
@@ -489,7 +487,7 @@ function BridgetSession(context: Context) {
     invalidate("detail");
   }, [selectedId, invalidate]);
 
-  const mask = useCallback((detail: string) => {
+  const mask = useStableCallback((detail: string) => {
     const current = visit.current;
     current.version++;
     current.dirty = false;
@@ -497,14 +495,11 @@ function BridgetSession(context: Context) {
     current.model = emptyModel();
     setModel(current.model);
     setError(detail);
-  }, []);
-  const stopWatch = useCallback(
-    (detail: string) => {
-      mask(detail);
-      setWatchEnabled(false);
-    },
-    [mask],
-  );
+  });
+  const stopWatch = useStableCallback((detail: string) => {
+    mask(detail);
+    setWatchEnabled(false);
+  });
 
   const needle = search.trim().toLocaleLowerCase();
   const visibleThreads = needle
@@ -630,7 +625,7 @@ function BridgetSession(context: Context) {
                     aria-pressed={selectedId === thread.thread_id}
                     aria-current={selectedId === thread.thread_id ? true : undefined}
                     className={cn(
-                      "flex w-full min-w-0 cursor-pointer flex-col gap-1 rounded-md px-2 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                      "flex w-full min-w-0 cursor-pointer flex-col gap-1 rounded-md px-2 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-inset focus-visible:ring-ring",
                       selectedId === thread.thread_id
                         ? "bg-sidebar-row-active text-sidebar-foreground"
                         : "text-sidebar-foreground hover:bg-sidebar-row-hover",
@@ -654,7 +649,7 @@ function BridgetSession(context: Context) {
                   </button>
                   {selectedId === thread.thread_id && selectedDetail ? (
                     <details className="px-2 py-1 text-xs text-muted-foreground">
-                      <summary className="cursor-pointer rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                      <summary className="cursor-pointer rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
                         Détails du fil
                       </summary>
                       <p className="pt-1 break-words">{selectedDetail.title}</p>
@@ -880,10 +875,7 @@ function BridgetMessage({
       setOverflows(overflow);
     };
     measure();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(measure);
-    observer.observe(body);
-    return () => observer.disconnect();
+    return observeResize(body, measure);
   }, [expanded, entry.body]);
   const kind = entry.kind
     ? { history: "Historique", action: "Action", blocker: "Blocage", decision: "Décision" }[

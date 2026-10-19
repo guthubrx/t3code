@@ -1,12 +1,3 @@
-/**
- * Live contract check for `@opencode/client` against a real OpenCode 2 server.
- * It re-proves that OpenCode's schemas decode under the workspace Effect
- * version, which the pnpm overrides force. Run it after bumping either side:
- *
- *   OPENCODE2_BIN=/path/to/opencode vp test run src/provider/opencode2/OpenCode2Client.live.test.ts
- *
- * The turn uses the free `opencode/big-pickle` model.
- */
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { AbsolutePath, Location, Model, Provider } from "@opencode/client/effect";
 import { assert, it } from "@effect/vitest";
@@ -20,8 +11,9 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
-import { FetchHttpClient } from "effect/http";
-import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
+import * as ChildProcess from "effect/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { describe } from "vite-plus/test";
 
 import * as OpenCode2Client from "./OpenCode2Client.ts";
@@ -52,14 +44,11 @@ const startServer = Effect.fn("OpenCode2ClientLive.startServer")(function* (bina
       },
     }),
   );
-  // Stop by the PID captured at spawn, before the temp directory is removed.
   yield* Effect.addFinalizer(() =>
     Effect.sync(() => {
       try {
         process.kill(Number(child.pid), "SIGTERM");
-      } catch {
-        // Already exited.
-      }
+      } catch {}
     }).pipe(Effect.andThen(child.exitCode), Effect.timeout("10 seconds"), Effect.ignore),
   );
   const baseUrl = yield* child.stdout.pipe(
@@ -90,7 +79,7 @@ describe.runIf(binaryPath !== undefined)("OpenCode2Client live", () => {
         });
 
         const info = yield* client.server.info();
-        assert.strictEqual(info.version, "2.0.23");
+        assert.strictEqual(info.version, "2.0.28");
         assert.strictEqual(info.pid, server.pid);
 
         const session = yield* client.session.create({
@@ -123,7 +112,6 @@ describe.runIf(binaryPath !== undefined)("OpenCode2Client live", () => {
         );
         assert.strictEqual(terminal.type, "session.execution.succeeded");
 
-        // One message per page makes every request after the first send only a cursor.
         const history = yield* OpenCode2Client.paginate(
           { sessionID: session.id, order: "asc", limit: 1 },
           client.message.list,

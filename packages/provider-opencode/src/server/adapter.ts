@@ -9,7 +9,7 @@ import type {
   Todo as OpenCodeTodo,
   ToolPart,
 } from "@opencode-ai/sdk/v2";
-import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import {
@@ -48,6 +48,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Random from "effect/Random";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
@@ -55,7 +56,7 @@ import * as Stream from "effect/Stream";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { mcpToolPresentation } from "@t3tools/provider-core/server/mcpToolPresentation";
-import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import {
   structuralProtocolMethod,
@@ -88,20 +89,15 @@ export const OPENCODE_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(OPENCODE_
 export const OPENCODE_SDK_PROTOCOL = "opencode-sdk.sse" as const;
 const DEFAULT_OPENCODE_SETTINGS = Schema.decodeSync(OpenCodeSettings)({});
 
-let openCodeMessageIdEpochMillis = -1;
-let openCodeMessageIdCounter = 0;
-
-const makeOpenCodeMessageId = Effect.fnUntraced(function* () {
+const makeOpenCodeMessageId = Effect.fnUntraced(function* (
+  clock: Ref.Ref<{ readonly epochMillis: number; readonly counter: number }>,
+) {
   const epochMillis = DateTime.toEpochMillis(yield* DateTime.now);
-  if (epochMillis !== openCodeMessageIdEpochMillis) {
-    openCodeMessageIdEpochMillis = epochMillis;
-    openCodeMessageIdCounter = 0;
-  }
-  openCodeMessageIdCounter += 1;
-  const encodedTime = BigInt.asUintN(
-    48,
-    BigInt(epochMillis) * 0x1000n + BigInt(openCodeMessageIdCounter),
-  )
+  const counter = yield* Ref.modify(clock, (previous) => {
+    const next = previous.epochMillis === epochMillis ? previous.counter + 1 : 1;
+    return [next, { epochMillis, counter: next }] as const;
+  });
+  const encodedTime = BigInt.asUintN(48, BigInt(epochMillis) * 0x1000n + BigInt(counter))
     .toString(16)
     .padStart(12, "0");
   const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -229,7 +225,6 @@ interface OpenCodeTurnTokenUsageAccumulator {
   readonly partIds: Set<string>;
   readonly promptMessageIds: Set<string>;
   readonly assistantOwnershipByMessageId: Map<string, "owned" | "other" | "unknown">;
-  // Native removal does not undo usage. Keep unresolved counts until this turn settles.
   readonly unresolvedStepsByMessageId: Map<string, Map<string, OpenCodeStepUsage>>;
   inputTokens: number;
   cachedInputTokens: number;
@@ -279,7 +274,6 @@ interface ActiveOpenCodeTurn {
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
   readonly providerTurnId: OrchestrationV2ProviderTurn["id"];
-  /** The provider thread the turn started on, which its terminal names. */
   readonly providerThreadId: OrchestrationV2ProviderTurn["providerThreadId"];
   readonly providerTurnOrdinal: number;
   readonly runOrdinal: number;
@@ -388,7 +382,6 @@ interface OpenCodeThreadState {
   appThread: OrchestrationV2AppThread | null;
   activeTurn: ActiveOpenCodeTurn | null;
   readonly providerTurns: Map<string, OrchestrationV2ProviderTurn>;
-  readonly messages: Map<string, OrchestrationV2ConversationMessage>;
   readonly runtimeRequests: Map<string, OrchestrationV2RuntimeRequest>;
   readonly messageRoles: Map<string, "user" | "assistant">;
   readonly userMessageIds: Array<string>;
@@ -400,14 +393,9 @@ interface OpenCodeThreadState {
 interface OpenCodeRequestOwner {
   readonly state: OpenCodeThreadState;
   readonly turn: ActiveOpenCodeTurn;
-  /** The subagent on the owner's thread that leads to the asking session. */
   readonly subagent: OpenCodeSubagentContext | null;
 }
 
-/**
- * The top-level thread and active turn that own a session's requests, walking
- * up through (possibly nested) subagents.
- */
 function topLevelRequestOwner(state: OpenCodeThreadState): OpenCodeRequestOwner | undefined {
   let owner = state;
   let subagent: OpenCodeSubagentContext | null = null;
@@ -421,7 +409,6 @@ function topLevelRequestOwner(state: OpenCodeThreadState): OpenCodeRequestOwner 
 interface PendingOpenCodeRequest {
   readonly requestId: RuntimeRequestId;
   readonly nativeRequestId: string;
-  /** The session that asked, which may be a subagent's. */
   readonly nativeSessionId: string;
   readonly turn: ActiveOpenCodeTurn;
   readonly state: OpenCodeThreadState;
@@ -459,7 +446,7 @@ function formatOpenCodeProtocolLogPayload(event: OpenCodeProtocolLogEvent) {
 
 export function makeOpenCodeProtocolLogger(input: {
   readonly nativeEventLogger: ProviderEventLoggers.EventNdjsonLogger | undefined;
-  readonly idAllocator: IdAllocator.IdAllocatorV2Shape;
+  readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];
   readonly providerInstanceId: ProviderInstanceId;
   readonly providerSessionId: ProviderSessionId;
   readonly threadId: ThreadId;
@@ -614,10 +601,7 @@ const OPENCODE_RESTRICTED_PERMISSIONS = [
 
 /**
  * OpenCode does not provide an OS sandbox, so permission rules are also the
- * enforcement boundary for non-interactive policies. Read/planning tools are
- * safe by default; edits are auto-approved only for workspace-write modes,
- * while shell/network/external access remains gated unless policy explicitly
- * allows it.
+ * enforcement boundary for non-interactive policies.
  */
 export function openCodePermissionRules(
   runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
@@ -830,7 +814,7 @@ function taskSessionId(part: ToolPart): string | null {
 }
 
 function makeProviderThread(input: {
-  readonly idAllocator: IdAllocator.IdAllocatorV2Shape;
+  readonly idAllocator: IdAllocator.IdAllocatorV2["Service"];
   readonly providerInstanceId: ProviderInstanceId;
   readonly providerSessionId: OrchestrationV2ProviderThread["providerSessionId"];
   readonly appThreadId: OrchestrationV2ProviderThread["appThreadId"];
@@ -947,6 +931,8 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
   const runtime = yield* OpenCodeRuntime.OpenCodeRuntime;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const host = yield* ProviderHost.ProviderHost;
+  const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+  const messageIdClock = yield* Ref.make({ epochMillis: -1, counter: 0 });
 
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: options.instanceId,
@@ -971,7 +957,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             : {}),
         });
 
-        const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const mcpSession = yield* mcpSessions.read(input.threadId);
         const hasT3Mcp = mcpSession !== undefined && !connection.external;
         if (hasT3Mcp) {
           yield* OpenCodeRuntime.runOpenCodeSdk("mcp.add", () =>
@@ -1009,10 +995,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
         const pendingRequestsByNativeId = new Map<string, PendingOpenCodeRequest>();
         const subagentsByNativeItemId = new Map<string, OpenCodeSubagentContext>();
         const subagentsByChildSessionId = new Map<string, OpenCodeSubagentContext>();
-        // Permission and question requests can originate from child sessions
-        // (task subagents and their descendants). Related sessions map back
-        // to the root thread state whose active turn owns the request; asks
-        // arriving before the relation is known resolve it via session.get.
         const relatedSessionOwners = new Map<string, OpenCodeThreadState>();
         // Sessions of this runtime that OpenCode reports busy. A background
         // task child keeps running after its parent turn settles, so idle
@@ -1258,7 +1240,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               createdAt: startedAt,
               updatedAt: emittedAt,
             };
-            state.messages.set(String(message.id), message);
             yield* emitProviderEvent({
               type: "message.updated",
               driver: OPENCODE_PROVIDER,
@@ -1429,7 +1410,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               appThread: childThread,
               activeTurn: null,
               providerTurns: new Map(),
-              messages: new Map(),
               runtimeRequests: new Map(),
               messageRoles: new Map(),
               userMessageIds: [],
@@ -1547,8 +1527,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             yield* emitSubagent(state, turn, part);
             return;
           }
-          // question.asked carries the respondable semantic item. Projecting
-          // the implementation tool as well would duplicate it in the UI.
           if (normalizedTool === "question") return;
           const now = yield* DateTime.now;
           const status = toolStatus(part);
@@ -1763,6 +1741,8 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             id: OpenCodeRuntime.openCodeQuestionId(index, question),
             header: question.header.trim() || `Question ${index + 1}`,
             question: question.question.trim() || question.header.trim() || `Question ${index + 1}`,
+            ...(question.multiple === undefined ? {} : { multiSelect: question.multiple }),
+            ...(question.custom === undefined ? {} : { allowCustomAnswer: question.custom }),
             options: question.options.map((option) => ({
               label: option.label.trim() || "Option",
               description: option.description.trim() || option.label.trim() || "Option",
@@ -1833,7 +1813,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           });
           const nodeId = idAllocator.derive.approvalNode({ requestId });
           const turnItemId = idAllocator.derive.approvalTurnItem({ requestId });
-          // The tool call belongs to the asking session's turn, not the owner's.
           const permissionToolName =
             request.type === "permission" && request.value.tool !== undefined
               ? threads
@@ -1974,10 +1953,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           if (!hasOtherPending) yield* updateProviderSession("running", null);
         });
 
-        /** Resolve the thread state a session belongs to: its own, or for a
-         *  child not registered yet, the nearest known ancestor found by walking
-         *  the native parent chain. Registers every hop so later requests from
-         *  the same child resolve without another lookup. */
         const resolveSessionOwner = Effect.fnUntraced(function* (sessionId: string) {
           const known = threads.get(sessionId) ?? relatedSessionOwners.get(sessionId);
           if (known !== undefined) return known;
@@ -2001,14 +1976,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           return undefined;
         });
 
-        /** Every request is asked on the top-level thread and its active turn,
-         *  under the subagent that leads to the asking session, because native
-         *  subagent threads are hidden from the sidebar. A child's request can
-         *  arrive before the task part or session.created event that reveals
-         *  its relation to a thread. The first resolution attempt runs inline
-         *  (the replayable path); if the relation or the owning turn is not
-         *  established yet, a short forked backoff keeps trying instead of
-         *  dropping the request. */
         const routeRuntimeRequest = Effect.fnUntraced(function* (
           nativeRequestId: string,
           sessionId: string,
@@ -2337,7 +2304,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             createdAt: turn.startedAt,
             updatedAt: now,
           };
-          state.messages.set(String(messageId), projected);
           yield* emitProviderEvent({
             type: "message.updated",
             driver: OPENCODE_PROVIDER,
@@ -2488,7 +2454,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             return;
           }
           if (part.type === "tool") {
-            // Approval routing needs the tool name, without retaining its input and output.
             turn.toolNamesByCallId.set(part.callID, part.tool);
           } else {
             turn.parts.set(part.id, part);
@@ -2737,7 +2702,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           Effect.exit,
           Effect.flatMap((exit) =>
             Effect.gen(function* () {
-              // No further status can clear a busy session once the stream ends.
               busySessionIds.clear();
               if (closing || abortController.signal.aborted) return;
               const detail = Exit.isSuccess(exit)
@@ -2835,7 +2799,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             appThread,
             activeTurn: null,
             providerTurns: new Map(),
-            messages: new Map(),
             runtimeRequests: new Map(),
             messageRoles: new Map(),
             userMessageIds: [],
@@ -3036,8 +2999,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           hasPendingBackgroundWork: Effect.sync(() => busySessionIds.size > 0),
           ensureThread: (threadInput) =>
             Effect.gen(function* () {
-              // Only a row that already carries a native session can be
-              // resumed; a placeholder without one still needs session.create.
               if (threadInput.existingProviderThread?.nativeThreadRef != null) {
                 return yield* runtimeSession.resumeThread({
                   providerThread: threadInput.existingProviderThread,
@@ -3064,9 +3025,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 now: createdAt,
               });
               const existing = threadInput.existingProviderThread;
-              // Bind the new native session to the caller's row when one was
-              // handed over: a second live row per app thread would make
-              // `activeProviderThreadId` flap between the two on every update.
               const providerThread =
                 existing === undefined
                   ? created
@@ -3168,7 +3126,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 startedAt,
                 completedAt: null,
               };
-              const admissionMessageId = yield* makeOpenCodeMessageId();
+              const admissionMessageId = yield* makeOpenCodeMessageId(messageIdClock);
               // No Effect may be yielded between this check and installing the
               // turn. If the event stream ended while IDs were being prepared,
               // registering afterward would leave a running turn that the EOF
@@ -3370,7 +3328,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 ...files,
               ];
               turn.admissionGeneration = state.nextAdmissionGeneration++;
-              turn.admissionMessageId = yield* makeOpenCodeMessageId();
+              turn.admissionMessageId = yield* makeOpenCodeMessageId(messageIdClock);
               turn.admissionPending = true;
               turn.admissionAccepted = false;
               turn.admissionMessageObserved = false;
@@ -3425,8 +3383,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               const sessionId = nativeThreadId(interruptInput.providerThread);
               const state = threads.get(sessionId);
               const turn = state?.activeTurn;
-              // Stop on a settled turn: a background task child can outlive
-              // it (busySessionIds), and aborting the descendants ends it.
               if (
                 (turn === undefined || turn === null) &&
                 interruptInput.requestRuntimeRestart === true
@@ -3451,7 +3407,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               cancelOpenCodePromptAdmission(turn, state!.nextAdmissionGeneration++);
               turn.admissionAbortController?.abort();
               if (admissionWasPending) {
-                // Settle the cancelled request before sending the session abort.
                 // A timed-out local request must not prevent the definitive
                 // server-side abort below from running.
                 yield* Deferred.await(turn.admissionSettled).pipe(
@@ -3463,10 +3418,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 client.session.abort({ sessionID: sessionId }, { signal }),
               ).pipe(
                 Effect.timeout("10 seconds"),
-                // The turn can settle while the abort is in flight, and
-                // aborting an already-idle session fails. That stop still
-                // succeeded; only surface failures for a turn that is
-                // genuinely still running.
                 Effect.catch((cause) =>
                   turn.finalized
                     ? Effect.void
@@ -3730,6 +3681,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
 export type OpenCodeAdapterV2DriverEnv =
   | OpenCodeRuntime.OpenCodeRuntime
   | IdAllocator.IdAllocatorV2
+  | McpProviderSessions.McpProviderSessions
   | ProviderEventLoggers.ProviderEventLoggers
   | ProviderHost.ProviderHost;
 
@@ -3742,12 +3694,12 @@ export const OpenCodeAdapterV2Driver: ProviderAdapterDriver<
   defaultConfig: (): OpenCodeSettings => DEFAULT_OPENCODE_SETTINGS,
   create: Effect.fn("OpenCodeAdapterV2Driver.create")(
     function* (input: ProviderAdapterDriverCreateInput<OpenCodeSettings>) {
-      const hostEnvironment = yield* HostProcessEnvironment;
+      const hostEnvironment = yield* HostProcess.Environment;
       const providerEventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
       return yield* makeOpenCodeAdapterV2({
         instanceId: input.instanceId,
         settings: { ...input.config, enabled: input.enabled },
-        environment: mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
+        environment: yield* mergeProviderInstanceEnvironment(input.environment, hostEnvironment),
         ...(providerEventLoggers.native === undefined
           ? {}
           : { nativeEventLogger: providerEventLoggers.native }),
@@ -3772,7 +3724,7 @@ const layer: Layer.Layer<ProviderAdapter.ProviderAdapterV2, never, OpenCodeAdapt
   Layer.effect(
     ProviderAdapter.ProviderAdapterV2,
     Effect.gen(function* () {
-      const hostEnvironment = yield* HostProcessEnvironment;
+      const hostEnvironment = yield* HostProcess.Environment;
       const providerEventLoggers = yield* ProviderEventLoggers.ProviderEventLoggers;
       return yield* makeOpenCodeAdapterV2({
         instanceId: OPENCODE_DEFAULT_INSTANCE_ID,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
@@ -56,6 +56,7 @@ const diagnose = (input: {
   output: string;
   ldd: string;
   version?: string;
+  uid?: number;
 }) => {
   const { spawner, commands } = hostReporting({
     ldd: input.ldd,
@@ -67,7 +68,8 @@ const diagnose = (input: {
     setupCommand: "sudo t3 browser setup",
   }).pipe(
     Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-    Effect.provideService(HostProcessPlatform, input.platform),
+    Effect.provideService(HostProcess.Platform, input.platform),
+    Effect.provideService(HostProcess.UserId, input.uid ?? 1000),
     Effect.map((error) => ({ error, commands })),
   );
 };
@@ -82,6 +84,22 @@ describe("diagnoseLaunchFailure", () => {
       });
       expect(error?._tag).toBe("PreviewBrowserSandboxError");
       expect(error?.message).toContain("Run `sudo t3 browser setup` on the host");
+      expect(commands).toEqual([]);
+    }),
+  );
+
+  it.effect("tells a root server to drop root, not to run setup", () =>
+    Effect.gen(function* () {
+      const { error, commands } = yield* diagnose({
+        platform: "linux",
+        output: PreviewBrowserHost.NO_SANDBOX_SIGNATURE,
+        ldd: "",
+        uid: 0,
+      });
+      expect(error?._tag).toBe("PreviewBrowserRootError");
+      expect(error?.message).toContain("`User=`");
+      expect(error?.message).toContain("`T3CODE_SERVER_BROWSER_SANDBOX=0`");
+      expect(error?.message).not.toMatch(/AppArmor|browser setup/);
       expect(commands).toEqual([]);
     }),
   );

@@ -84,20 +84,13 @@ vi.mock("react-native", () => ({
 vi.mock("@react-navigation/native", () => ({
   useIsFocused: () => true,
 }));
-vi.mock("react-native-nitro-markdown", () => ({
-  Markdown: ({ children }: { children: unknown }) => children,
-}));
 vi.mock("../../native/SelectableMarkdownText", () => ({
-  hasNativeSelectableMarkdownText: () => true,
   SelectableMarkdownText: (props: { markdown: string }) => {
     nativeMarkdown.props.push(props);
     return props.markdown;
   },
 }));
 vi.mock("../../lib/copyTextWithHaptic", () => ({ copyTextWithHaptic: vi.fn() }));
-vi.mock("../../lib/useFontFamily", () => ({
-  useFontFamily: (weight: string) => `DMSans-${weight}`,
-}));
 vi.mock("../../lib/useUniwindTheme", () => ({
   useUniwindTheme: () => ({
     "--color-md-body": "#102030",
@@ -434,9 +427,9 @@ describe("BridgetTaskJournal (mobile, session 149)", () => {
     expect(props.markdown).toBe(markdown);
     expect(props.textStyle).toMatchObject({
       color: "#102030",
-      fontFamily: "DMSans-regular",
-      headingFontFamily: "DMSans-bold",
-      boldFontFamily: "DMSans-bold",
+      fontFamily: "DMSans-Regular",
+      headingFontFamily: "DMSans-Bold",
+      boldFontFamily: "DMSans-Bold",
       fontSize: 18,
     });
     expect(props.textStyle.lineHeight).toBeGreaterThan(props.textStyle.fontSize);

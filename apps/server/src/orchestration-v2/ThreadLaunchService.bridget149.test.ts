@@ -34,7 +34,8 @@ import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
-import type { ProviderAdapterV2Shape } from "@t3tools/provider-core/server/ProviderAdapter";
+import type { ProviderAdapterV2 } from "@t3tools/provider-core/server/ProviderAdapter";
+type ProviderAdapterV2Shape = ProviderAdapterV2["Service"];
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import type { BridgetLineageSnapshot, BridgetLineageTask } from "@t3tools/contracts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -86,8 +87,16 @@ function makeHarness() {
     { databaseLayer: layerDatabase, runEffectWorker: false },
   );
   const layerProjection = ProjectionStore.layer.pipe(Layer.provide(layerDatabase));
-  const layerThreadManagement = ThreadManagement.layer.pipe(Layer.provide(layerOrchestrator));
   const layerReceipts = CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
+  const layerThreadManagement = ThreadManagement.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        layerOrchestrator,
+        layerReceipts,
+        ServerSettings.layerTest().pipe(Layer.orDie),
+      ),
+    ),
+  );
   const layerOutbox = EffectOutbox.layer.pipe(Layer.provide(layerDatabase));
   const createWorktree = vi.fn(((input) =>
     Effect.succeed({
@@ -340,6 +349,7 @@ describe("ThreadLaunchService.bridget149 read-only guard", () => {
         .launch(launchInput({ command: "bridget-149-launch-virtual", thread: childId }))
         .pipe(Effect.flip);
       expect(failure._tag).toBe("ThreadLaunchError");
+      if (failure._tag !== "ThreadLaunchError") throw new Error("Expected launch refusal");
       expect(failure.operation).toBe("update-thread");
       expect(failure.threadId).toBe(childId);
       expect(failure.cause).toBe("Native Bridget tasks are read-only.");

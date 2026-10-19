@@ -1,10 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
-import {
-  HostProcessEnvironment,
-  HostProcessExecutablePath,
-  HostProcessPlatform,
-} from "@t3tools/shared/hostProcess";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -12,7 +8,9 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Redacted from "effect/Redacted";
 import * as TestClock from "effect/testing/TestClock";
-import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
+import * as HttpClient from "effect/http/HttpClient";
+import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import { describe } from "vite-plus/test";
 
 import * as OpenCodeRuntime from "../OpenCodeRuntime.ts";
@@ -96,7 +94,6 @@ describe("OpenCode2Server.verifyServer", () => {
     }),
   );
 
-  // 1.x (and the 2.x web UI on unknown paths) answers /api/info with 200 HTML.
   it.effect("rejects a server that answers with the web UI's HTML", () =>
     Effect.gen(function* () {
       const error = yield* verify(
@@ -115,8 +112,6 @@ describe("OpenCode2Server.verifyServer", () => {
 });
 
 describe("OpenCode2Server error details", () => {
-  // `detail` reaches clients through the provider status message, and a
-  // `serverUrl` can carry credentials in its userinfo or query.
   const serverUrl = "http://user:url-secret@127.0.0.1:1/?token=query-secret";
   const detailFor = (httpClient: Layer.Layer<HttpClient.HttpClient>) =>
     Effect.gen(function* () {
@@ -192,9 +187,6 @@ describe("OpenCode2Server passwords", () => {
   });
 });
 
-// Serves /api/info only with the password from OPENCODE_PASSWORD, like 2.x, and
-// prints the 2.x banner (plus the generated-password line 2.x prints when no
-// password is set, which T3 must never need).
 const FAKE_SERVER = `import { createServer } from "node:http";
 const expected = "Basic " + Buffer.from("opencode:" + process.env.OPENCODE_PASSWORD).toString("base64");
 const server = createServer((request, response) => {
@@ -219,7 +211,7 @@ describe("OpenCode2Server spawned server", () => {
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
-        const platform = yield* HostProcessPlatform;
+        const platform = yield* HostProcess.Platform;
         const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-opencode2-fake-" });
         const isWindows = platform === "win32";
         const binaryPath = path.join(directory, isWindows ? "opencode.cmd" : "opencode");
@@ -228,8 +220,8 @@ describe("OpenCode2Server spawned server", () => {
         yield* fs.writeFileString(
           binaryPath,
           isWindows
-            ? `@echo off\r\n"${yield* HostProcessExecutablePath}" "${scriptPath}" %*\r\n`
-            : `#!/bin/sh\nexec "${yield* HostProcessExecutablePath}" "${scriptPath}" "$@"\n`,
+            ? `@echo off\r\n"${yield* HostProcess.ExecutablePath}" "${scriptPath}" %*\r\n`
+            : `#!/bin/sh\nexec "${yield* HostProcess.ExecutablePath}" "${scriptPath}" "$@"\n`,
         );
         if (!isWindows) yield* fs.chmod(binaryPath, 0o755);
 
@@ -238,7 +230,7 @@ describe("OpenCode2Server spawned server", () => {
           serverUrl: "",
           serverPassword: "",
           directory,
-          environment: { ...(yield* HostProcessEnvironment), OPENCODE_SERVER_PASSWORD: "ambient" },
+          environment: { ...(yield* HostProcess.Environment), OPENCODE_SERVER_PASSWORD: "ambient" },
         });
         const first = yield* server.withConnection((connection) => Effect.succeed(connection));
         const second = yield* server.withConnection((connection) => Effect.succeed(connection));

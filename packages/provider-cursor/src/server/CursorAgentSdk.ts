@@ -12,11 +12,13 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
-import { Agent, createAgentPlatform } from "./sdk.ts";
+import * as CursorSdk from "./CursorSdk.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 
 export const CURSOR_AGENT_SDK_PROTOCOL = "cursor-agent-sdk.local" as const;
@@ -34,7 +36,34 @@ export class CursorAgentSdkRunnerError extends Schema.TaggedError<CursorAgentSdk
   }
 }
 
-const isCursorAgentSdkRunnerError = Schema.is(CursorAgentSdkRunnerError);
+/** The failure text a user sees: the SDK's own reason, which the error's message leaves out. */
+export function cursorSdkFailureMessage(error: CursorAgentSdkRunnerError): string {
+  const reason = sdkErrorReason(error.cause);
+  return reason === undefined
+    ? error.message
+    : `Cursor Agent SDK ${error.method} failed: ${reason}`;
+}
+
+/** Codes Cursor sends when it has no specific one. */
+const GENERIC_SDK_ERROR_CODES = new Set(["", "error", "unknown"]);
+
+/** The SDK's own message, with the code and HTTP status its errors carry. */
+function sdkErrorReason(cause: unknown): string | undefined {
+  if (!(cause instanceof Error)) return undefined;
+  const message = cause.message.trim();
+  if (message.length === 0) return undefined;
+  const code = Reflect.get(cause, "code");
+  const status = Reflect.get(cause, "status");
+  const details = [
+    ...(typeof code === "string" && !GENERIC_SDK_ERROR_CODES.has(code) && !message.includes(code)
+      ? [code]
+      : []),
+    ...(typeof status === "number" ? [`HTTP ${status}`] : []),
+  ];
+  return details.length === 0 ? message : `${message} (${details.join(", ")})`;
+}
+
+export const isCursorAgentSdkRunnerError = Schema.is(CursorAgentSdkRunnerError);
 
 export interface CursorAgentSdkOpenInput {
   readonly operation: "create" | "resume";
@@ -66,16 +95,14 @@ export interface CursorAgentSdkSession {
   readonly close: Effect.Effect<void, CursorAgentSdkRunnerError>;
 }
 
-export interface CursorAgentSdkRunnerShape {
-  readonly open: (
-    input: CursorAgentSdkOpenInput,
-  ) => Effect.Effect<CursorAgentSdkSession, CursorAgentSdkRunnerError>;
-  readonly assertComplete: Effect.Effect<void, CursorAgentSdkRunnerError>;
-}
-
 export class CursorAgentSdkRunner extends Context.Service<
   CursorAgentSdkRunner,
-  CursorAgentSdkRunnerShape
+  {
+    readonly open: (
+      input: CursorAgentSdkOpenInput,
+    ) => Effect.Effect<CursorAgentSdkSession, CursorAgentSdkRunnerError>;
+    readonly assertComplete: Effect.Effect<void, CursorAgentSdkRunnerError>;
+  }
 >()("@t3tools/provider-cursor/server/CursorAgentSdk/CursorAgentSdkRunner") {}
 
 export interface CursorAgentSdkLoggedAgentOptions {
@@ -298,49 +325,45 @@ function makeCursorAgentSdkProtocolLogger(input: {
       .pipe(Effect.ignore);
 }
 
-/**
- * The Cursor SDK decides once per process whether local sandboxing works, and
- * caches the answer the first time any run starts. Only sandboxed runs point
- * it at its `cursorsandbox` helper first, so after an unsandboxed (Full access)
- * run it caches "unsupported" and rejects every later sandboxed run until the
- * server restarts. Warming a bare sandboxed executor before the first
- * unsandboxed agent opens lets the SDK find the helper and cache the real
- * answer. Warming is best effort: on a machine without sandbox support it
- * fails, the SDK caches "unsupported", and sandboxed runs report that as
- * before.
- */
-let cursorSandboxSupportPrime: Promise<void> | undefined;
-
-function primeCursorSandboxSupport(options: AgentOptions): Promise<void> {
-  cursorSandboxSupportPrime ??= (async () => {
-    const cwd = typeof options.local?.cwd === "string" ? options.local.cwd : undefined;
-    const platform = await createAgentPlatform(cwd === undefined ? {} : { workspaceRef: cwd });
-    const release = await platform.prewarmLocalWorkspace({
-      ...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
-      local: {
-        ...(cwd === undefined ? {} : { cwd }),
-        settingSources: [],
-        sandboxOptions: { enabled: true },
-      },
-    });
-    await release();
-  })().catch(() => undefined);
-  return cursorSandboxSupportPrime;
-}
-
-/**
- * Runs agents through the Cursor SDK, logging every frame to the protocol
- * logger chosen for each opened agent. The live layer writes the native
- * provider event log; the replay recorder turns the same frames into a
- * transcript.
- */
-export function makeCursorAgentSdkRunner(
+export const makeCursorAgentSdkRunner = Effect.fn("makeCursorAgentSdkRunner")(function* (
   protocolLoggerFor: (input: CursorAgentSdkOpenInput) => CursorAgentSdkProtocolLogger | undefined,
-): CursorAgentSdkRunnerShape {
+) {
+  const { Agent, createAgentPlatform } = yield* CursorSdk.CursorSdk;
+
+  /**
+   * The Cursor SDK decides once per process whether local sandboxing works, and
+   * caches the answer the first time any run starts. Only sandboxed runs point it
+   * at its `cursorsandbox` helper first, so after an unsandboxed (Full access)
+   * run it caches "unsupported" and rejects every later sandboxed run until the
+   * server restarts.
+   */
+  const sandboxSupportPrimeStarted = yield* Ref.make(false);
+  const sandboxSupportPrimed = yield* Deferred.make<void>();
+  const primeCursorSandboxSupport = Effect.fn("CursorAgentSdkRunner.primeSandboxSupport")(
+    function* (options: AgentOptions) {
+      if (yield* Ref.getAndSet(sandboxSupportPrimeStarted, true)) {
+        return yield* Deferred.await(sandboxSupportPrimed);
+      }
+      yield* Effect.tryPromise(async () => {
+        const cwd = typeof options.local?.cwd === "string" ? options.local.cwd : undefined;
+        const platform = await createAgentPlatform(cwd === undefined ? {} : { workspaceRef: cwd });
+        const release = await platform.prewarmLocalWorkspace({
+          ...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
+          local: {
+            ...(cwd === undefined ? {} : { cwd }),
+            settingSources: [],
+            sandboxOptions: { enabled: true },
+          },
+        });
+        await release();
+      }).pipe(Effect.ignore, Effect.ensuring(Deferred.succeed(sandboxSupportPrimed, undefined)));
+    },
+  );
+
   return CursorAgentSdkRunner.of({
     open: Effect.fn("CursorAgentSdkRunner.open")(function* (input) {
       if (input.options.local?.sandboxOptions?.enabled === false) {
-        yield* Effect.promise(() => primeCursorSandboxSupport(input.options));
+        yield* primeCursorSandboxSupport(input.options);
       }
       const protocolLogger = protocolLoggerFor(input);
       const log = (event: CursorAgentSdkProtocolLogEvent) =>
@@ -590,17 +613,13 @@ export function makeCursorAgentSdkRunner(
     }),
     assertComplete: Effect.void,
   });
-}
+});
 
-export const layer: Layer.Layer<
-  CursorAgentSdkRunner,
-  never,
-  ProviderEventLoggers.ProviderEventLoggers
-> = Layer.effect(
+export const layer = Layer.effect(
   CursorAgentSdkRunner,
   Effect.gen(function* () {
     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
-    return makeCursorAgentSdkRunner((input) =>
+    return yield* makeCursorAgentSdkRunner((input) =>
       makeCursorAgentSdkProtocolLogger({
         nativeEventLogger,
         threadId: input.threadId,

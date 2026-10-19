@@ -6,6 +6,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSetupError,
+  type ServerProviderUsageLimits,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -128,7 +129,11 @@ const layerTest = ProviderHostLive.layer.pipe(
 type ProbeError = EffectAcpErrors.AcpError | ProviderSetupError;
 
 const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
-  options: { readonly enabled?: boolean; readonly safe?: boolean } = {},
+  options: {
+    readonly enabled?: boolean;
+    readonly safe?: boolean;
+    readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
+  } = {},
 ) {
   const initialProbe = yield* Deferred.make<EffectAcpSchema.InitializeResponse, ProbeError>();
   const probeCalls = yield* Ref.make(0);
@@ -141,6 +146,7 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
     decodeSettings({ enabled: options.enabled ?? true, customModels: ["do-not-seed-me"] }),
     {
       stampIdentity: (snapshot) => Effect.succeed({ ...snapshot, instanceId, driver }),
+      ...(options.probeUsage ? { probeUsage: options.probeUsage } : {}),
       probe: Ref.update(probeCalls, (count) => count + 1).pipe(
         Effect.andThen(Ref.get(probe)),
         Effect.flatten,
@@ -251,31 +257,23 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
     ),
   );
 
-  it.effect("records explicit sign-in while disabled without starting a health probe", () =>
+  it.effect("ignores account updates while disabled", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const harness = yield* makeHarness({ enabled: false });
-        const signedIn = yield* Stream.toPull(
-          harness.provider.snapshot.streamChanges.pipe(
-            Stream.filter(
-              (snapshot) =>
-                snapshot.auth.status === "authenticated" && snapshot.slashCommands.length > 0,
-            ),
-          ),
-        );
         yield* harness.provider.onSessionStarted(started);
         yield* harness.provider.onAvailableCommands(commands);
-        const [snapshot] = yield* signedIn;
+        yield* harness.provider.onSignedOut;
+        const snapshot = yield* harness.provider.snapshot.refresh;
         expect(snapshot).toMatchObject({
           enabled: false,
-          installed: true,
+          installed: false,
           status: "disabled",
-          auth: { status: "authenticated", type: "oauth-personal" },
+          auth: { status: "unknown" },
+          models: [],
+          slashCommands: [],
           workspaceSnapshots: [],
         });
-        expect(snapshot.models).toEqual(buildAntigravityModelsFromSession(sessionSetupResult));
-        expect(snapshot.slashCommands).toEqual(expectedCommands);
-        expect((yield* harness.provider.snapshot.refresh).models).toEqual(snapshot.models);
         expect(yield* Ref.get(harness.probeCalls)).toBe(0);
       }),
     ),
@@ -428,6 +426,68 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         });
         yield* harness.provider.onConfigOptionsUpdated([]);
         expect((yield* harness.provider.snapshot.getSnapshot).models).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("does not guess a version before a custom launcher's first handshake", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* Deferred.succeed(harness.initialProbe, {
+          ...initializeResult,
+          agentInfo: { ...initializeResult.agentInfo, version: "unknown" },
+        });
+        yield* harness.initialUpdate;
+        expect((yield* harness.provider.snapshot.getSnapshot).version).toBeNull();
+      }),
+    ),
+  );
+
+  it.effect("accepts a known version from a later installation probe", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* harness.initialize;
+        yield* harness.provider.onSessionStarted({
+          ...started,
+          initializeResult: {
+            ...initializeResult,
+            agentInfo: { ...initializeResult.agentInfo, version: "1.3.0" },
+          },
+        });
+        yield* Ref.set(
+          harness.probe,
+          Effect.succeed({
+            ...initializeResult,
+            agentInfo: { ...initializeResult.agentInfo, version: "1.4.0" },
+          }),
+        );
+        expect((yield* harness.provider.snapshot.refresh).version).toBe("1.4.0");
+      }),
+    ),
+  );
+
+  it.effect("does not replace a handshake version with an unknown custom-launcher probe", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* harness.initialize;
+        yield* harness.provider.onSessionStarted({
+          ...started,
+          initializeResult: {
+            ...initializeResult,
+            agentInfo: { ...initializeResult.agentInfo, version: "1.4.0" },
+          },
+        });
+        yield* Ref.set(
+          harness.probe,
+          Effect.succeed({
+            ...initializeResult,
+            agentInfo: { ...initializeResult.agentInfo, version: "unknown" },
+          }),
+        );
+        expect((yield* harness.provider.snapshot.refresh).version).toBe("1.4.0");
       }),
     ),
   );
@@ -667,6 +727,75 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         expect(snapshot.workspaceSnapshots?.[0]?.cwd).toBe("/workspace-3");
         expect(snapshot.slashCommands).toEqual(expectedCommands);
         expect(yield* Ref.get(harness.probeCalls)).toBe(1);
+      }),
+    ),
+  );
+
+  it.effect(
+    "publishes limits, retains a successful read on failure, and clears them on sign-out",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const limits: ServerProviderUsageLimits = {
+            checkedAt: "2026-10-09T12:00:00.000Z",
+            windows: [
+              {
+                id: "3p-weekly",
+                kind: "weekly",
+                label: "Claude & GPT (shared) · Weekly",
+                usedPercent: 75,
+              },
+            ],
+          };
+          const usage = yield* Ref.make(limits);
+          const harness = yield* makeHarness({ probeUsage: Ref.get(usage) });
+          yield* harness.initialize;
+          expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toEqual(limits);
+          yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+          yield* Ref.set(usage, {
+            checkedAt: "2026-10-09T12:01:00.000Z",
+            windows: [],
+            unavailable: { reason: "probeFailed" },
+          });
+          expect((yield* harness.provider.snapshot.refresh).usageLimits).toEqual(limits);
+          yield* harness.provider.onSignedOut;
+          expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toBeUndefined();
+          yield* Ref.set(usage, {
+            checkedAt: "2026-10-09T12:02:00.000Z",
+            windows: [],
+            unavailable: { reason: "unsupported" },
+          });
+          expect((yield* harness.provider.snapshot.refresh).usageLimits?.windows).toEqual([]);
+        }),
+      ),
+  );
+
+  it.effect("a quota read finishing after sign-out cannot restore account limits", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const readStarted = yield* Deferred.make<void>();
+        const readResult = yield* Deferred.make<ServerProviderUsageLimits>();
+        const usage = yield* Ref.make<Effect.Effect<ServerProviderUsageLimits>>(
+          Effect.succeed({ checkedAt: "2026-10-09T12:00:00.000Z", windows: [] }),
+        );
+        const harness = yield* makeHarness({ probeUsage: Ref.get(usage).pipe(Effect.flatten) });
+        yield* harness.initialize;
+        yield* Ref.set(harness.probe, Effect.succeed(initializeResult));
+        yield* Ref.set(
+          usage,
+          Deferred.succeed(readStarted, undefined).pipe(Effect.andThen(Deferred.await(readResult))),
+        );
+        const refresh = yield* harness.provider.snapshot.refresh.pipe(Effect.forkChild);
+        yield* Deferred.await(readStarted);
+        yield* harness.provider.onSignedOut;
+        yield* Deferred.succeed(readResult, {
+          checkedAt: "2026-10-09T12:01:00.000Z",
+          windows: [
+            { id: "gemini-5h", kind: "session", label: "Gemini · 5-hour", usedPercent: 10 },
+          ],
+        });
+        yield* Fiber.join(refresh);
+        expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toBeUndefined();
       }),
     ),
   );

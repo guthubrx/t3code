@@ -1,3 +1,8 @@
+// Native bridge interop: real Node APIs form the boundary under test.
+// @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics globalTimers:off
+// @effect-diagnostics globalDate:off
+// @effect-diagnostics globalFetchInEffect:off
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";

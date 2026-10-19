@@ -3,24 +3,20 @@ import { ExternalLinkIcon } from "lucide-react";
 import { useState } from "react";
 
 import { useEnvironmentSettings } from "../../hooks/useSettings";
+import { readGitHubSettings } from "@t3tools/client-runtime/source-control-clients";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button, InlineButton } from "../ui/button";
 import { Input } from "../ui/input";
+import { SecretInput } from "./SecretInput";
 import { Label } from "../ui/label";
 
 const DEFAULT_HOST = "github.com";
 
-/** Where to create a token for a host: GitHub's own page, or the same path on an Enterprise host. */
 function newTokenUrl(host: string): string {
   return `https://${host}/settings/personal-access-tokens/new`;
 }
 
-/**
- * A GitHub token for one host, kept in the server's secret store. It is used before
- * `GH_TOKEN` and the `gh` login, so it also works on a server without `gh` installed.
- * Write-only: the saved token is never shown, only whether one is set.
- */
 export function GitHubTokenSettings({
   environmentId,
   onSaved,
@@ -28,7 +24,7 @@ export function GitHubTokenSettings({
   readonly environmentId: EnvironmentId;
   readonly onSaved: () => void;
 }) {
-  const tokens = useEnvironmentSettings(environmentId, (settings) => settings.github.tokens);
+  const { tokens } = useEnvironmentSettings(environmentId, readGitHubSettings);
   const updateSettings = useAtomCommand(serverEnvironment.updateSettings, {
     label: "save GitHub token",
   });
@@ -43,17 +39,17 @@ export function GitHubTokenSettings({
 
   const save = async (target: string, token: string) => {
     setSaving(true);
-    try {
-      const result = await updateSettings({
-        environmentId,
-        input: { patch: { github: { tokens: { [target]: token } } } },
-      });
-      if (result._tag === "Success") {
-        setDraft("");
-        onSaved();
-      }
-    } finally {
-      setSaving(false);
+    const result = await updateSettings({
+      environmentId,
+      // The map travels whole: every other saved token as its redaction marker, which keeps it.
+      input: {
+        patch: { sourceControlHosts: { github: { tokens: { ...tokens, [target]: token } } } },
+      },
+    });
+    setSaving(false);
+    if (result._tag === "Success") {
+      setDraft("");
+      onSaved();
     }
   };
 
@@ -99,12 +95,10 @@ export function GitHubTokenSettings({
           </div>
           <div className="grid gap-1.5">
             <Label htmlFor={`github-token-${environmentId}`}>Token</Label>
-            <Input
+            <SecretInput
               id={`github-token-${environmentId}`}
-              type="password"
-              autoComplete="off"
               size="sm"
-              placeholder={isSaved ? "Stored secret, enter a new value to replace" : "Not set"}
+              configured={isSaved}
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
             />

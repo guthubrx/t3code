@@ -30,6 +30,7 @@ import { AssistantCitationCommentEditor } from "./AssistantCitationCommentEditor
 import { resolveAssistantCitationCommentDismissal } from "./assistantCitationCommentDismissal";
 import { observeAssistantCitationCommentSource } from "./AssistantCitationSource";
 import { composerFloatingLayerProps } from "./composerEventScope";
+import { observeResize } from "~/lib/observeResize";
 
 export function AssistantCitationChip({
   citation,
@@ -45,7 +46,7 @@ export function AssistantCitationChip({
     onCancel?: () => void;
     onSave: (comment: string) => boolean;
     onSaveAndSend?: (comment: string) => boolean;
-    /** Returns focus to the host editor when the popover closes instead of to the pencil trigger. */
+    onDraftChange?: (comment: string) => void;
     onRestoreFocus?: () => void;
   };
 }) {
@@ -75,7 +76,6 @@ export function AssistantCitationChip({
     if (settleDraftOnClose("none")) {
       commentEditor?.onOpenChange(false);
     } else {
-      // Keep the draft mounted, positioned at the composer trigger instead of a detached range.
       setUnavailableSourceAnchor(sourceAnchor);
     }
   });
@@ -89,8 +89,6 @@ export function AssistantCitationChip({
       onUnavailable: onSourceUnavailable,
     });
   }, [citation, commentOpen, sourceAnchor, unavailableSourceAnchor]);
-  // A multi-line selection's bounding box spans the full message width; anchor
-  // the bubble to the selection's last line, where the pointer released.
   const popupAnchor = activeSourceAnchor
     ? {
         contextElement: activeSourceAnchor.source,
@@ -185,7 +183,6 @@ export function AssistantCitationChip({
               finalFocus={
                 commentEditor.onRestoreFocus
                   ? () => {
-                      // Leave focus alone when the user closed the popover by moving to another control.
                       const activeElement = document.activeElement;
                       if (
                         activeElement === document.body ||
@@ -209,6 +206,7 @@ export function AssistantCitationChip({
                 inputRef={commentInputRef}
                 onDraftChange={(comment) => {
                   draftCommentRef.current = comment;
+                  commentEditor.onDraftChange?.(comment);
                 }}
                 onSubmit={(comment) => {
                   if (!commentEditor.onSave(comment)) return false;
@@ -249,14 +247,11 @@ function AssistantCitationQuote({ citation }: { citation: AssistantCitation }) {
       current.top === top && current.bottom === bottom ? current : { top, bottom },
     );
   };
+  const observeFade = (element: HTMLDivElement | null) =>
+    element ? observeResize(element, () => updateFade(element)) : undefined;
   return (
     <div
-      ref={(element) => {
-        if (!element) return;
-        const observer = new ResizeObserver(() => updateFade(element));
-        observer.observe(element);
-        return () => observer.disconnect();
-      }}
+      ref={observeFade}
       onScroll={(event) => updateFade(event.currentTarget)}
       className={cn(
         "max-h-64 min-h-0 space-y-3 self-stretch overflow-y-auto whitespace-pre-wrap wrap-break-word",

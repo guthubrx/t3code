@@ -104,6 +104,7 @@ export const refreshBridgetMcpServer = Effect.fn("refreshBridgetMcpServer")(
       const command = yield* resolveCommandPath(server.command, {
         env: { ...environment, ...server.env },
       });
+      if (command === null) return { code: "executable_unavailable" as const };
       if ((yield* fs.realPath(command)) !== executable) return { code: "user_server" as const };
     }
     const current = servers.at(-1);
