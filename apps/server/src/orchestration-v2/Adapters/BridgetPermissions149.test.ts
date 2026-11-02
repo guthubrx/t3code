@@ -1,3 +1,4 @@
+import * as PortScanner from "../../preview/PortScanner.ts";
 import * as BridgetTestSessions from "../../bridget/BridgetSessions.testkit.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -37,14 +38,12 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { vi } from "vite-plus/test";
 import * as ServerConfig from "../../config.ts";
-import {
-  buildCodexAdditionalContext,
-  buildCodexDeveloperInstructions,
-} from "../../provider/CodexDeveloperInstructions.ts";
+import { buildCodexAdditionalContext } from "../../provider/CodexDeveloperInstructions.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
 import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
-import { makeReplayServerConfig, withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
+import { withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
+import { makeReplayServerConfig } from "../testkit/ProviderReplayHarness.ts";
 
 // Spec 149 (permissions lineage). The Claude runner captures a bounded launch
 // context (CLI digests, config sources) and only represents the provider
@@ -119,6 +118,7 @@ const makeFixture = Effect.gen(function* () {
   const runner = yield* ClaudeAdapterV2.ClaudeAgentSdkQueryRunner.pipe(
     Effect.provide(
       ClaudeAdapterV2.layerQueryRunner.pipe(
+        Layer.provide(PortScanner.layerTest),
         Layer.provide(Layer.succeed(HostProcessEnvironment, environment)),
         Layer.provide(
           Layer.succeed(
@@ -917,12 +917,22 @@ const codexReplayPreamble = (input: {
           // A mounted credential always carries its private t3-code mount
           // (CodexAdapterV2 thread params); the stdio bridget server stays
           // absent because this fixture's environment has no BRIDGET_HOME.
-          mcp_servers: {
-            "t3-code": {
-              tool_timeout_sec: 3900,
-              url: "http://127.0.0.1:9/private-endpoint",
-              http_headers: { Authorization: "Bearer private-proof-149" },
-            },
+          "shell_environment_policy.set.T3CODE_THREAD_ID": input.nativeThreadId
+            .replace(/^native-g3-/, "thread-perm-149-g3-")
+            .replace(/^native-perm-/, "thread-perm-")
+            .replace(/^native-goal-permissions-/, "thread-perm-149-g3-goal-"),
+          "mcp_servers.t3-code": {
+            tool_timeout_sec: 3900,
+            url: "http://127.0.0.1:9/private-endpoint",
+            http_headers: { Authorization: "Bearer private-proof-149" },
+            disabled_tools: ["t3_thread_wait"],
+          },
+          "mcp_servers.t3-code-direct": {
+            tool_timeout_sec: 3900,
+            url: "http://127.0.0.1:9/private-endpoint",
+            http_headers: { Authorization: "Bearer private-proof-149" },
+            enabled_tools: ["t3_thread_wait"],
+            omit_tools_from: ["code_mode", "deferred"],
           },
         },
       },
@@ -985,15 +995,13 @@ const codexReplayPreamble = (input: {
         // The private t3-code mount makes the turn carry T3 context: the
         // session's browserToolsAvailable:false keeps t3_code_tools out.
         additionalContext: buildCodexAdditionalContext(
-          { model: "gpt-5.4", reasoningEffort: "medium" },
+          { model: "gpt-5.4", reasoningEffort: undefined },
           { browser: false, device: false },
         ),
         collaborationMode: {
           mode: "default",
           settings: {
             model: "gpt-5.4",
-            reasoning_effort: "medium",
-            developer_instructions: buildCodexDeveloperInstructions("default"),
           },
         },
       },

@@ -105,6 +105,7 @@ export function BridgetPanel(props: {
   const [documentVisible, setDocumentVisible] = useState(
     () => typeof document === "undefined" || document.visibilityState !== "hidden",
   );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- tracks the page visibility listener to suspend native subscriptions
   useEffect(() => {
     if (typeof document === "undefined") return;
     const update = () => setDocumentVisible(document.visibilityState !== "hidden");
@@ -159,6 +160,7 @@ function BridgetSession(context: Context) {
   });
   const [watchEnabled, setWatchEnabled] = useState(true);
 
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- opens and closes the native RPC visit for the connected server generation
   useLayoutEffect(() => {
     const current = visit.current;
     current.active = connectedGeneration !== null;
@@ -476,6 +478,7 @@ function BridgetSession(context: Context) {
     void run();
   });
 
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- cancels the previous native detail request when the persisted selection changes
   useEffect(() => {
     const current = visit.current;
     if (current.selectedId === selectedId) return;
@@ -728,6 +731,7 @@ function BridgetWatch({
     }),
   );
   const accepted = useRef<{ generation: string; seq: number; subscriptionId: symbol } | null>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- forwards ordered native watch receipts to the active RPC visit
   useEffect(() => {
     // A unique visit key prevents SWR from an older visit. The native snapshot
     // retains handshake proof even when React first observes a coalesced changed.
@@ -860,6 +864,7 @@ function BridgetMessage({
     .map(({ id, name }) => (name ? `${name} (${id})` : `Nom indisponible (${id})`))
     .join(" ; ");
   const authorRow = author + (recipients.length ? ` → ${recipientNames}` : " · Sans sollicitation");
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- observes the rendered body height to retain the visible expansion control and focus
   useEffect(() => {
     const body = bodyRef.current;
     if (!body || expanded || entry.body.length === 0) return;

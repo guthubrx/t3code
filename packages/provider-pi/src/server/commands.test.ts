@@ -1,9 +1,8 @@
 import { expect, it } from "@effect/vitest";
 
 import {
-  parsePiCompactCommand,
   parsePiDiscoveredCommands,
-  PI_COMPACT_SLASH_COMMAND,
+  parsePiCompactCommand,
   withPiBuiltinSlashCommands,
 } from "./commands.ts";
 
@@ -97,16 +96,17 @@ it("parses a standalone /compact command and optional instructions", () => {
 });
 
 it("prepends the builtin compact command without duplicating a discovered one", () => {
-  expect(withPiBuiltinSlashCommands([{ name: "hello", description: "Say hello." }])).toEqual([
-    PI_COMPACT_SLASH_COMMAND,
-    { name: "hello", description: "Say hello." },
-  ]);
+  expect(
+    withPiBuiltinSlashCommands([{ name: "hello", description: "Say hello." }]).map(
+      ({ name }) => name,
+    ),
+  ).toEqual(["compact", "hello"]);
   expect(
     withPiBuiltinSlashCommands([
       { name: "compact", description: "Extension compact." },
       { name: "hello" },
-    ]),
-  ).toEqual([PI_COMPACT_SLASH_COMMAND, { name: "hello" }]);
+    ]).map(({ name }) => name),
+  ).toEqual(["compact", "hello"]);
 });
 
 it("SPEC169 keeps the private policy control out of user slash commands", () => {

@@ -10,7 +10,6 @@ import {
   type BridgetJournalConflict,
   type BridgetJournalContinuityCut,
   type BridgetJournalGap,
-  type BridgetJournalProjection,
 } from "@t3tools/client-runtime/bridget-journal-presentation";
 import {
   AuthOrchestrationOperateScope,
@@ -40,7 +39,7 @@ import {
   type NativeMarkdownTextStyle,
 } from "../../native/SelectableMarkdownText";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
-import { RequestActionButton } from "./RequestActionButton";
+import { Button as RequestActionButton } from "../../components/ui/Button";
 import { copyTextWithHaptic } from "../../lib/copyTextWithHaptic";
 import { uuidv4 } from "../../lib/uuid";
 
@@ -84,7 +83,6 @@ function useJournalMarkdownPresentation(): NativeMarkdownTextStyle {
     codeBackgroundColor: theme["--color-md-code-bg"],
     codeBlockBackgroundColor: theme["--color-md-code-bg"],
     fileTextColor: theme["--color-md-code-text"],
-    skillTextColor: theme["--color-md-code-text"],
     quoteMarkerColor: theme["--color-md-blockquote-border"],
     dividerColor: theme["--color-md-hr"],
     ...typography,
@@ -235,6 +233,7 @@ function NativeSubscription({
       },
     }),
   );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- forwards native journal subscription receipts to the mounted screen
   useEffect(() => {
     if (journal._tag === "Failure")
       onFailure("Bridget indisponible. Les lignes déjà lues sont conservées.");
@@ -276,24 +275,26 @@ export function BridgetTaskJournal({
   const [result, setResult] = useState("");
   const [busy, setBusy] = useState(false);
   const lastSeq = useRef(0);
-  const liveProjection = useRef<BridgetJournalProjection | null>(null);
   const requests = useRef(new Set<AbortController>());
   const cancel = useAtomCommand(orchestrationEnvironment.bridgetLineageCancel, {
     reportFailure: false,
   });
   const canOperate = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- tracks the native foreground lifecycle while the journal is mounted
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (state) =>
       setForeground(state === "active"),
     );
     return () => subscription.remove();
   }, []);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- releases in-flight journal requests when the native screen unmounts
   useEffect(
     () => () => {
       for (const request of requests.current) request.abort();
     },
     [],
   );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- stops native journal requests while the screen is out of focus or backgrounded
   useEffect(() => {
     if (!active) {
       for (const request of requests.current) request.abort();
@@ -412,13 +413,15 @@ export function BridgetTaskJournal({
     }),
     [journal],
   );
-  const projectedLiveJournal = useMemo(
-    () => projectBridgetJournal(liveInput, liveProjection.current ?? undefined),
-    [liveInput],
-  );
-  useEffect(() => {
-    liveProjection.current = projectedLiveJournal;
-  }, [projectedLiveJournal]);
+  const [previousProjection, setPreviousProjection] = useState(() => ({
+    journal,
+    projection: projectBridgetJournal(liveInput),
+  }));
+  let projectedLiveJournal = previousProjection.projection;
+  if (previousProjection.journal !== journal) {
+    projectedLiveJournal = projectBridgetJournal(liveInput, previousProjection.projection);
+    setPreviousProjection({ journal, projection: projectedLiveJournal });
+  }
   const projectedHistory = useMemo(() => {
     if (history === null) return null;
     const merged = mergeJournalEvents([], history.events);

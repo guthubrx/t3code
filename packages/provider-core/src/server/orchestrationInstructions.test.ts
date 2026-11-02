@@ -1,97 +1,88 @@
 import { assert, describe, it } from "@effect/vitest";
 
 import {
+  T3_CODE_DEVICE_TOOL_INSTRUCTIONS,
+  T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH,
   T3_CODE_ORCHESTRATION_INSTRUCTIONS,
   t3AcpPromptWithInstructions,
-  t3OrchestrationPromptForFirstRun,
+  t3OrchestrationPrompt,
   t3OrchestrationSystemPrompt,
   t3OrchestrationInstructions,
 } from "./orchestrationInstructions.ts";
 
-describe("T3 orchestration provider instructions", () => {
-  it("distinguishes delegated subagents from ordinary top-level threads", () => {
-    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Use `delegate_task`");
-    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "ordinary top-level T3 conversations");
-    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Never use them merely");
-    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "cross-provider");
-    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "call `delegate_task` again");
-    assert.include(
-      T3_CODE_ORCHESTRATION_INSTRUCTIONS,
-      "Do not use `t3_thread_send` on `childThreadId`",
+describe("T3 device instructions", () => {
+  it("route device work through device_open and give Claude the line that loads the tools", () => {
+    for (const intent of ["`device_list`", "`device_open`", "`agent-device`", "ssh", "`hostId`"]) {
+      assert.include(T3_CODE_DEVICE_TOOL_INSTRUCTIONS, intent);
+    }
+    assert.notInclude(T3_CODE_DEVICE_TOOL_INSTRUCTIONS, "ToolSearch");
+    const loadLine =
+      " Load them with ToolSearch `select:mcp__t3-code__device_list,mcp__t3-code__device_open,mcp__t3-code__device_screenshot,mcp__t3-code__device_close`.";
+    assert.include(T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH, loadLine);
+    assert.equal(
+      T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH.replace(loadLine, ""),
+      T3_CODE_DEVICE_TOOL_INSTRUCTIONS,
     );
   });
 
-  it("documents structured schedules instead of JSON strings", () => {
-    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "structured object, never as JSON text");
-    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, '"everyMs":3600000');
-    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "bindToCurrentThread=false");
+  it("open the app before the returned command's snapshots, screenshots and input", () => {
+    assert.include(
+      T3_CODE_DEVICE_TOOL_INSTRUCTIONS,
+      "its snapshots, screenshots and input need `open <app>` first,",
+    );
   });
 
-  it("injects the current mode initially and skips an unchanged known policy", () => {
-    const prompt = "Inspect the repository.";
-    const injected = t3OrchestrationPromptForFirstRun({
-      prompt,
-      runOrdinal: 1,
-      hasT3Mcp: true,
-    });
+  it("keep the failure rule from taking over or closing a session another thread holds", () => {
+    // agent-device's DEVICE_IN_USE advice is to rerun with the owner's --session or close it first.
+    assert.include(
+      T3_CODE_DEVICE_TOOL_INSTRUCTIONS,
+      "follow its advice once, but never reuse or close another session; if it still fails,",
+    );
+  });
 
-    assert.include(injected, "<t3_code_orchestration_instructions>");
-    assert.include(injected, `<user_request>\n${prompt}\n</user_request>`);
-    assert.equal(
-      t3OrchestrationPromptForFirstRun({
-        prompt,
-        runOrdinal: 2,
+  it("reach OpenCode and Cursor only when the session holds device access", () => {
+    assert.include(t3OrchestrationSystemPrompt(true, true), T3_CODE_DEVICE_TOOL_INSTRUCTIONS);
+    assert.notInclude(t3OrchestrationSystemPrompt(true, false), "## T3 Code devices");
+    assert.isUndefined(t3OrchestrationSystemPrompt(false, true));
+
+    const firstRun = (hasDeviceTools: boolean) =>
+      t3OrchestrationPrompt({
+        prompt: "Check the login screen.",
         hasT3Mcp: true,
+        hasDeviceTools,
+        orchestrationDelivered: false,
+        deviceInstructionsDelivered: false,
+      });
+    assert.include(firstRun(true), T3_CODE_DEVICE_TOOL_INSTRUCTIONS);
+    assert.notInclude(firstRun(false), "## T3 Code devices");
+
+    const laterRun = (deviceInstructionsDelivered: boolean) =>
+      t3OrchestrationPrompt({
+        prompt: "Check the login screen.",
+        hasT3Mcp: true,
+        hasDeviceTools: true,
+        orchestrationDelivered: true,
         previousPreference: "off",
-      }),
-      prompt,
-    );
-    assert.include(
-      t3OrchestrationPromptForFirstRun({ prompt, runOrdinal: 1, hasT3Mcp: false }),
-      "preference is off for this turn",
-    );
+        deviceInstructionsDelivered,
+      });
+    assert.include(laterRun(false), T3_CODE_DEVICE_TOOL_INSTRUCTIONS);
+    assert.notInclude(laterRun(false), T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim());
+    assert.equal(laterRun(true), "Check the login screen.");
   });
 
-  it("only exposes the system prompt when the T3 MCP server is attached", () => {
-    assert.equal(t3OrchestrationSystemPrompt(false), undefined);
-    assert.equal(t3OrchestrationSystemPrompt(true), T3_CODE_ORCHESTRATION_INSTRUCTIONS);
-  });
-
-  it("gives ACP sessions provider-neutral mode, browser, and orchestration guidance", () => {
-    const injected = t3AcpPromptWithInstructions({
-      prompt: "Inspect the repository.",
-      state: { interactionMode: "default", hasT3Mcp: true },
+  it("reach ACP agents again when device access changes mid-thread", () => {
+    const state = { interactionMode: "default", hasT3Mcp: true, hasDeviceTools: false } as const;
+    const withDevices = t3AcpPromptWithInstructions({
+      prompt: "Check the login screen.",
+      state: { ...state, hasDeviceTools: true },
+      previousState: state,
     });
-
-    assert.include(injected, "T3 Code interaction mode: Default");
-    assert.include(injected, "T3 Code collaborative browser");
-    assert.include(injected, "T3 Code orchestration");
-    assert.include(injected, "<user_request>\nInspect the repository.\n</user_request>");
-  });
-
-  it("reinjects ACP guidance only when mode or tool availability changes", () => {
-    const prompt = "Continue.";
-    const defaultState = { interactionMode: "default", hasT3Mcp: true } as const;
-
+    assert.include(withDevices, T3_CODE_DEVICE_TOOL_INSTRUCTIONS);
     assert.equal(
-      t3AcpPromptWithInstructions({ prompt, state: defaultState, previousState: defaultState }),
-      prompt,
+      t3AcpPromptWithInstructions({ prompt: "Again.", state, previousState: state }),
+      "Again.",
     );
-    assert.include(
-      t3AcpPromptWithInstructions({
-        prompt,
-        state: { ...defaultState, interactionMode: "plan" },
-        previousState: defaultState,
-      }),
-      "T3 Code interaction mode: Plan",
-    );
-    const withoutMcp = t3AcpPromptWithInstructions({
-      prompt,
-      state: { interactionMode: "default", hasT3Mcp: false },
-    });
-    assert.include(withoutMcp, "T3 Code interaction mode: Default");
-    assert.notInclude(withoutMcp, "T3 Code collaborative browser");
-    assert.notInclude(withoutMcp, "T3 Code orchestration");
+    assert.notInclude(t3AcpPromptWithInstructions({ prompt: "Hi.", state }), "## T3 Code devices");
   });
 });
 
@@ -105,13 +96,13 @@ describe("SPEC169 delegation guidance", () => {
     assert.include(off, "preference is off for this turn");
     assert.notInclude(off, "orchestrator_capabilities");
     for (const hasT3Mcp of [false, true]) {
-      const resumed = t3OrchestrationPromptForFirstRun({ prompt, runOrdinal: 8, hasT3Mcp });
+      const resumed = t3OrchestrationPrompt({ prompt, runOrdinal: 8, hasT3Mcp });
       assert.include(
         resumed,
-        hasT3Mcp ? "Prefer native subagent tools" : "preference is off for this turn",
+        hasT3Mcp ? T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim() : "preference is off for this turn",
       );
       assert.equal(
-        t3OrchestrationPromptForFirstRun({ prompt: "/compact", runOrdinal: 8, hasT3Mcp }),
+        t3OrchestrationPrompt({ prompt: "/compact", runOrdinal: 8, hasT3Mcp }),
         "/compact",
       );
       const acp = t3AcpPromptWithInstructions({
@@ -120,7 +111,7 @@ describe("SPEC169 delegation guidance", () => {
       });
       assert.include(
         acp,
-        hasT3Mcp ? "Prefer native subagent tools" : "preference is off for this turn",
+        hasT3Mcp ? T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim() : "preference is off for this turn",
       );
     }
   });
@@ -133,6 +124,11 @@ describe("SPEC169 delegation guidance", () => {
     assert.include(preferred, "bridget_auto_delegate");
     for (const obsolete of [
       "Prefer native subagent tools",
+      "Subagents: use your native tool",
+      "`spawn_agent`",
+      "Call `orchestrator_capabilities`",
+      "Every new delegate review",
+      "Follow a running delegate",
       "Use `delegate_task` with that provider",
       "For every T3 delegated review round",
       "you delegate or dedupe",
@@ -141,10 +137,11 @@ describe("SPEC169 delegation guidance", () => {
     ])
       assert.notInclude(preferred, obsolete);
     for (const retained of [
-      "ordinary top-level T3 conversations",
+      "t3_thread_launch",
+      "create_threads",
       "schedule_task",
       "request_secret",
-      "Showing visuals",
+      "Visuals and preview",
     ])
       assert.include(preferred, retained);
     for (const constraint of [
@@ -182,14 +179,14 @@ describe("SPEC169 delegation guidance", () => {
     );
     assert.include(
       t3AcpPromptWithInstructions({ prompt: "Continue", state: off, previousState: on }),
-      "Prefer native subagent tools",
+      T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim(),
     );
     assert.equal(
       t3AcpPromptWithInstructions({ prompt: "/compact", state: on, previousState: off }),
       "/compact",
     );
     assert.include(
-      t3OrchestrationPromptForFirstRun({
+      t3OrchestrationPrompt({
         prompt: "Continue",
         runOrdinal: 2,
         hasT3Mcp: true,
@@ -199,7 +196,7 @@ describe("SPEC169 delegation guidance", () => {
       "preference: blocked",
     );
     assert.equal(
-      t3OrchestrationPromptForFirstRun({
+      t3OrchestrationPrompt({
         prompt: "/model example",
         runOrdinal: 2,
         hasT3Mcp: true,

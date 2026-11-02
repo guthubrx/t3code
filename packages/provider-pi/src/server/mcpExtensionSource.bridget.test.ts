@@ -10,7 +10,7 @@ describe("SPEC169 private Pi policy control", () => {
           { systemPrompt: "Pi" },
           { ui: { notify: () => undefined } },
         )
-      ).systemPrompt;
+      )?.systemPrompt ?? "Pi";
     assert.include(await render(), "preference: blocked");
     assert.notInclude(await render(), "orchestrator_capabilities");
     await bridge.setPolicy("off 0123456789abcdef");
@@ -29,11 +29,11 @@ describe("SPEC169 private Pi policy control", () => {
           { systemPrompt: "Pi" },
           { ui: { notify: () => undefined } },
         )
-      ).systemPrompt;
+      )?.systemPrompt ?? "Pi";
     assert.include(await render(), "preference: blocked");
     assert.equal(bridge.receipts.length, 0);
     await bridge.setPolicy("off 0123456789abcdef");
-    assert.include(await render(), "Prefer native subagent tools");
+    assert.include(await render(), "Subagents: use your native tool");
     assert.deepEqual(bridge.receipts.at(-1), ["t3-bridget-policy:0123456789abcdef", "off"]);
     for (const invalid of [
       "prefer",
@@ -49,12 +49,26 @@ describe("SPEC169 private Pi policy control", () => {
         rejected = true;
       }
       assert.isTrue(rejected);
-      assert.include(await render(), "Prefer native subagent tools");
+      assert.include(await render(), "Subagents: use your native tool");
       assert.equal(bridge.receipts.length, 1);
     }
     await bridge.setPolicy("prefer fedcba9876543210");
     assert.include(await render(), "preference: blocked");
-    assert.notInclude(await render(), "Prefer native subagent tools");
+    assert.notInclude(await render(), "Subagents: use your native tool");
     assert.deepEqual(bridge.receipts.at(-1), ["t3-bridget-policy:fedcba9876543210", "prefer"]);
   });
+});
+
+it("keeps Bridget policy in Pi prompt sections and clears OFF without MCP", async () => {
+  const bridge = await loadMcpBridge({ hasT3Mcp: false, initialPolicy: "blocked" });
+  const sections: Record<string, string> = { other: "Keep this section." };
+  const event = { systemPrompt: "Pi", systemPromptOptions: { sections } };
+  const context = { ui: { notify: () => undefined } };
+  const hook = bridge.handlers.get("before_agent_start")!;
+  assert.isUndefined(await hook(event, context));
+  assert.include(sections.t3_code_orchestration!, "preference: blocked");
+  await bridge.setPolicy("off 0123456789abcdef");
+  assert.isUndefined(await hook(event, context));
+  assert.notProperty(sections, "t3_code_orchestration");
+  assert.equal(sections.other, "Keep this section.");
 });

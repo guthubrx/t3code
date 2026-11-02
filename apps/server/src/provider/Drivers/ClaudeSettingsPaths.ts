@@ -49,8 +49,9 @@ export const findRepositoryRoot = Effect.fn("findRepositoryRoot")(function* (
         ? yield* fs.exists(path.join(current, ".git")).pipe(Effect.orElseSucceed(() => false))
         : yield* fs.stat(path.join(current, ".git")).pipe(
             Effect.as(true),
-            Effect.catch((error) =>
-              error.reason._tag === "NotFound" ? Effect.succeed(false) : Effect.fail(error),
+            Effect.catchIf(
+              (error) => error.reason._tag === "NotFound",
+              () => Effect.succeed(false),
             ),
           );
     if (isRoot) return current;

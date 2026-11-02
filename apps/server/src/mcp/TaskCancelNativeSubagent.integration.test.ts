@@ -41,20 +41,17 @@ import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
+import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 
-const layerOrchestratorService = OrchestratorMcpService.layer
-  .pipe(Layer.provide(McpProviderSessions.layer))
-  .pipe(
-    Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
-    Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
-  );
+const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(McpProviderSessions.layer),
+  Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+  Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
+);
 
 const driver = ProviderDriverKind.make("claudeAgent");
 const instanceId = ProviderInstanceId.make("claudeAgent");
 const modelSelection = { instanceId, model: "claude-test" };
-
-// A delegated Claude child ends its turn while a background native subagent it
-// started keeps running (#17154).
 
 it.effect("task_cancel ends a delegated child's background native subagent", () =>
   Effect.scoped(
@@ -161,6 +158,7 @@ it.effect("task_cancel ends a delegated child's background native subagent", () 
             Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
             Layer.mock(ProjectService.ProjectService)({}),
             Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(RemoteDelegation.RemoteDelegation)({}),
             ServerSettings.layerTest(),
             Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
             NodeServices.layer,

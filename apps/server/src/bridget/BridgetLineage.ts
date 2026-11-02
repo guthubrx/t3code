@@ -46,8 +46,8 @@ const make = Effect.gen(function* () {
     Effect.map((id) => CommandId.make(`bridget-lineage:${id}`)),
     Effect.orDie,
   );
-  const unavailable = (input: BridgetLineageWatchInput, taskThreadId?: ThreadId) =>
-    Effect.gen(function* () {
+  const unavailable = Effect.fn("unavailable")(
+    function* (input: BridgetLineageWatchInput, taskThreadId?: ThreadId) {
       const { thread: root } = yield* orchestrator.getThreadRecords(input.threadId, []);
       // A caller-provided context that the reader refused cannot invalidate a
       // different project or use a virtual child as an authoritative root.
@@ -63,7 +63,9 @@ const make = Effect.gen(function* () {
         commandId: yield* commandId,
         threadId,
       });
-    }).pipe(Effect.ignore);
+    },
+    (effect) => Effect.ignore(effect),
+  );
   const observeFailure = (
     input: BridgetLineageWatchInput | BridgetLineageReadInput | BridgetLineageJournalInput,
     error: BridgetLineageError,
@@ -89,15 +91,12 @@ const make = Effect.gen(function* () {
     input: BridgetLineageWatchInput,
     remaining: number,
   ): Effect.Effect<BridgetLineageSnapshot, BridgetLineageError> =>
-    reader
-      .lineageSnapshot(input)
-      .pipe(
-        Effect.catch((error) =>
-          error.code === "snapshot_changed" && remaining > 1
-            ? snapshotAttempt(input, remaining - 1)
-            : Effect.fail(error),
-        ),
-      );
+    reader.lineageSnapshot(input).pipe(
+      Effect.catchIf(
+        (error) => error.code === "snapshot_changed" && remaining > 1,
+        () => snapshotAttempt(input, remaining - 1),
+      ),
+    );
   const synchronize = Effect.fn("BridgetLineage.synchronize")(function* (
     input: BridgetLineageWatchInput,
   ): Effect.fn.Return<BridgetLineageSnapshot, BridgetLineageError> {

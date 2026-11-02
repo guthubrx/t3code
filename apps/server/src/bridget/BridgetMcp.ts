@@ -120,5 +120,5 @@ export const refreshBridgetMcpServer = Effect.fn("refreshBridgetMcpServer")(
       },
     };
   },
-  Effect.catch(() => Effect.succeed({ code: "executable_unavailable" as const })),
+  Effect.orElseSucceed(() => ({ code: "executable_unavailable" as const })),
 );

@@ -120,8 +120,9 @@ it.effect(
     ),
 );
 
-it.effect("cancels an imperative read on abort and starts a fresh read on returning to A", () =>
-  Effect.scoped(
+it.effect("cancels an imperative read on abort and starts a fresh read on returning to A", () => {
+  const controller = new AbortController();
+  return Effect.scoped(
     Effect.gen(function* () {
       const started = yield* Deferred.make<void>();
       const stopped = yield* Deferred.make<void>();
@@ -144,7 +145,6 @@ it.effect("cancels an imperative read on abort and starts a fresh read on return
           }),
       } as unknown as RpcSession["client"]);
       const target = { ...h.target, input: { ...h.target.input, action: "list" as const } };
-      const controller = new AbortController();
       const pending = executeAtomQuery(h.registry, h.atoms.bridgetRead(target), {
         refresh: true,
         signal: controller.signal,
@@ -162,8 +162,8 @@ it.effect("cancels an imperative read on abort and starts a fresh read on return
       ).toBe("Success");
       expect(calls).toBe(2);
     }),
-  ),
-);
+  );
+});
 
 it.effect("performs one fresh RPC per consecutive zero-idle human read", () =>
   Effect.scoped(

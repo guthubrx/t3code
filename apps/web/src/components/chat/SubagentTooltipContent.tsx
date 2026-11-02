@@ -12,6 +12,7 @@ import {
   resolveSubagentMetadata,
   subagentDetailPreview,
 } from "@t3tools/client-runtime/state/subagent-display";
+import { REASONING_EFFORT_OPTION_IDS } from "@t3tools/client-runtime/state/thread-execution";
 import { getModelSelectionStringOptionValue, resolveSelectableModel } from "@t3tools/shared/model";
 import { getTraitsSpeedDisplay, TraitsSpeedIcon } from "./TraitsSpeed";
 import type { ReactNode } from "react";
@@ -115,7 +116,6 @@ export function BridgetTaskPlacement({
   );
 }
 
-/** Geometry and preview limits stay identical in lineage and timeline tooltips. */
 export function SubagentTooltipContent(props: {
   title: string;
   model: string | null;
@@ -159,9 +159,9 @@ export function SubagentTooltipContent(props: {
     childModel === (modelSlug ?? model) && childSelection?.instanceId === props.providerInstanceId
       ? childSelection
       : undefined;
-  const effort = ["reasoningEffort", "effort", "reasoning", "variant"]
-    .map((id) => getModelSelectionStringOptionValue(matchingSelection, id))
-    .find(Boolean);
+  const effort = REASONING_EFFORT_OPTION_IDS.map((id) =>
+    getModelSelectionStringOptionValue(matchingSelection, id),
+  ).find(Boolean);
   const speed = provider
     ? providerModel?.capabilities?.optionDescriptors
         ?.map((descriptor) => {

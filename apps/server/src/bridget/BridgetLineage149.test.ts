@@ -161,13 +161,11 @@ const harness = Effect.fn("BridgetLineage149.harness")(function* (options: Harne
       Effect.gen(function* () {
         if (options.failDispatch === true) {
           attempts.push({ type: command.type, threadId: command.threadId, ok: false });
-          return yield* Effect.fail(
-            new Orchestrator.OrchestratorDispatchError({
-              commandId: CommandId.make("stub-command"),
-              commandType: command.type,
-              cause: "projection down",
-            }),
-          );
+          return yield* new Orchestrator.OrchestratorDispatchError({
+            commandId: CommandId.make("stub-command"),
+            commandType: command.type,
+            cause: "projection down",
+          });
         }
         attempts.push({ type: command.type, threadId: command.threadId, ok: true });
         return { sequence: attempts.length, storedEvents: [] };

@@ -57,6 +57,7 @@ export interface RuntimeSubagent {
   readonly role: string | null;
   readonly model: string | null;
   readonly effort: string | null;
+  readonly speed?: string | undefined;
   readonly status: RuntimeSubagentStatus;
   readonly activationCount: number;
   readonly usage: SubagentUsage | null;
@@ -144,9 +145,10 @@ function workflowMembersToRuntime(
     const failed = status === "failed";
     const startedAt = isoFromEpochMillis(agent.startedAt);
     const completedAt = isTerminalSubagentStatus(status)
-      ? agent.startedAt !== undefined && agent.durationMs !== undefined
-        ? isoFromEpochMillis(agent.startedAt + agent.durationMs)
-        : coordinator.completedAt
+      ? (isoFromEpochMillis(agent.completedAt) ??
+        (agent.startedAt !== undefined && agent.durationMs !== undefined
+          ? isoFromEpochMillis(agent.startedAt + agent.durationMs)
+          : coordinator.completedAt))
       : null;
     return {
       ...coordinator,
@@ -154,6 +156,8 @@ function workflowMembersToRuntime(
       kind: "workflow_agent" as const,
       title: agent.label,
       model: agent.model ?? null,
+      effort: agent.effort ?? null,
+      ...(agent.speed === undefined ? {} : { speed: agent.speed }),
       status,
       activationCount: agent.attempt ?? 1,
       usage: workflowUsage(agent),

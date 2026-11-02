@@ -47,6 +47,6 @@ export const prepareCodexBridgetMcp = Effect.fn("prepareCodexBridgetMcp")(functi
     } satisfies Schema.Json;
   }).pipe(
     Effect.timeout("6 seconds"),
-    Effect.catch(() => Effect.succeed(undefined)),
+    Effect.orElseSucceed(() => undefined),
   );
 });

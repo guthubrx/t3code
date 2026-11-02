@@ -305,7 +305,7 @@ const make = Effect.gen(function* () {
             const exitCode =
               event.code === "binding_unavailable"
                 ? yield* child.exitCode.pipe(
-                    Effect.catch(() => Effect.succeed(null)),
+                    Effect.orElseSucceed(() => null),
                     Effect.timeoutOrElse({
                       duration: "500 millis",
                       orElse: () => Effect.succeed(null),
@@ -530,16 +530,15 @@ const make = Effect.gen(function* () {
     attempt: (version: 1 | 2 | 3) => Effect.Effect<A, BridgetLineageError>,
   ) =>
     attempt(3).pipe(
-      Effect.catch((error) =>
-        error.code === "unsupported_version"
-          ? attempt(2).pipe(
-              Effect.catch((legacyError) =>
-                legacyError.code === "unsupported_version" || legacyError.code === "invalid_request"
-                  ? attempt(1)
-                  : Effect.fail(legacyError),
-              ),
-            )
-          : Effect.fail(error),
+      Effect.catchIf(
+        (error) => error.code === "unsupported_version",
+        () =>
+          attempt(2).pipe(
+            Effect.catchIf(
+              (error) => error.code === "unsupported_version" || error.code === "invalid_request",
+              () => attempt(1),
+            ),
+          ),
       ),
     );
   const lineageSnapshot = (input: BridgetLineageWatchInput) =>
@@ -553,29 +552,32 @@ const make = Effect.gen(function* () {
   // The wire margin covers metadata and delimiters for up to 100 events.
   const journalContentBytes = 16 * 1024;
   const journalEnvelopeBytes = 24 * 1024;
-  const validateJournal = (journal: BridgetLineageJournal, taskId: string, afterSeq: number) =>
-    Effect.gen(function* () {
-      if (
-        journal.task_id !== taskId ||
-        journal.next_seq < afterSeq ||
-        (journal.gap !== null && journal.gap.to_seq < journal.gap.from_seq)
-      )
+  const validateJournal = Effect.fn("validateJournal")(function* (
+    journal: BridgetLineageJournal,
+    taskId: string,
+    afterSeq: number,
+  ) {
+    if (
+      journal.task_id !== taskId ||
+      journal.next_seq < afterSeq ||
+      (journal.gap !== null && journal.gap.to_seq < journal.gap.from_seq)
+    )
+      return yield* new BridgetLineageError({ code: "invalid_output" });
+    let previous = afterSeq;
+    let contentBytes = 0;
+    for (const event of journal.events) {
+      if (event.seq <= previous || event.seq > journal.next_seq)
         return yield* new BridgetLineageError({ code: "invalid_output" });
-      let previous = afterSeq;
-      let contentBytes = 0;
-      for (const event of journal.events) {
-        if (event.seq <= previous || event.seq > journal.next_seq)
-          return yield* new BridgetLineageError({ code: "invalid_output" });
-        const encoded = yield* encodeJournalEvent(event).pipe(
-          Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
-        );
-        contentBytes += Buffer.byteLength(encoded, "utf8");
-        if (contentBytes > journalContentBytes)
-          return yield* new BridgetLineageError({ code: "output_limit" });
-        previous = event.seq;
-      }
-      return journal;
-    });
+      const encoded = yield* encodeJournalEvent(event).pipe(
+        Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+      );
+      contentBytes += Buffer.byteLength(encoded, "utf8");
+      if (contentBytes > journalContentBytes)
+        return yield* new BridgetLineageError({ code: "output_limit" });
+      previous = event.seq;
+    }
+    return journal;
+  });
   const lineageReadAttempt = Effect.fn("BridgetReader.lineageRead")(function* (
     input: Exclude<BridgetLineageReadInput, { readonly action: "list" }>,
     responseVersion: 1 | 2 | 3,

@@ -1,3 +1,7 @@
+import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
+import * as PeerLinks from "../peer/PeerLinks.ts";
+import * as PeerLinkRequests from "../peer/PeerLinkRequests.ts";
+import * as PeerForwarding from "../peer/PeerForwarding.ts";
 // Native bridge interop: real Node APIs form the boundary under test.
 // @effect-diagnostics nodeBuiltinImport:off
 // @effect-diagnostics globalTimers:off
@@ -78,6 +82,11 @@ run(
     // Only stored conversation data and unused backend dependencies are fixtures.
     // HTTP transport, auth registry, toolkit, handler, identity service and Rust client are real.
     const storageLayer = Layer.mergeAll(
+      Layer.mock(PeerForwarding.PeerForwarding)({}),
+      Layer.mock(PeerLinkRequests.PeerLinkRequests)({}),
+      Layer.mock(PeerLinks.PeerLinks)({}),
+      Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+      Layer.mock(TestSettings.ServerSettingsService)({}),
       Layer.mock(ThreadManagement.ThreadManagementService)({
         getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
         getThreadRecords: (id) => {
@@ -118,6 +127,7 @@ run(
           OrchestratorHandlers.layer,
         ).pipe(
           Layer.provideMerge(McpHttpServer.layerMcpTransport),
+          Layer.provide(storageLayer),
           Layer.provide(
             OrchestratorService.layer.pipe(
               Layer.provideMerge(storageLayer),
@@ -226,7 +236,11 @@ run(
           3,
         );
       }),
-    ).pipe(Effect.provide(registryLayer), Effect.provide(httpLayer));
+    ).pipe(
+      Effect.provide(
+        registryLayer.pipe(Layer.provideMerge(httpLayer), Layer.provideMerge(NodeServices.layer)),
+      ),
+    );
   },
   60_000,
 );

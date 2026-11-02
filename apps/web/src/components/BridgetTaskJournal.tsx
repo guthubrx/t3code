@@ -41,6 +41,7 @@ type Context = { environmentId: EnvironmentId; projectId: ProjectId; threadId: T
 
 function useVisiblePage() {
   const [visible, setVisible] = useState(() => document.visibilityState !== "hidden");
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- tracks the browser page visibility listener for live journal subscriptions
   useEffect(() => {
     const changed = () => setVisible(document.visibilityState !== "hidden");
     document.addEventListener("visibilitychange", changed);
@@ -227,6 +228,7 @@ function JournalFollow({
       },
     }),
   );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- forwards receipts from the native journal subscription to the mounted view
   useEffect(() => {
     if (result._tag === "Failure") onFailure(failureMessage(result.cause));
     const state = Option.getOrNull(AsyncResult.value(result));
@@ -242,7 +244,10 @@ export function BridgetTaskJournal({
   onOpenParent,
 }: {
   environmentId: EnvironmentId;
-  thread: OrchestrationV2AppThread;
+  thread: Pick<
+    OrchestrationV2AppThread,
+    "bridgetTaskRef" | "bridgetTask" | "projectId" | "title" | "modelSelection" | "bridgetLineage"
+  >;
   onOpenParent: (() => void) | null;
 }) {
   const ref = thread.bridgetTaskRef!;
@@ -279,6 +284,7 @@ export function BridgetTaskJournal({
   const [bottomInset, setBottomInset] = useState(0);
   const lastSeq = useRef(0);
   const requests = useRef(new Set<AbortController>());
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- measures the real composer overlay and keeps journal scroll clearance in sync
   useLayoutEffect(() => {
     const overlay = scrollElement
       ?.closest("[data-chat-canvas]")
@@ -290,12 +296,14 @@ export function BridgetTaskJournal({
     measure();
     return observeResize(overlay, measure);
   }, [scrollElement]);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- aborts native journal reads when the component unmounts
   useEffect(
     () => () => {
       for (const request of requests.current) request.abort();
     },
     [],
   );
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- suspends native journal reads while the browser page is hidden
   useEffect(() => {
     if (!visible) {
       for (const request of requests.current) request.abort();

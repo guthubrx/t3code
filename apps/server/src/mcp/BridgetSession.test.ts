@@ -1,3 +1,4 @@
+import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as BridgetTestSessions from "../bridget/BridgetSessions.testkit.ts";
 import * as TestGit from "../vcs/GitVcsDriver.ts";
 import * as TestLaunch from "../orchestration-v2/ThreadLaunchService.ts";
@@ -64,53 +65,49 @@ describe("Bridget session attestation", () => {
       }),
     );
   const layer = (active: boolean, archived = false, deleted = false) =>
-    Service.layer
-      .pipe(
-        Layer.provide(BridgetTestSessions.layer),
-        Layer.provide(Layer.mock(TestGit.GitVcsDriver)({})),
-        Layer.provide(Layer.mock(TestLaunch.ThreadLaunchService)({})),
-        Layer.provide(Layer.mock(TestSettings.ServerSettingsService)({})),
-      )
-      .pipe(
-        Layer.provide(
-          Layer.mergeAll(
-            NodeServices.layer,
-            Layer.mock(ThreadManagement.ThreadManagementService)({
-              getThreadShell: (threadId) =>
-                Effect.succeed(
-                  liveThreadShell(threadId, { activeRunId: active ? undefined : null }),
-                ),
-              getThreadRecords: (threadId) => {
-                const projection = idleThreadProjection(liveThreadShell(threadId));
-                return Effect.succeed({
-                  ...projection,
-                  thread: {
-                    ...projection.thread,
-                    archivedAt: archived ? projection.updatedAt : null,
-                    deletedAt: deleted ? projection.updatedAt : null,
-                  },
-                  runs: active
-                    ? [
-                        {
-                          ordinal: 1,
-                          status: "running",
-                          providerInstanceId: ProviderInstanceId.make("codex"),
-                        },
-                      ]
-                    : [],
-                } as unknown as OrchestrationV2ThreadProjection);
-              },
-            }),
-            Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
-            Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
-              list: () => Effect.succeed([]),
-            }),
-            Layer.mock(ProjectService.ProjectService)({}),
-            Layer.mock(SecretRequests.SecretRequests)({}),
-            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
-          ),
+    Service.layer.pipe(
+      Layer.provide(BridgetTestSessions.layer),
+      Layer.provide(Layer.mock(TestGit.GitVcsDriver)({})),
+      Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
+      Layer.provide(Layer.mock(TestLaunch.ThreadLaunchService)({})),
+      Layer.provide(Layer.mock(TestSettings.ServerSettingsService)({})),
+      Layer.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: (threadId) =>
+              Effect.succeed(liveThreadShell(threadId, active ? {} : { activeRunId: null })),
+            getThreadRecords: (threadId) => {
+              const projection = idleThreadProjection(liveThreadShell(threadId));
+              return Effect.succeed({
+                ...projection,
+                thread: {
+                  ...projection.thread,
+                  archivedAt: archived ? projection.updatedAt : null,
+                  deletedAt: deleted ? projection.updatedAt : null,
+                },
+                runs: active
+                  ? [
+                      {
+                        ordinal: 1,
+                        status: "running",
+                        providerInstanceId: ProviderInstanceId.make("codex"),
+                      },
+                    ]
+                  : [],
+              } as unknown as OrchestrationV2ThreadProjection);
+            },
+          }),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
         ),
-      );
+      ),
+    );
 
   it.effect("keeps two sessions distinct even when their provider instance is shared", () =>
     clearMountedCredentials(

@@ -89,7 +89,7 @@ describe("SPEC148 Codex private MCP identity", () => {
         for (const readConfig of [
           () => Effect.fail("private failure"),
           () => Effect.succeed({ config: { mcp_servers: false } }),
-          () => Effect.succeed(undefined),
+          () => Effect.void,
         ]) {
           assert.equal(yield* prepareCodexBridgetMcp({ ...f, readConfig }), undefined);
         }

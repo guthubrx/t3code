@@ -106,6 +106,14 @@ vi.mock("../../lib/useUniwindTheme", () => ({
 vi.mock("../settings/appearance/AppearancePreferencesProvider", () => ({
   useAppearancePreferences: () => ({ appearance: { baseFontSize: 18 } }),
 }));
+vi.mock("../../components/ui/Button", () => ({
+  Button: (props: { label: string; onPress: () => void; disabled?: boolean }) =>
+    createElement(
+      "button",
+      { type: "button", disabled: props.disabled, onClick: props.onPress },
+      props.label,
+    ),
+}));
 vi.mock("expo-crypto", () => ({
   randomUUID: () => `mobile-test-request-${++uuidCalls.count}`,
 }));

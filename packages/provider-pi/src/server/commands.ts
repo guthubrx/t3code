@@ -3,7 +3,7 @@ import * as Predicate from "effect/Predicate";
 import { PI_DELEGATION_POLICY_COMMAND } from "./mcpExtensionSource.ts";
 
 // Pi RPC get_commands omits TUI builtins. Advertise /compact so T3 can map it to RPC compact.
-export const PI_COMPACT_SLASH_COMMAND: ServerProviderSlashCommand = {
+const PI_COMPACT_SLASH_COMMAND: ServerProviderSlashCommand = {
   name: "compact",
   description: "Summarize the conversation and reduce context usage",
   input: { hint: "Optional instructions" },

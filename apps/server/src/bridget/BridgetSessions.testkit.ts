@@ -9,4 +9,7 @@ export const layer = Layer.succeed(Sessions.McpProviderSessions, {
   set: (config) => Effect.sync(() => Legacy.setMcpProviderSession(config)),
   read: (threadId) => Effect.sync(() => Legacy.readMcpProviderSession(threadId)),
   clear: (threadId) => Effect.sync(() => Legacy.clearMcpProviderSession(threadId)),
+  recordHtmlRender: () => Effect.void,
+  // @effect-diagnostics-next-line effectSucceedWithVoid:off -- The optional reference requires undefined rather than void.
+  takeHtmlRender: () => Effect.succeed(undefined),
 });

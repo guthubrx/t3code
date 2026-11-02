@@ -128,11 +128,12 @@ function makeHarness() {
       update: () => Effect.die("unused"),
       delete: () => Effect.die("unused"),
       getById: (id: ProjectId) =>
-        Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
-      getByWorkspaceRoot: () => Effect.succeed(Option.some(project)),
+        id === projectId ? Effect.succeedSome(project) : Effect.succeedNone,
+      getByWorkspaceRoot: () => Effect.succeedSome(project),
       snapshot: Effect.die("unused"),
       getShell: () => Effect.die("unused"),
       listShells: () => Effect.die("unused"),
+      listPage: () => Effect.die("unused"),
     }),
     Layer.mock(GitWorkflow.GitWorkflowService)({
       createWorktree,
@@ -156,7 +157,7 @@ function makeHarness() {
     ProviderRegistryMock.layer([] as ReadonlyArray<ServerProvider>),
     Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
       namedProjectsRoot: "/projects",
-      folderForThread: () => Effect.succeed(Option.none()),
+      folderForThread: () => Effect.succeedNone,
     }),
   );
   const layerLaunch = ThreadLaunch.layer.pipe(

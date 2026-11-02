@@ -105,7 +105,7 @@ const metadataPolicy = Effect.fn("ClaudeMcp.metadataPolicy")(function* (
       .pipe(
         Effect.catch((error) =>
           error.reason._tag === "NotFound"
-            ? Effect.succeed(undefined)
+            ? Effect.void
             : Effect.fail("metadata_unavailable" as const),
         ),
       );
@@ -185,7 +185,7 @@ export const prepareClaudeMcp = Effect.fn("prepareClaudeMcp")(function* (input: 
     Effect.tryPromise({ try: run, catch: () => new ClaudeMcpError({ code: "sdk_failed" }) });
   const preparation = Effect.gen(function* () {
     const policy = yield* metadataPolicy(input.config, input.cwd, input.environment).pipe(
-      Effect.catch(() => Effect.succeed("metadata_unavailable" as MetadataCode)),
+      Effect.orElseSucceed(() => "metadata_unavailable" as MetadataCode),
     );
     if (typeof policy === "string") return { code: policy };
     const current = yield* sdk(() => input.query.mcpServerStatus());

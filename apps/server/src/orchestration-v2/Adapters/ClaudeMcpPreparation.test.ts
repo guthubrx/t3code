@@ -1,3 +1,4 @@
+import * as PortScanner from "../../preview/PortScanner.ts";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
@@ -32,6 +33,7 @@ const fixture = Effect.gen(function* () {
   const runner = yield* ClaudeAdapter.ClaudeAgentSdkQueryRunner.pipe(
     Effect.provide(
       ClaudeAdapter.layerQueryRunner.pipe(
+        Layer.provide(PortScanner.layerTest),
         Layer.provide(Layer.succeed(HostProcessEnvironment, environment)),
         Layer.provide(
           Layer.succeed(
