@@ -2788,6 +2788,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           return yield* new ProjectionStoreThreadNotFoundError({ threadId });
         }
 
+        const userMessagesOnly =
+          filter?.messageRoles?.length === 1 && filter.messageRoles[0] === "user";
+
         const boundedTurnItemRows =
           (fields !== undefined && !fields.includes("turnItems")) ||
           (window === undefined &&
@@ -2797,6 +2800,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ? yield* sql<PayloadRow>`
                 SELECT payload_json
                 FROM orchestration_v2_projection_turn_items
+                  ${filter?.turnItemTypes === undefined ? sql`` : sql`INDEXED BY orchestration_v2_projection_turn_items_command_idx`}
                 WHERE thread_id = ${threadId}
                   ${filter?.turnItemTypes === undefined ? sql`` : sql`AND type IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemTypes)}))`}
                   ${filter?.turnItemStatuses === undefined ? sql`` : sql`AND status IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemStatuses)}))`}
@@ -3002,6 +3006,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               SELECT value FROM json_each(${cohortJson("nodeId")})
               UNION
               SELECT node_id FROM orchestration_v2_projection_nodes
+                INDEXED BY orchestration_v2_projection_nodes_live_idx
               WHERE thread_id = ${threadId} AND status IN ('pending','starting','running','waiting')
               UNION
               SELECT root_node_id FROM orchestration_v2_projection_run_attempts
@@ -3105,6 +3110,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ? sql<PayloadRow>`
             SELECT payload_json
             FROM orchestration_v2_projection_nodes AS node
+              ${filter?.omitSettledLeafNodes === true ? sql`INDEXED BY orchestration_v2_projection_nodes_command_idx` : sql``}
             WHERE node.thread_id = ${threadId}
               ${
                 filter?.omitSettledLeafNodes === true
@@ -3243,9 +3249,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             : window === undefined
               ? sql<PayloadRow>`
                 SELECT payload_json FROM orchestration_v2_projection_messages
+                  ${userMessagesOnly ? sql`INDEXED BY orchestration_v2_projection_messages_latest_user_idx` : sql``}
                 WHERE thread_id = ${threadId}
                   ${filter?.messageIds === undefined ? sql`` : sql`AND message_id IN (SELECT value FROM json_each(${encodeIdList(filter.messageIds)}))`}
-                  ${filter?.messageRoles === undefined ? sql`` : sql`AND role IN (SELECT value FROM json_each(${encodeIdList(filter.messageRoles)}))`}
+                  ${userMessagesOnly ? sql`AND role = 'user'` : filter?.messageRoles === undefined ? sql`` : sql`AND role IN (SELECT value FROM json_each(${encodeIdList(filter.messageRoles)}))`}
                   ${filter?.messageRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.messageRunIds)}))`}
                 ORDER BY created_at ASC, message_id ASC
               `
@@ -3388,10 +3395,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         const messageOrdinals = new Map<string, number>();
         if (fields !== undefined && fields.includes("messages") && messages.length > 1) {
           const rows = yield* sql<{ message_id: string; ordinal: number }>`
-            SELECT json_extract(payload_json, '$.messageId') AS message_id, MIN(ordinal) AS ordinal
-            FROM orchestration_v2_projection_turn_items
-            WHERE thread_id = ${threadId} AND type IN ('user_message', 'assistant_message')
-            GROUP BY json_extract(payload_json, '$.messageId')
+            SELECT selected.value AS message_id, MIN(item.ordinal) AS ordinal
+            FROM json_each(${encodeIdList(messages.map((message) => message.id))}) AS selected
+            CROSS JOIN orchestration_v2_projection_turn_items AS item
+              INDEXED BY orchestration_v2_projection_turn_items_message_order_idx
+            WHERE item.thread_id = ${threadId}
+              AND json_extract(item.payload_json, '$.messageId') = selected.value
+              AND item.type IN ('user_message', 'assistant_message')
+            GROUP BY selected.value
           `;
           for (const row of rows) messageOrdinals.set(row.message_id, row.ordinal);
         }

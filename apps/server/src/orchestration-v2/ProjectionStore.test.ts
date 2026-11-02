@@ -1215,7 +1215,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       );
       assert.match(
         windowPlan.map((row) => row.detail).join("\n"),
-        /SEARCH item USING INDEX orchestration_v2_projection_turn_items_user_message_idx \(thread_id=\? AND ordinal<\?\)/,
+        /SEARCH item USING INDEX orchestration_v2_projection_turn_items_command_idx \(thread_id=\? AND type=\? AND ordinal<\?\)/,
       );
       const topLevel = windowPlan.filter((row) => row.parent === 0).map((row) => row.detail);
       assert.include(topLevel, "SEARCH item USING INTEGER PRIMARY KEY (rowid=?)");
@@ -6094,3 +6094,72 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 });
+
+it.effect("orders only the selected messages without hydrating historical message bodies", () =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = yield* addRolledBackRecoveryCandidate("selected-message-order");
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const ids = ["order:z-first", "order:a-second", "order:b-without-item"];
+    for (const id of ids) {
+      const payload = JSON.stringify({
+        createdBy: "user",
+        creationSource: "web",
+        id,
+        threadId,
+        runId: null,
+        nodeId: null,
+        role: "user",
+        text: id,
+        attachments: [],
+        streaming: false,
+        createdAt: now,
+        updatedAt: now,
+      });
+      yield* sql`INSERT INTO orchestration_v2_projection_messages
+        (message_id,thread_id,run_id,node_id,role,streaming,created_at,updated_at,payload_json)
+        VALUES (${id},${threadId},NULL,NULL,'user',0,${now},${now},${payload})`;
+    }
+    for (const [id, messageId, ordinal, scope] of [
+      ["first", ids[0]!, 10, threadId],
+      ["first-duplicate", ids[0]!, 1, threadId],
+      ["second", ids[1]!, 4, threadId],
+      ["foreign", ids[1]!, 0, "thread:foreign"],
+    ] as const) {
+      yield* sql`INSERT INTO orchestration_v2_projection_turn_items
+        (turn_item_id,thread_id,run_id,node_id,provider_thread_id,provider_turn_id,
+          type,status,ordinal,updated_at,payload_json)
+        VALUES (${id},${scope},NULL,NULL,NULL,NULL,'user_message','completed',${ordinal},${now},
+          ${JSON.stringify({ messageId })})`;
+    }
+    const queries: Array<string> = [];
+    const record: Statement.Transformer = (statement) => {
+      queries.push(statement.compile()[0]);
+      return Effect.succeed(statement);
+    };
+    const records = yield* store
+      .getThreadRecords(threadId, ["messages"], { messageRoles: ["user"] })
+      .pipe(Effect.provideService(Statement.CurrentTransformer, record));
+    assert.deepEqual(
+      records.messages.map((message) => message.id),
+      ids,
+    );
+    const messageQuery = queries.find((query) =>
+      query.includes("FROM orchestration_v2_projection_messages"),
+    );
+    assert.ok(messageQuery);
+    const messagePlan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${messageQuery}`);
+    assert.include(
+      messagePlan.map((row) => row.detail),
+      "SEARCH orchestration_v2_projection_messages USING INDEX orchestration_v2_projection_messages_latest_user_idx (thread_id=?)",
+    );
+    const lookup = queries.find((query) => query.includes("MIN(item.ordinal)"));
+    assert.ok(lookup);
+    const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${lookup}`);
+    assert.match(
+      plan.map((row) => row.detail).join("\n"),
+      /SEARCH item USING INDEX orchestration_v2_projection_turn_items_message_order_idx \(thread_id=\? AND <expr>=\?\)/,
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
