@@ -382,6 +382,54 @@ describe("SPEC169 R2 Claude actual MCP preparation", () => {
   });
   const withNode = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, PortScanner.layerTest)));
+  it.effect("attests built-in device instructions while refusing other hooks", () =>
+    Effect.scoped(
+      withNode(
+        Effect.gen(function* () {
+          const harness = yield* makeHarness(["mounted", "mounted", "mounted"]);
+          const input = harness.input(false);
+          const options = ClaudeAdapterV2.makeClaudeQueryOptions({
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            nativeThreadId: "native-private169",
+            resume: false,
+            cwd: input.options.cwd ?? null,
+            ...(input.options.env === undefined ? {} : { environment: input.options.env }),
+            permissionMode: "bypassPermissions",
+            canUseTool: vi.fn(),
+            ...(input.options.mcpServers === undefined
+              ? {}
+              : { mcpServers: input.options.mcpServers }),
+            deviceToolsAvailable: true,
+          });
+          assert.isDefined(options.hooks?.SubagentStart);
+          const session = yield* harness.runner.open({ ...input, options });
+          const permissions = session.bridgetPermissionInputs;
+          assert.isDefined(permissions);
+          if (permissions === undefined) return;
+          assert.equal(yield* Effect.promise(permissions.verify), true);
+          const changed = yield* harness.runner.open({
+            ...input,
+            options: { ...options, hooks: { SubagentStart: [{ hooks: [vi.fn()] }] } },
+          });
+          assert.isUndefined(changed.bridgetPermissionInputs);
+          const mixed = yield* harness.runner.open({
+            ...input,
+            options: {
+              ...options,
+              hooks: { ...options.hooks, PreToolUse: [{ hooks: [vi.fn()] }] },
+            },
+          });
+          assert.isUndefined(mixed.bridgetPermissionInputs);
+          const matcher = options.hooks?.SubagentStart?.[0];
+          assert.isDefined(matcher);
+          if (matcher === undefined) return;
+          matcher.hooks.push(vi.fn());
+          assert.equal(yield* Effect.promise(permissions.verify), false);
+        }),
+      ),
+    ),
+  );
+
   it.effect.each([
     ["mounted", false],
     ["mounted", true],

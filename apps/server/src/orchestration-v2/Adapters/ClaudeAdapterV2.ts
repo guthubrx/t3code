@@ -750,7 +750,7 @@ async function captureClaudeLaunchContext(
       (options.executableArgs?.length ?? 0) > 0 ||
       options.projectConfigRoot !== undefined ||
       (options.plugins?.length ?? 0) > 0 ||
-      options.hooks !== undefined
+      !claudePermissionHooksRepresented(options.hooks)
     )
       return undefined;
     if (env.BASH_ENV || env.ENV || Object.keys(env).some((key) => key.startsWith("BASH_FUNC_")))
@@ -1425,7 +1425,7 @@ export const makeQueryRunnerLayer = (
               input.options.permissionPromptToolName === undefined &&
               input.options.permissionPrompts === undefined &&
               input.options.spawnClaudeCodeProcess === undefined &&
-              input.options.hooks === undefined &&
+              claudePermissionHooksRepresented(input.options.hooks) &&
               claudePermissionFlagsRepresented(permissionOptions);
             permissionSettings = yield* Effect.try(() =>
               claudeSanitarySettings(permissionOptions.settings),
@@ -1700,15 +1700,16 @@ export const makeQueryRunnerLayer = (
                       ...(finalLaunch === undefined ? {} : { launch_context: finalLaunch }),
                     },
                     verify: async () =>
-                      finalLaunch === undefined ||
-                      JSON.stringify(
-                        await captureClaudeLaunchContext(
-                          permissionOptions,
-                          resolvePermissionExecutable,
-                          permissionPlatform,
-                          appliedPermissionSettings,
-                        ),
-                      ) === launchSnapshot,
+                      claudePermissionHooksRepresented(permissionOptions.hooks) &&
+                      (finalLaunch === undefined ||
+                        JSON.stringify(
+                          await captureClaudeLaunchContext(
+                            permissionOptions,
+                            resolvePermissionExecutable,
+                            permissionPlatform,
+                            appliedPermissionSettings,
+                          ),
+                        ) === launchSnapshot),
                   };
             yield* logProtocolEvent({
               direction: "outgoing",
@@ -2059,6 +2060,20 @@ const subagentDeviceInstructions: HookCallback = () =>
       additionalContext: T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH,
     },
   });
+
+// Only this callback adds prompt context without deciding or changing permissions.
+function claudePermissionHooksRepresented(hooks: ClaudeAgentSdkQueryOptions["hooks"]): boolean {
+  if (hooks === undefined) return true;
+  const matcher = hooks.SubagentStart?.[0];
+  return (
+    Object.keys(hooks).length === 1 &&
+    hooks.SubagentStart?.length === 1 &&
+    matcher !== undefined &&
+    Object.keys(matcher).length === 1 &&
+    matcher.hooks.length === 1 &&
+    matcher.hooks[0] === subagentDeviceInstructions
+  );
+}
 
 export function makeClaudeQueryOptions(input: {
   readonly modelSelection: ModelSelection;
