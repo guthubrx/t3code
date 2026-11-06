@@ -217,9 +217,8 @@ describe("SPEC147 Claude MCP policy", () => {
       }).pipe(Effect.provide(NodeServices.layer)),
     ),
   );
-  (process.env.BRIDGET_147_CLAUDE_METADATA_COMMAND ? it.live : it.live.skip)(
-    "private native Claude root metadata proof without a model",
-    () =>
+  if (process.env.BRIDGET_147_CLAUDE_METADATA_COMMAND)
+    it.live("private native Claude root metadata proof without a model", () =>
       Effect.scoped(
         Effect.gen(function* () {
           const f = yield* fixture();
@@ -278,7 +277,7 @@ describe("SPEC147 Claude MCP policy", () => {
           assert.equal(evidence[1]?.rc, 0);
         }).pipe(Effect.provide(NodeServices.layer)),
       ),
-  );
+    );
   it.effect("mounts stdio with private session identity and preserves t3-code", () =>
     Effect.scoped(
       Effect.gen(function* () {

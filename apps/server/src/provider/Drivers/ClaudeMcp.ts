@@ -7,7 +7,6 @@ import type {
 import type { ClaudeSettings } from "@t3tools/contracts";
 import { Platform as HostProcessPlatform } from "@t3tools/shared/HostProcess";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
-import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -17,9 +16,9 @@ import type { McpProviderSessionConfig } from "@t3tools/provider-core/server/mcp
 import { resolveClaudeHomePath } from "./ClaudeHome.ts";
 import { claudeSettingsPaths, findRepositoryRoot } from "./ClaudeSettingsPaths.ts";
 
-export class ClaudeMcpError extends Data.TaggedError("ClaudeMcpError")<{
-  readonly code: "sdk_failed" | "timeout" | "catalogue_unavailable";
-}> {}
+export class ClaudeMcpError extends Schema.TaggedError<ClaudeMcpError>()("ClaudeMcpError", {
+  code: Schema.Literals(["sdk_failed", "timeout", "catalogue_unavailable"]),
+}) {}
 
 export const CLAUDE_BRIDGET_READ_ONLY_TOOLS = [
   "mcp__bridget__bridget_capabilities",
@@ -144,15 +143,7 @@ const metadataPolicy = Effect.fn("ClaudeMcp.metadataPolicy")(function* (
   return definitions;
 });
 
-/**
- * Startup/cold path for a new or resumed candidate, while its user prompt queue is empty.
- * Metadata scopes are a fixed set, with a 4 MiB/file stat guard; ancestor discovery
- * scales with cwd depth. Local work is linear in the metadata bytes and SDK
- * catalogue/config entries inspected or copied, plus executable path lookup (not O(1)).
- * At most four SDK controls run under one 6-second preparation deadline.
- * SDK promises may outlive that deadline; the caller owns candidate closure and
- * must prevent publication or prompts after failed/interrupted preparation.
- */
+// Prepare the empty candidate under one deadline; its caller owns closure on failure.
 export const prepareClaudeMcp = Effect.fn("prepareClaudeMcp")(function* (input: {
   readonly query: {
     readonly mcpServerStatus: () => Promise<McpServerStatus[]>;

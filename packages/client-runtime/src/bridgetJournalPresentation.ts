@@ -1,7 +1,7 @@
 import type { BridgetJournalEvent, BridgetLineageJournal } from "@t3tools/contracts";
 
 /** The native stream is bounded before it reaches this pure presentation layer. */
-export const BRIDGET_JOURNAL_WINDOW = 4_096;
+const BRIDGET_JOURNAL_WINDOW = 4_096;
 export const BRIDGET_JOURNAL_MAX_GAPS = 64;
 
 export type BridgetJournalGap = NonNullable<BridgetLineageJournal["gap"]>;
@@ -54,10 +54,7 @@ function sameJsonValue(left: unknown, right: unknown): boolean {
   );
 }
 
-export function sameBridgetJournalEvent(
-  left: BridgetJournalEvent,
-  right: BridgetJournalEvent,
-): boolean {
+function sameBridgetJournalEvent(left: BridgetJournalEvent, right: BridgetJournalEvent): boolean {
   return (
     left === right ||
     (left.v === right.v &&
@@ -122,14 +119,7 @@ function sameGap(left: BridgetJournalGap, right: BridgetJournalGap): boolean {
   );
 }
 
-/**
- * Gap markers are ephemeral client state. When more than 64 still intersect
- * the live window, one conservative interval keeps the projection from joining
- * text across an unknown boundary instead of silently forgetting it. Partial
- * reconnect snapshots merge with retained continuity rather than replacing it.
- * Scanning and copying k incoming markers costs O(k * (64 + k)) before pruning;
- * the retained history never exceeds 64 markers.
- */
+// Coalesce overflowing gaps to preserve unknown boundaries within a bounded window.
 export function retainBridgetJournalGaps(
   previous: BridgetJournalGapState,
   incoming: BridgetJournalGap | ReadonlyArray<BridgetJournalGap> | null,
@@ -137,10 +127,10 @@ export function retainBridgetJournalGaps(
   incomingContinuityCut: BridgetJournalContinuityCut | null = null,
 ): BridgetJournalGapState {
   const incomingGaps = incoming === null ? [] : "from_seq" in incoming ? [incoming] : incoming;
-  const withIncoming = incomingGaps.reduce<ReadonlyArray<BridgetJournalGap>>(
-    (gaps, gap) => (gaps.some((current) => sameGap(current, gap)) ? gaps : [...gaps, gap]),
-    previous.gaps,
-  );
+  const withIncoming = [...previous.gaps];
+  for (const gap of incomingGaps) {
+    if (!withIncoming.some((current) => sameGap(current, gap))) withIncoming.push(gap);
+  }
   const gaps =
     firstRetainedSeq === null
       ? withIncoming

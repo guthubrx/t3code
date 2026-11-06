@@ -227,15 +227,7 @@ export function generateSpreadPinOrderKeys(count: number): string[] {
   return keys;
 }
 
-/**
- * Assignments needed to realize a new pinned order. When the moved thread
- * sits between two keyed (or absent) neighbors, this is a single write to
- * the moved thread. When a neighbor is keyless (threads pinned before
- * reordering shipped), the whole section gets fresh spread keys — a
- * one-time materialization; every move after that is single-write. Active
- * reordering uses the same planner with activeOrderKey values. A selected
- * block receives keys between its unchanged neighbors in one planning pass.
- */
+// Keyless sections need spread keys once; later moves update only the moved block.
 export function planPinnedReorder(input: {
   readonly orderedIds: readonly string[];
   /** Include retained keys from hidden rows; only orderedIds receive writes. */

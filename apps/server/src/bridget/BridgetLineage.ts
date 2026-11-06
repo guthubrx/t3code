@@ -13,7 +13,7 @@ import {
   type BridgetLineageJournalInput,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -41,8 +41,8 @@ export class BridgetLineage extends Context.Service<
 const make = Effect.gen(function* () {
   const reader = yield* BridgetReader.BridgetReader;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
-  const crypto = yield* Crypto.Crypto;
-  const commandId = crypto.randomUUIDv4().pipe(
+  const crypto = yield* SecureRandom.SecureRandom;
+  const commandId = crypto.uuidV4().pipe(
     Effect.map((id) => CommandId.make(`bridget-lineage:${id}`)),
     Effect.orDie,
   );
@@ -111,13 +111,15 @@ const make = Effect.gen(function* () {
       .pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })));
     return snapshot;
   });
-  const read = (
-    input: BridgetLineageReadInput,
-  ): Effect.Effect<BridgetLineageView, BridgetLineageError> =>
-    Effect.gen(function* () {
+  const read = Effect.fn("BridgetLineage.read")(
+    function* (
+      input: BridgetLineageReadInput,
+    ): Effect.fn.Return<BridgetLineageView, BridgetLineageError> {
       if (input.action === "list") return yield* synchronize(input);
       return yield* reader.lineageRead(input);
-    }).pipe(Effect.tapError((error) => observeFailure(input, error)));
+    },
+    (effect, input) => effect.pipe(Effect.tapError((error) => observeFailure(input, error))),
+  );
   const watch = (
     input: BridgetLineageWatchInput,
   ): Stream.Stream<BridgetWatchEvent, BridgetLineageError> =>

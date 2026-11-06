@@ -32,6 +32,18 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import { resolveBridgetExecutable } from "./BridgetExecutable.ts";
 
+const decodeLineageDetail = Schema.decodeUnknownEffect(BridgetLineageDetail, {
+  onExcessProperty: "error",
+});
+const decodeLineageJournal = Schema.decodeUnknownEffect(BridgetLineageJournal, {
+  onExcessProperty: "error",
+});
+const decodeBridgetWatch = Schema.decodeUnknownEffect(BridgetWatchEvent, {
+  onExcessProperty: "error",
+});
+const decodeLineageCancel = Schema.decodeUnknownEffect(BridgetLineageCancelResult, {
+  onExcessProperty: "error",
+});
 const decodeLineageSnapshot = Schema.decodeUnknownEffect(BridgetLineageSnapshot, {
   onExcessProperty: "error",
 });
@@ -601,9 +613,9 @@ const make = Effect.gen(function* () {
       args.push("--after-seq", String(input.afterSeq));
     const raw = yield* runLineage(args, input.action === "show" ? 24 * 1024 : journalEnvelopeBytes);
     if (input.action === "show") {
-      const detail = yield* Schema.decodeUnknownEffect(BridgetLineageDetail, {
-        onExcessProperty: "error",
-      })(raw).pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })));
+      const detail = yield* decodeLineageDetail(raw).pipe(
+        Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+      );
       const resultBytes = Buffer.byteLength(detail.result ?? "", "utf8");
       if (
         detail.version !== responseVersion ||
@@ -617,9 +629,9 @@ const make = Effect.gen(function* () {
         return yield* new BridgetLineageError({ code: "invalid_output" });
       return detail;
     }
-    const journal = yield* Schema.decodeUnknownEffect(BridgetLineageJournal, {
-      onExcessProperty: "error",
-    })(raw).pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })));
+    const journal = yield* decodeLineageJournal(raw).pipe(
+      Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+    );
     return yield* validateJournal(journal, input.taskId, input.afterSeq ?? 0);
   });
   const lineageRead = (input: Exclude<BridgetLineageReadInput, { readonly action: "list" }>) =>
@@ -643,9 +655,9 @@ const make = Effect.gen(function* () {
       ],
       4096,
     );
-    const receipt = yield* Schema.decodeUnknownEffect(BridgetLineageCancelResult, {
-      onExcessProperty: "error",
-    })(raw).pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })));
+    const receipt = yield* decodeLineageCancel(raw).pipe(
+      Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+    );
     if (receipt.task_id !== input.taskId)
       return yield* new BridgetLineageError({ code: "invalid_output" });
     return receipt;
@@ -738,9 +750,7 @@ const make = Effect.gen(function* () {
         return lineageLines(input, ["watch"], 4096).pipe(
           Stream.mapEffect((raw) =>
             Effect.gen(function* () {
-              const event = yield* Schema.decodeUnknownEffect(BridgetWatchEvent, {
-                onExcessProperty: "error",
-              })(raw).pipe(
+              const event = yield* decodeBridgetWatch(raw).pipe(
                 Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
               );
               if (generation === undefined) {
@@ -785,9 +795,7 @@ const make = Effect.gen(function* () {
         ).pipe(
           Stream.mapEffect((raw) =>
             Effect.gen(function* () {
-              const journal = yield* Schema.decodeUnknownEffect(BridgetLineageJournal, {
-                onExcessProperty: "error",
-              })(raw).pipe(
+              const journal = yield* decodeLineageJournal(raw).pipe(
                 Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
               );
               yield* validateJournal(journal, input.taskId, afterSeq);

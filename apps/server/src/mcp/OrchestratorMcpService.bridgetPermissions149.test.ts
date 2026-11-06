@@ -1,9 +1,9 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as BridgetTestSessions from "../bridget/BridgetSessions.testkit.ts";
 import * as TestGit from "../vcs/GitVcsDriver.ts";
 import * as TestLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as TestSettings from "../serverSettings.ts";
-import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -24,13 +24,6 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 import * as Service from "./OrchestratorMcpService.ts";
-
-// Spec 149 (permissions lineage). `sessionIdentity` is the only reader of the
-// private permission facts: identity-only v1 while no valid fact exists for
-// the live run, v2 with the bound permissions once a fact is published for the
-// credential mounted on the calling thread. Every failure path collapses to
-// the same closed refusal; none of them downgrade a tombstone back to v1 and
-// none of them echo source material (credential, endpoint or policy detail).
 
 const scope = (): McpInvocationScope => ({
   environmentId: EnvironmentId.make("environment:bridget"),
@@ -105,7 +98,7 @@ const layer = (
     Layer.provide(Layer.mock(TestSettings.ServerSettingsService)({})),
     Layer.provide(
       Layer.mergeAll(
-        NodeServices.layer,
+        Layer.mergeAll(NodeServices.layer, NodeCrypto.layer),
         Layer.mock(ThreadManagement.ThreadManagementService)({ getThreadRecords: records }),
         Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
         Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({

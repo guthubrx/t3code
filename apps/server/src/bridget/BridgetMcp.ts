@@ -10,7 +10,7 @@ const isServer = Schema.is(Schema.Record(Schema.String, Schema.Json));
 const isEnvironment = Schema.is(Schema.Record(Schema.String, Schema.String));
 
 /** Private identity belongs to this MCP subprocess, never to the provider process. */
-export const bridgetMcpServer = Effect.fn("bridgetMcpServer")(function* (
+const bridgetMcpServer = Effect.fn("bridgetMcpServer")(function* (
   environment: NodeJS.ProcessEnv,
   session: McpProviderSessionConfig | undefined,
 ) {

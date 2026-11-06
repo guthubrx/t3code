@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -111,7 +112,7 @@ it.effect("prepares Bridget before publishing a V2 query and preserves T3 MCP", 
     assert.equal(f.close.mock.calls.length, 0);
     yield* session.close;
     assert.equal(f.close.mock.calls.length, 1);
-  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 );
 
 it.effect("closes a failed MCP candidate without publishing it", () =>
@@ -121,7 +122,7 @@ it.effect("closes a failed MCP candidate without publishing it", () =>
     const error = yield* f.open.pipe(Effect.flip);
     assert.equal(error._tag, "ClaudeAgentSdkQueryRunnerError");
     assert.equal(f.close.mock.calls.length, 1);
-  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 );
 
 it.effect("closes a preparation that exceeds its deadline", () =>
@@ -136,7 +137,7 @@ it.effect("closes a preparation that exceeds its deadline", () =>
     yield* TestClock.adjust("6 seconds");
     yield* Fiber.join(fiber).pipe(Effect.flip);
     assert.equal(f.close.mock.calls.length, 1);
-  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 );
 
 it.effect("closes an interrupted preparation before it can publish a query", () =>
@@ -150,5 +151,5 @@ it.effect("closes an interrupted preparation before it can publish a query", () 
     yield* Effect.promise(() => f.started.promise);
     yield* Fiber.interrupt(fiber);
     assert.equal(f.close.mock.calls.length, 1);
-  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 );

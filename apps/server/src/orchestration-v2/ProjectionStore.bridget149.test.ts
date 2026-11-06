@@ -1,11 +1,3 @@
-// Session 149 — server lineage lot (L). Oracles: getBridgetTaskThreads selects every
-// thread whose bridgetTaskRef points at the root, extends the result with explicit
-// candidates (cross-root candidates are returned by design), and refuses beyond 4096.
-// getSettlementCandidates never offers a virtual subagent thread.
-//
-// The virtual threads are seeded through the public projections.apply path with exactly
-// the events dispatchBridgetLineageSync would emit (provider instance id uses a
-// slug-valid stand-in because of the reported production bug at Orchestrator.ts:10210).
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { describe, expect, it } from "@effect/vitest";
 import {

@@ -1,11 +1,3 @@
-// Session 149 — server lineage lot (L). Oracles: a thread launch targeting a virtual
-// Bridget subagent thread is refused with operation "update-thread" before any worktree,
-// title or branch work happens, and the projection stays untouched; a plain launch on a
-// fresh thread still succeeds.
-//
-// The virtual thread is seeded through the public projections.apply path with exactly
-// the events dispatchBridgetLineageSync would emit (provider instance id uses a
-// slug-valid stand-in because of the reported production bug at Orchestrator.ts:10210).
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
@@ -20,7 +12,6 @@ import {
 import { describe, expect, it, vi } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";

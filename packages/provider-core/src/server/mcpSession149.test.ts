@@ -13,12 +13,6 @@ import {
   setMcpProviderSession,
 } from "./mcpSession.ts";
 
-// Spec 149 (permissions lineage). The permission fact registry is private and
-// keyed by the credential OBJECT: two configs with equal fields are different
-// credentials. A fact binds to the run, its attempt and its provider thread.
-// A tombstone (invalidate) must never downgrade an ended or invalid fact back
-// to identity-only, and a stale cleanup (wrong revision or wrong run) is a no-op.
-
 let nextThread = 0;
 const credential = (over: Record<string, unknown> = {}) => ({
   environmentId: "environment:bridget" as EnvironmentId,

@@ -1,9 +1,9 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
 import * as BridgetTestSessions from "../bridget/BridgetSessions.testkit.ts";
 import * as TestGit from "../vcs/GitVcsDriver.ts";
 import * as TestLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as TestSettings from "../serverSettings.ts";
-import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -73,7 +73,7 @@ describe("Bridget session attestation", () => {
       Layer.provide(Layer.mock(TestSettings.ServerSettingsService)({})),
       Layer.provide(
         Layer.mergeAll(
-          NodeServices.layer,
+          Layer.mergeAll(NodeServices.layer, NodeCrypto.layer),
           Layer.mock(ThreadManagement.ThreadManagementService)({
             getThreadShell: (threadId) =>
               Effect.succeed(liveThreadShell(threadId, active ? {} : { activeRunId: null })),

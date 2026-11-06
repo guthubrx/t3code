@@ -48,7 +48,7 @@ export function observeWrittenMcpSession(
 }
 
 /** Matches the existing Rust t3code::stable_uuid mapping, including its v4 presentation. */
-export const bridgetThreadUuid = (name: string): string => {
+const bridgetThreadUuid = (name: string): string => {
   const namespace = Buffer.from("098b71d3c0de4a119b1d73636f646501", "hex");
   const bytes = NodeCrypto.createHash("sha1")
     .update(namespace)

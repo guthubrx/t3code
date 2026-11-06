@@ -1,15 +1,4 @@
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
-// Session 149 — server lineage lot (L). Oracles: the virtual projection is provider-free,
-// the read-only guard protects it, thread.stop cancels natives through the real BridgetReader
-// without creating runs, and no transport means refusal with no fallback.
-//
-// t3149 FIXED by Sol: Orchestrator.ts:10212 now builds
-// `ProviderInstanceId.make(\`bridget-task-${task.task_id}\`)` — a synthetic instance
-// derived from the validated task UUID: slug-valid, injective per task, independent of
-// agent_type. lineage.md does not fix the native instance format, so the sync oracle
-// below asserts the chosen real format (slug rule, uniqueness, displayed native model,
-// no provider run) while guards, stop and markers stay provable through the public
-// projections.apply path seeded with the same exact shapes.
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { describe, expect, it } from "@effect/vitest";
 import {
@@ -1135,18 +1124,6 @@ describe("Orchestrator.bridget149 sync delta", () => {
   });
 });
 
-// Gap G5 (spec 149, T035). The three subagent origins meet four branches that
-// read `origin`: start (a message sent to the child thread), resume (startup
-// recovery), result delivery ("remise": the completion-delivery commands) and
-// the outbox (what a Stop enqueues and what its effect later executes). Every
-// cell below goes through the real producer (`delegated_task.request`,
-// `bridget.lineage.sync`, or the projection events the provider ingestor
-// writes for a provider-native subagent) and the real consumer
-// (`message.dispatch`, `ProviderRuntimeRecoveryService`, the delivery commands,
-// `run.interrupt` + `ThreadManagementService.stopDelegatedTasks`). The sinks
-// are SQL row counts and a counting dry provider, never a real auth or model:
-// `openSession` is never reached, and a `provider-turn.start` outbox row is
-// the only way a provider turn can start.
 type OriginName = "app_owned" | "provider_native" | "bridget_native";
 const ORIGINS: ReadonlyArray<OriginName> = ["app_owned", "provider_native", "bridget_native"];
 const providerNativeChildId = ThreadId.make("thread:provider-native-child-149");

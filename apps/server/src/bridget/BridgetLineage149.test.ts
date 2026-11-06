@@ -14,7 +14,7 @@ import {
   ThreadId,
   WS_METHODS,
 } from "@t3tools/contracts";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -172,16 +172,16 @@ const harness = Effect.fn("BridgetLineage149.harness")(function* (options: Harne
       }),
   } as unknown as Orchestrator.OrchestratorV2["Service"]);
 
-  const crypto = Crypto.Crypto.of({
-    randomUUIDv4: () => Effect.succeed(FIXED_UUID),
-  } as unknown as Crypto.Crypto);
+  const crypto = SecureRandom.SecureRandom.of({
+    uuidV4: () => Effect.succeed(FIXED_UUID),
+  } as unknown as SecureRandom.SecureRandom["Service"]);
 
   const lineage = yield* BridgetLineage.BridgetLineage.pipe(
     Effect.provide(
       BridgetLineage.layer.pipe(
         Layer.provide(Layer.succeed(BridgetReader.BridgetReader, reader)),
         Layer.provide(Layer.succeed(Orchestrator.OrchestratorV2, orchestrator)),
-        Layer.provide(Layer.succeed(Crypto.Crypto, crypto)),
+        Layer.provide(Layer.succeed(SecureRandom.SecureRandom, crypto)),
       ),
     ),
   );

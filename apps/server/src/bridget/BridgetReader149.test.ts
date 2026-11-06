@@ -1,3 +1,4 @@
+import * as Redacted from "effect/Redacted";
 // Session 149 — server lineage lot (L). Oracles from specs/149-sous-agents-lineage/contracts/lineage.md:
 // snapshot staging is atomic and bounded, refusals stay closed, and no free text becomes authority.
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -146,7 +147,12 @@ const harness = Effect.fn("BridgetReader149.harness")(function* (options: Harnes
     Effect.acquireRelease(
       Effect.sync(() => {
         if (command._tag !== "StandardCommand") throw new Error("unexpected shell command");
-        calls.push({ args: command.args, maxOutputBytes: -1 });
+        calls.push({
+          args: command.args.map((word) =>
+            typeof word === "string" ? word : Redacted.value(word),
+          ),
+          maxOutputBytes: -1,
+        });
         return ChildProcessSpawner.makeHandle({
           pid: ChildProcessSpawner.ProcessId(147),
           exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),

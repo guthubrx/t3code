@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import * as BridgetTestSessions from "../../bridget/BridgetSessions.testkit.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -27,7 +28,7 @@ import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexReplay from "effect-codex-app-server/replay";
-import * as Crypto from "effect/Crypto";
+import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -45,12 +46,6 @@ import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
 import { withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
 import { makeReplayServerConfig } from "../testkit/ProviderReplayHarness.ts";
 
-// Spec 149 (permissions lineage). The Claude runner captures a bounded launch
-// context (CLI digests, config sources) and only represents the provider
-// permission inputs when the whole permission surface is one the registry can
-// reason about. Everything here exercises the real query runner with the SDK
-// `query` call mocked; the fixture writes real files under a temp home.
-
 const sdk = vi.hoisted(() => ({ query: vi.fn() }));
 vi.mock("@anthropic-ai/claude-agent-sdk", async (original) => ({
   ...(await original<typeof import("@anthropic-ai/claude-agent-sdk")>()),
@@ -64,8 +59,8 @@ const toHex = (bytes: Uint8Array) =>
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
 const sha256 = (bytes: Uint8Array) =>
-  Effect.flatMap(Crypto.Crypto, (crypto) =>
-    Effect.map(crypto.digest("SHA-256", bytes), (digest) => `sha256:${toHex(digest)}`),
+  Effect.flatMap(Digest.Digest, (crypto) =>
+    Effect.map(crypto.digest(Digest.sha256, bytes), (digest) => `sha256:${toHex(digest)}`),
   );
 const encode = (text: string) => new TextEncoder().encode(text);
 
@@ -201,7 +196,7 @@ const withFixture = <E, R>(
   Effect.gen(function* () {
     const f = yield* makeFixture;
     yield* body(f).pipe(Effect.ensuring(f.cleanup));
-  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
 
 describe("Claude launch context capture (spec 149)", () => {
   it.effect("captures fresh CLI digests through the pinned launcher with PATH priority", () =>
@@ -560,8 +555,41 @@ const makeTurnInput = (input: {
   runtimePolicy: RUNTIME_POLICY,
 });
 
+const originalPublishPermissions = McpProviderSession.publishMcpProviderPermissions;
+const originalInvalidatePermissions = McpProviderSession.invalidateMcpProviderPermissions;
+const permissionChanges = Effect.gen(function* () {
+  const changes = yield* Queue.unbounded<void>();
+  const publishSpy = vi.spyOn(McpProviderSession, "publishMcpProviderPermissions");
+  const invalidateSpy = vi.spyOn(McpProviderSession, "invalidateMcpProviderPermissions");
+  const publish = publishSpy.getMockImplementation() ?? originalPublishPermissions;
+  const invalidate = invalidateSpy.getMockImplementation() ?? originalInvalidatePermissions;
+  yield* Effect.acquireRelease(
+    Effect.sync(() => [
+      vi
+        .spyOn(McpProviderSession, "publishMcpProviderPermissions")
+        .mockImplementation((...args) => {
+          const revision = publish(...args);
+          Queue.offerUnsafe(changes, undefined);
+          return revision;
+        }),
+      vi
+        .spyOn(McpProviderSession, "invalidateMcpProviderPermissions")
+        .mockImplementation((...args) => {
+          invalidate(...args);
+          Queue.offerUnsafe(changes, undefined);
+        }),
+    ]),
+    (spies) =>
+      Effect.sync(() => {
+        for (const spy of spies) spy.mockRestore();
+      }),
+  );
+  return changes;
+});
+
 const makePermissionHarness = (credentialOverrides: Record<string, unknown> = {}) =>
   Effect.gen(function* () {
+    const changes = yield* permissionChanges;
     const now = yield* DateTime.now;
     const threadId = ThreadId.make(
       `thread-perm-149-${credentialOverrides.providerInstanceId === "codex" ? "codex" : "claude"}`,
@@ -613,6 +641,10 @@ const makePermissionHarness = (credentialOverrides: Record<string, unknown> = {}
             ) as unknown as ClaudeAdapterV2.ClaudeAgentSdkQuerySession["messages"],
             offer: () => Effect.void,
             setModel: () => Effect.void,
+            mcpServerStatus: Effect.succeed([]),
+            readMcpResource: () => Effect.die("unused"),
+            callMcpTool: () => Effect.die("unused"),
+            listPermissionRules: Effect.succeed([]),
             applyFlagSettings: () => Effect.void,
             stopTask: () => Effect.void,
             backgroundTasks: () => Effect.succeed(false),
@@ -649,15 +681,14 @@ const makePermissionHarness = (credentialOverrides: Record<string, unknown> = {}
       predicate: (
         read: Awaited<ReturnType<typeof McpProviderSession.readMcpProviderPermissions>>,
       ) => boolean,
-      label: string,
+      _label: string,
     ) =>
       Effect.gen(function* () {
-        for (let attempt = 0; attempt < 300; attempt++) {
+        for (;;) {
           const current = yield* read();
           if (predicate(current)) return current;
-          yield* Effect.sleep("20 millis");
+          yield* Queue.take(changes);
         }
-        return yield* Effect.die(new Error(`permission fact did not reach ${label}`));
       });
     return {
       queue,
@@ -675,8 +706,6 @@ const makePermissionHarness = (credentialOverrides: Record<string, unknown> = {}
   });
 
 describe("Claude adapter permission publication (spec 149)", () => {
-  // Live clock: the pump and the registry run on real promises, so the
-  // polling waits need real time, not the it.effect TestClock.
   it.live("publishes on turn start, follows init and status modes and retires at turn end", () =>
     Effect.gen(function* () {
       const h = yield* makePermissionHarness();
@@ -760,7 +789,11 @@ describe("Claude adapter permission publication (spec 149)", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        Layer.mergeAll(IdAllocator.layer, NodeServices.layer, BridgetTestSessions.layer),
+        Layer.mergeAll(
+          IdAllocator.layer,
+          Layer.mergeAll(NodeServices.layer, NodeCrypto.layer),
+          BridgetTestSessions.layer,
+        ),
       ),
     ),
   );
@@ -773,24 +806,21 @@ describe("Claude adapter permission publication (spec 149)", () => {
         // The instance gate refuses: the refusal itself leaves a tombstone
         // for this run (invalidate without a fact records revision 0), so
         // the refused run can never become attestable afterwards.
-        yield* Effect.sleep("200 millis");
         const after = yield* h.read();
         assert.deepEqual(after, { status: "unavailable" });
       }).pipe(Effect.ensuring(h.cleanup));
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        Layer.mergeAll(IdAllocator.layer, NodeServices.layer, BridgetTestSessions.layer),
+        Layer.mergeAll(
+          IdAllocator.layer,
+          Layer.mergeAll(NodeServices.layer, NodeCrypto.layer),
+          BridgetTestSessions.layer,
+        ),
       ),
     ),
   );
 });
-
-// Part C: the Codex adapter publishes the final turn/start wire parameters
-// through the real replay app-server, for the credential mounted before the
-// session opened. The replay transcript replays a standard handoff; the point
-// is that the fact mirrors what the adapter sent, not the session defaults
-// the app-server reported back on thread/start.
 
 const DEFAULT_CODEX_SETTINGS = Schema.decodeSync(CodexSettings)({});
 const CODEX_MODEL_SELECTION: ModelSelection = {
@@ -1112,7 +1142,7 @@ describe("Codex adapter permission publication (spec 149)", () => {
           settings: DEFAULT_CODEX_SETTINGS,
           environment: {},
           clientFactory,
-          crypto: yield* Crypto.Crypto,
+          digest: yield* Digest.Digest,
           fileSystem,
           idAllocator: yield* IdAllocator.IdAllocatorV2,
           serverConfig,
@@ -1168,20 +1198,15 @@ describe("Codex adapter permission publication (spec 149)", () => {
     }).pipe(
       Effect.scoped,
       Effect.provide(
-        Layer.mergeAll(IdAllocator.layer, NodeServices.layer, BridgetTestSessions.layer),
+        Layer.mergeAll(
+          IdAllocator.layer,
+          Layer.mergeAll(NodeServices.layer, NodeCrypto.layer),
+          BridgetTestSessions.layer,
+        ),
       ),
     ),
   );
 });
-
-// Gap G3 (spec 149, T006). The positive publication above shows that the
-// fact mirrors the final turn/start parameters. The tests below prove the
-// other half of T006: the fact is retired when the real Codex app-server
-// path fails, when the turn ends and when the session closes, and a retire
-// owned by one run never removes the fact of another run or thread. A
-// retired fact reads as `unavailable` (tombstone), never as `absent` (which
-// would let a caller fall back to the identity-only v1 attestation) and never
-// as `valid`.
 
 const codexReplayTurn = (
   id: string,
@@ -1202,9 +1227,10 @@ const codexTurnCompleted = (input: {
   readonly nativeTurnId: string;
   readonly status: "completed" | "interrupted" | "failed";
   readonly afterMs?: number;
+  readonly label?: string;
 }): CodexReplay.CodexAppServerReplayEntry => ({
   type: "emit_inbound",
-  label: "turn/completed",
+  label: input.label ?? "turn/completed",
   ...(input.afterMs === undefined ? {} : { afterMs: input.afterMs }),
   frame: {
     method: "turn/completed",
@@ -1233,6 +1259,7 @@ const openCodexPermissionSession = (input: {
   readonly beforeEmitInbound?: CodexReplay.CodexAppServerReplayDriver["beforeEmitInbound"];
 }) =>
   Effect.gen(function* () {
+    const changes = yield* permissionChanges;
     const now = yield* DateTime.now;
     const threadId = ThreadId.make(`thread-perm-149-g3-${input.suffix}`);
     const credential = {
@@ -1251,9 +1278,10 @@ const openCodexPermissionSession = (input: {
       scenario: `perm-149-g3-${input.suffix}`,
       entries: input.entries,
     });
-    const driver = yield* CodexReplay.makeReplayDriver(transcript, {
-      ...(input.beforeEmitInbound ? { beforeEmitInbound: input.beforeEmitInbound } : {}),
-    });
+    const driver = yield* CodexReplay.makeReplayDriver(
+      transcript,
+      input.beforeEmitInbound ? { beforeEmitInbound: input.beforeEmitInbound } : {},
+    );
     const fileSystem = yield* FileSystem.FileSystem;
     const serverConfig = yield* makeReplayServerConfig(transcript.scenario).pipe(Effect.orDie);
     const clientFactory: CodexAdapterV2.CodexAppServerClientFactoryShape = {
@@ -1280,7 +1308,7 @@ const openCodexPermissionSession = (input: {
       settings: DEFAULT_CODEX_SETTINGS,
       environment: {},
       clientFactory,
-      crypto: yield* Crypto.Crypto,
+      digest: yield* Digest.Digest,
       fileSystem,
       idAllocator: yield* IdAllocator.IdAllocatorV2,
       serverConfig,
@@ -1311,12 +1339,11 @@ const openCodexPermissionSession = (input: {
       status: "valid" | "unavailable" | "absent",
     ) =>
       Effect.gen(function* () {
-        for (let attempt = 0; attempt < 300; attempt++) {
+        for (;;) {
           const current = yield* read(turnInput);
           if (current.status === status) return current;
-          yield* Effect.sleep("20 millis");
+          yield* Queue.take(changes);
         }
-        return yield* Effect.die(new Error(`permission fact did not reach ${status}`));
       });
     return {
       threadId,
@@ -1332,7 +1359,7 @@ const openCodexPermissionSession = (input: {
 
 const codexG3Layer = Layer.mergeAll(
   IdAllocator.layer,
-  NodeServices.layer,
+  Layer.mergeAll(NodeServices.layer, NodeCrypto.layer),
   BridgetTestSessions.layer,
 );
 
@@ -1392,7 +1419,6 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
           assert.equal(before.status, "valid");
           yield* h.waitForStatus(turnInput, "unavailable");
           // Settled and stable: it never falls back to valid or absent.
-          yield* Effect.sleep("100 millis");
           assert.deepEqual(yield* h.read(turnInput), { status: "unavailable" });
         }).pipe(Effect.ensuring(h.cleanup));
       }).pipe(Effect.scoped, Effect.provide(Layer.merge(codexG3Layer, BridgetTestSessions.layer))),
@@ -1425,6 +1451,7 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
   it.live("keeps the fact of a newer run when an older run on the same thread ends", () =>
     Effect.gen(function* () {
       const nativeThreadId = "native-g3-stale";
+      const finishNewer = yield* Deferred.make<void>();
       const preamble = codexReplayPreamble({
         nativeThreadId,
         nativeTurnId: "native-turn-g3-a",
@@ -1432,6 +1459,8 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
       });
       const h = yield* openCodexPermissionSession({
         suffix: "stale",
+        beforeEmitInbound: (entry) =>
+          entry.label === "finish-newer" ? Deferred.await(finishNewer) : Effect.void,
         entries: [
           ...preamble,
           // Run B starts while run A is still in flight; run A then ends.
@@ -1473,17 +1502,15 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
             nativeThreadId,
             nativeTurnId: "native-turn-g3-b",
             status: "completed",
-            afterMs: 600,
+            label: "finish-newer",
           }),
         ],
       });
       yield* Effect.gen(function* () {
-        const terminals: Array<string> = [];
+        const terminals = yield* Queue.unbounded<void>();
         yield* h.runtime.events.pipe(
           Stream.runForEach((event) =>
-            Effect.sync(() => {
-              if (event.type === "turn.terminal") terminals.push(event.type);
-            }),
+            event.type === "turn.terminal" ? Queue.offer(terminals, undefined) : Effect.void,
           ),
           Effect.forkScoped,
         );
@@ -1494,9 +1521,7 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
         yield* h.runtime.startTurn(turnB);
         // Run A's native completion is finalized (turn.terminal emitted after
         // the retire call) while run B's fact is still current.
-        for (let attempt = 0; attempt < 100 && terminals.length === 0; attempt++)
-          yield* Effect.sleep("20 millis");
-        assert.equal(terminals.length, 1, "run A must have been finalized");
+        yield* Queue.take(terminals);
         const readB = yield* h.read(turnB);
         assert.equal(readB.status, "valid");
         if (readB.status === "valid") {
@@ -1505,7 +1530,7 @@ describe("Codex adapter permission retirement (spec 149, T006 gap G3)", () => {
         }
         // Run A is no longer readable under its own binding.
         assert.deepEqual(yield* h.read(turnA), { status: "unavailable" });
-        // Run B's own completion finally retires it.
+        yield* Deferred.succeed(finishNewer, undefined);
         yield* h.waitForStatus(turnB, "unavailable");
       }).pipe(Effect.ensuring(h.cleanup));
     }).pipe(Effect.scoped, Effect.provide(Layer.merge(codexG3Layer, BridgetTestSessions.layer))),
