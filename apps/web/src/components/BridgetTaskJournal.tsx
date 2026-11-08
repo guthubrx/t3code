@@ -1,4 +1,4 @@
-import { observeResize } from "~/lib/observeResize";
+import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
 import { useStableCallback } from "../hooks/useStableCallback";
 import { useAtomValue } from "@effect/atom-react";
 import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
@@ -7,7 +7,7 @@ import {
   mergeJournalEvents,
   projectBridgetJournal,
   retainBridgetJournalGaps,
-  type BridgetJournalBlock,
+  type BridgetJournalProjection,
   type BridgetJournalConflict,
   type BridgetJournalContinuityCut,
   type BridgetJournalGap,
@@ -25,7 +25,7 @@ import type {
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
-import { memo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { orchestrationEnvironment } from "~/state/orchestration";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -35,9 +35,17 @@ import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 import { Button } from "~/components/ui/button";
 import { randomUUID } from "~/lib/utils";
 import { BridgetTaskPlacement } from "./chat/SubagentTooltipContent";
-import ChatMarkdown from "./ChatMarkdown";
 
 type Context = { environmentId: EnvironmentId; projectId: ProjectId; threadId: ThreadId };
+
+// Keep async cleanup outside render functions so the conversation can be compiled.
+async function withJournalCleanup<T>(operation: () => Promise<T>, cleanup: () => void): Promise<T> {
+  try {
+    return await operation();
+  } finally {
+    cleanup();
+  }
+}
 
 function useVisiblePage() {
   const [visible, setVisible] = useState(() => document.visibilityState !== "hidden");
@@ -121,88 +129,6 @@ const statusLabels = {
   cancelled: "Annulé",
 } as const;
 
-function rawPreview(event: BridgetJournalEvent): string | null {
-  return typeof event.payload === "string" ? event.payload : null;
-}
-
-const JournalDetails = memo(function JournalDetails({ block }: { block: BridgetJournalBlock }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <details
-      className="mt-2 text-xs text-muted-foreground"
-      onToggle={(event) => setOpen(event.currentTarget.open)}
-    >
-      <summary className="cursor-pointer select-none">
-        Détails techniques · #{block.firstSeq}–#{block.lastSeq}
-      </summary>
-      {open ? (
-        <div className="mt-2 space-y-2">
-          {block.conflicts.map((conflict) => (
-            <div key={`conflict:${conflict.seq}`} className="rounded border border-warning/40 p-2">
-              <p className="font-medium text-foreground">
-                Conflit de rejeu #{conflict.seq}
-                {conflict.additionalConflicts > 0
-                  ? ` · ${conflict.additionalConflicts + 1} occurrences conflictuelles`
-                  : ""}
-              </p>
-              <pre className="mt-1 whitespace-pre-wrap break-words">
-                {JSON.stringify(conflict.conflicting, null, 2)}
-              </pre>
-            </div>
-          ))}
-          {block.events.map((event) => (
-            <pre key={event.seq} className="whitespace-pre-wrap break-words">
-              {JSON.stringify(event, null, 2)}
-            </pre>
-          ))}
-        </div>
-      ) : null}
-    </details>
-  );
-});
-
-const JournalBlockView = memo(function JournalBlockView({ block }: { block: BridgetJournalBlock }) {
-  return (
-    <li className="border-b border-border/50 py-3" data-journal-seq={block.firstSeq}>
-      {block.excerpt ? (
-        <p className="mb-2 text-xs text-muted-foreground">
-          Extrait : le début de ce segment n’est pas chargé.
-        </p>
-      ) : null}
-      {block.kind === "text" ? (
-        <ChatMarkdown className="text-sm" cwd={undefined} inert text={block.content} />
-      ) : block.kind === "activity" ? (
-        <details className="rounded border bg-muted/30 px-3 py-2">
-          <summary className="cursor-pointer select-none text-sm font-medium">
-            {block.label}
-            {block.text ? ` · ${block.text}` : ""}
-          </summary>
-          <div className="mt-2 space-y-2 text-sm">
-            {block.detail ? <p>Détail : {block.detail}</p> : null}
-            {block.toolCallId ? <p>Identifiant d’appel : {block.toolCallId}</p> : null}
-            {block.exitCode !== null ? <p>Code de sortie : {block.exitCode}</p> : null}
-            {block.status ? <p>Statut : {block.status}</p> : null}
-            {block.state ? <p>État : {block.state}</p> : null}
-            {block.outputTail !== null ? (
-              <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-background p-2 text-xs">
-                {block.outputTail}
-              </pre>
-            ) : null}
-          </div>
-        </details>
-      ) : (
-        <details className="rounded border border-dashed px-3 py-2">
-          <summary className="cursor-pointer select-none text-sm">
-            {block.label}
-            {rawPreview(block.events[0]!) ? ` · ${rawPreview(block.events[0]!)} ` : ""}
-          </summary>
-        </details>
-      )}
-      <JournalDetails block={block} />
-    </li>
-  );
-});
-
 function JournalFollow({
   context,
   taskId,
@@ -242,13 +168,34 @@ export function BridgetTaskJournal({
   environmentId,
   thread,
   onOpenParent,
+  renderTimeline,
 }: {
   environmentId: EnvironmentId;
   thread: Pick<
     OrchestrationV2AppThread,
-    "bridgetTaskRef" | "bridgetTask" | "projectId" | "title" | "modelSelection" | "bridgetLineage"
+    | "id"
+    | "bridgetTaskRef"
+    | "bridgetTask"
+    | "projectId"
+    | "title"
+    | "modelSelection"
+    | "bridgetLineage"
   >;
   onOpenParent: (() => void) | null;
+  renderTimeline: (
+    projection: BridgetJournalProjection,
+    thread: Pick<
+      OrchestrationV2AppThread,
+      | "id"
+      | "bridgetTaskRef"
+      | "bridgetTask"
+      | "projectId"
+      | "title"
+      | "modelSelection"
+      | "bridgetLineage"
+    >,
+    result: string | null,
+  ) => ReactNode;
 }) {
   const ref = thread.bridgetTaskRef!;
   const task = thread.bridgetTask;
@@ -280,22 +227,9 @@ export function BridgetTaskJournal({
   const [reading, setReading] = useState(false);
   const [history, setHistory] = useState<BridgetLineageJournal | null>(null);
   const [historyAfterSeq, setHistoryAfterSeq] = useState<number | null>(null);
-  const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
-  const [bottomInset, setBottomInset] = useState(0);
   const lastSeq = useRef(0);
   const requests = useRef(new Set<AbortController>());
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- measures the real composer overlay and keeps journal scroll clearance in sync
-  useLayoutEffect(() => {
-    const overlay = scrollElement
-      ?.closest("[data-chat-canvas]")
-      ?.querySelector<HTMLElement>("[data-chat-composer-overlay]");
-    if (!overlay) return;
-    // The parent's read-only bar overlays this viewport, just like a composer.
-    // Reserve its measured height once, while keeping the normal journal gap.
-    const measure = () => setBottomInset(Math.max(0, overlay.getBoundingClientRect().height));
-    measure();
-    return observeResize(overlay, measure);
-  }, [scrollElement]);
+  const [showDetails, setShowDetails] = useState(false);
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- aborts native journal reads when the component unmounts
   useEffect(
     () => () => {
@@ -344,81 +278,87 @@ export function BridgetTaskJournal({
   const read = async (input: BridgetLineageReadInput) => {
     const controller = new AbortController();
     requests.current.add(controller);
-    try {
-      const response = await executeAtomQuery(
-        appAtomRegistry,
-        orchestrationEnvironment.bridgetLineageRead({ environmentId, input }),
-        { refresh: true, signal: controller.signal, reportFailure: false, reportDefect: false },
-      );
-      if (controller.signal.aborted) return null;
-      if (response._tag === "Failure") {
-        setFailure(failureMessage(response.cause));
-        return null;
-      }
-      return response.value;
-    } finally {
-      requests.current.delete(controller);
-    }
+    return withJournalCleanup(
+      async () => {
+        const response = await executeAtomQuery(
+          appAtomRegistry,
+          orchestrationEnvironment.bridgetLineageRead({ environmentId, input }),
+          { refresh: true, signal: controller.signal, reportFailure: false, reportDefect: false },
+        );
+        if (controller.signal.aborted) return null;
+        if (response._tag === "Failure") {
+          setFailure(failureMessage(response.cause));
+          return null;
+        }
+        return response.value;
+      },
+      () => {
+        requests.current.delete(controller);
+      },
+    );
   };
   const readResult = async (offset: number) => {
     if (reading) return;
     setReading(true);
-    try {
-      const value = await read({
-        projectId: context.projectId,
-        threadId: context.threadId,
-        action: "show",
-        taskId: ref.taskId,
-        offset,
-        limit: 16384,
-      });
-      if (value !== null && "task" in value) {
-        setDetail(value);
-        setResult((previous) =>
-          offset === 0 ? (value.result ?? "") : previous + (value.result ?? ""),
-        );
-      }
-    } finally {
-      setReading(false);
-    }
+    return withJournalCleanup(
+      async () => {
+        const value = await read({
+          projectId: context.projectId,
+          threadId: context.threadId,
+          action: "show",
+          taskId: ref.taskId,
+          offset,
+          limit: 16384,
+        });
+        if (value !== null && "task" in value) {
+          setDetail(value);
+          setResult((previous) =>
+            offset === 0 ? (value.result ?? "") : previous + (value.result ?? ""),
+          );
+        }
+      },
+      () => setReading(false),
+    );
   };
   const readHistory = async (afterSeq: number) => {
     if (reading) return;
     setReading(true);
-    try {
-      const value = await read({
-        projectId: context.projectId,
-        threadId: context.threadId,
-        action: "journal",
-        taskId: ref.taskId,
-        afterSeq,
-        limit: 100,
-      });
-      if (value !== null && "events" in value) {
-        setHistory(value);
-        setHistoryAfterSeq(afterSeq);
-      }
-    } finally {
-      setReading(false);
-    }
+    return withJournalCleanup(
+      async () => {
+        const value = await read({
+          projectId: context.projectId,
+          threadId: context.threadId,
+          action: "journal",
+          taskId: ref.taskId,
+          afterSeq,
+          limit: 100,
+        });
+        if (value !== null && "events" in value) {
+          setHistory(value);
+          setHistoryAfterSeq(afterSeq);
+        }
+      },
+      () => setReading(false),
+    );
   };
   const stop = async () => {
     if (stopping) return;
     setStopping(true);
-    try {
-      const response = await cancel({
-        environmentId,
-        input: {
-          projectId: context.projectId,
-          threadId: context.threadId,
-          taskId: ref.taskId,
-          requestId: randomUUID(),
-        },
-      });
-      if (response._tag === "Failure") setFailure(failureMessage(response.cause));
-    } finally {
-      setStopping(false);
-    }
+    return withJournalCleanup(
+      async () => {
+        const response = await cancel({
+          environmentId,
+          input: {
+            projectId: context.projectId,
+            threadId: context.threadId,
+            taskId: ref.taskId,
+            requestId: randomUUID(),
+          },
+        });
+        if (response._tag === "Failure") setFailure(failureMessage(response.cause));
+      },
+      () => setStopping(false),
+    );
   };
   const nativeStatus = task?.status ?? ref.status;
   const terminal = ["result_available", "failed", "cancelled"].includes(nativeStatus);
@@ -465,10 +405,12 @@ export function BridgetTaskJournal({
           onFailure={setFailure}
         />
       ) : null}
-      <div className="chat-composer-lane min-w-0 border-b py-3 text-sm">
+      <div className="chat-composer-lane min-w-0 py-3 text-sm">
         <div className="mx-auto flex w-full min-w-0 max-w-(--chat-content-max-width) flex-col gap-2">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <strong className="min-w-0 break-words">{task?.title ?? thread.title}</strong>
+            <strong className="min-w-0 flex-1 truncate">
+              {formatSubagentDisplayTitle(task?.title ?? thread.title)}
+            </strong>
             <span className="min-w-0 break-words">
               {task ? `${task.agent_type} · ` : null}
               {task?.model ?? thread.modelSelection.model}
@@ -513,11 +455,7 @@ export function BridgetTaskJournal({
           </div>
         </div>
       </div>
-      <div
-        ref={setScrollElement}
-        className="chat-composer-lane scrollbar-gutter-both min-h-0 min-w-0 flex-1 overflow-auto py-3"
-        style={{ paddingBottom: `calc(0.75rem + ${bottomInset}px)` }}
-      >
+      <div className="chat-composer-lane min-w-0 shrink-0 py-1">
         <div className="mx-auto w-full min-w-0 max-w-(--chat-content-max-width)">
           {task?.cwd ? (
             <p className="mb-2 break-all text-xs text-muted-foreground">{task.cwd}</p>
@@ -579,9 +517,19 @@ export function BridgetTaskJournal({
             ) : null}
           </div>
           {detail ? (
-            <div className="mb-4 rounded border p-3">
+            <div className="mb-4 px-1">
               <div className="mb-2 flex gap-2">
                 <strong>Résultat</strong>
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  onClick={() => {
+                    setDetail(null);
+                    setResult("");
+                  }}
+                >
+                  Revenir au journal
+                </Button>
                 <Button size="xs" variant="ghost" onClick={() => void writeTextToClipboard(result)}>
                   Copier le résultat chargé
                 </Button>
@@ -601,14 +549,8 @@ export function BridgetTaskJournal({
                   </>
                 ) : null}
               </div>
-              <ChatMarkdown cwd={undefined} inert text={result} />
             </div>
           ) : null}
-          <ol className="list-none p-0">
-            {projection.blocks.map((block) => (
-              <JournalBlockView key={block.key} block={block} />
-            ))}
-          </ol>
           {history ? (
             <Button
               size="xs"
@@ -622,6 +564,28 @@ export function BridgetTaskJournal({
             <p className="text-xs text-muted-foreground">Chargement du journal…</p>
           ) : null}
         </div>
+      </div>
+      {renderTimeline(projection, thread, detail === null ? null : result)}
+      <div className="chat-composer-lane shrink-0 py-1 text-xs text-muted-foreground">
+        <details open={showDetails} onToggle={(event) => setShowDetails(event.currentTarget.open)}>
+          <summary className="cursor-pointer">
+            Détails techniques du journal · {projection.sourceEvents.length} événements
+          </summary>
+          {showDetails ? (
+            <div className="max-h-64 overflow-auto whitespace-pre-wrap break-words">
+              {projection.blocks.map((block) => (
+                <div key={block.key}>
+                  {block.conflicts.map((conflict) => (
+                    <p key={conflict.seq}>Conflit de rejeu #{conflict.seq}</p>
+                  ))}
+                  <pre>
+                    {JSON.stringify({ events: block.events, conflicts: block.conflicts }, null, 2)}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </details>
       </div>
     </section>
   );

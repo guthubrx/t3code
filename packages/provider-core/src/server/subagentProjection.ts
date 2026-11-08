@@ -24,30 +24,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import { isOrchestrationV2WorkActive } from "@t3tools/contracts";
 
-function trimmed(value: string | null | undefined): string | undefined {
-  const result = value?.trim();
-  return result && result.length > 0 ? result : undefined;
-}
-
-export function subagentThreadTitle(input: {
-  readonly parentTitle: string;
-  readonly title?: string | null;
-  readonly prompt: string;
-  readonly ordinal: number;
-}): string {
-  const detail = trimmed(input.title) ?? trimmed(input.prompt);
-  if (detail === undefined) {
-    return `${input.parentTitle} subagent ${input.ordinal}`;
-  }
-  if (detail.length <= 72) return detail;
-  let end = 69;
-  const previous = detail.charCodeAt(end - 1);
-  const next = detail.charCodeAt(end);
-  if (previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
-    end -= 1;
-  }
-  return `${detail.slice(0, end)}...`;
-}
+export { subagentThreadTitle } from "@t3tools/shared/subagentTitle";
 
 export function makeSubagentChildThread(input: {
   readonly parentThread: OrchestrationV2AppThread;

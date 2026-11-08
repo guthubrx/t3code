@@ -1,4 +1,4 @@
-import type { ScopedThreadRef } from "@t3tools/contracts";
+import type { OrchestrationV2ProjectedTurnItem, ScopedThreadRef } from "@t3tools/contracts";
 import { type ComponentProps, useLayoutEffect } from "react";
 import { useIncrementalTimelineEntries } from "../../hooks/useIncrementalTimelineEntries";
 import type { TimelineEntriesInput, TimelineEntry } from "../../session-logic";
@@ -24,6 +24,7 @@ export function ThreadTimeline({
   activeThreadKey,
   syncing,
   detailLoading,
+  importedTurnItems,
   ...timelineProps
 }: Omit<ComponentProps<typeof MessagesTimeline>, "timelineEntries"> & {
   /** Null until the thread's detail may load; see resolveThreadDetailRef. */
@@ -34,8 +35,11 @@ export function ThreadTimeline({
   activeThreadKey: string | null;
   syncing: boolean;
   detailLoading: boolean;
+  /** Read-only adapter items use the same projection and renderer as streamed items. */
+  importedTurnItems?: ReadonlyArray<OrchestrationV2ProjectedTurnItem>;
 }) {
-  const visibleTurnItems = useTimelineVisibleTurnItems(threadDetailRef);
+  const streamedTurnItems = useTimelineVisibleTurnItems(threadDetailRef);
+  const visibleTurnItems = importedTurnItems ?? streamedTurnItems;
   const serverEntries = useIncrementalTimelineEntries(activeThreadKey, {
     ...entriesInput,
     visibleTurnItems,

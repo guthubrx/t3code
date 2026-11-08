@@ -1,4 +1,4 @@
-import { act, render, stubGlobal, type Screen } from "../../test/render";
+import { act, render, type Screen } from "../../test/render";
 import {
   BridgetLineageError,
   EnvironmentId,
@@ -14,6 +14,7 @@ import { AsyncResult } from "effect/reactivity";
 import { useSyncExternalStore } from "react";
 import { describe, expect, it as baseIt, vi } from "vite-plus/test";
 
+import { type BridgetJournalProjection } from "@t3tools/client-runtime/bridget-journal-presentation";
 import { BridgetLineageSubscription, BridgetTaskJournal } from "./BridgetTaskJournal";
 
 // Session 149 — journal de tâche Bridget côté web
@@ -224,12 +225,33 @@ function button(label: string) {
     (node) => node.getAttribute("aria-label") === label || node.textContent?.includes(label),
   )!;
 }
+function CaptureJournal({ blocks }: BridgetJournalProjection) {
+  return (
+    <ol>
+      {blocks.map((block) => (
+        <li key={block.key} data-journal-seq={block.firstSeq}>
+          {block.excerpt ? <span>Extrait :</span> : null}
+          {block.kind === "text"
+            ? block.content
+            : block.kind === "activity"
+              ? `${block.label} · ${block.text ?? ""}`
+              : typeof block.events[0]?.payload === "string"
+                ? block.events[0].payload
+                : "Activité technique"}
+        </li>
+      ))}
+    </ol>
+  );
+}
 async function mount(thread: OrchestrationV2AppThread, onOpenParent?: () => void) {
   screen = await render(
     <BridgetTaskJournal
       environmentId={environmentId}
       thread={thread}
       onOpenParent={onOpenParent ?? null}
+      renderTimeline={(projection, _thread, result) =>
+        result === null ? <CaptureJournal {...projection} /> : <div>{result}</div>
+      }
     />,
     { router: false },
   );
@@ -810,76 +832,6 @@ describe("BridgetLineageSubscription (web, session 149)", () => {
   });
 });
 
-// Session 149 r4 — F2 : la barre « lecture seule » du parent flotte au-dessus du conteneur
-// défilant du journal. Sa hauteur mesurée doit devenir la marge basse (une seule fois).
-describe("BridgetTaskJournal (web, session 149) — marge basse sous la barre flottante", () => {
-  const bottomPadding = () =>
-    Number.parseFloat(getComputedStyle(one("div.overflow-auto")).paddingBottom);
-  const normalPadding = () =>
-    Number.parseFloat(getComputedStyle(document.documentElement).fontSize) * 0.75;
-
-  it("réserve la hauteur mesurée de [data-chat-composer-overlay], suit le redimensionnement et se détache", async () => {
-    let height = 40;
-    let resize: (() => void) | undefined;
-    let disconnected = 0;
-    const nativeRect = HTMLElement.prototype.getBoundingClientRect;
-    using _rect = vi
-      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
-      .mockImplementation(function (this: HTMLElement) {
-        return this.hasAttribute("data-chat-composer-overlay")
-          ? { ...nativeRect.call(this), height }
-          : nativeRect.call(this);
-      });
-    using _resize = stubGlobal(
-      "ResizeObserver",
-      class {
-        constructor(callback: () => void) {
-          resize = callback;
-        }
-        observe() {}
-        disconnect() {
-          disconnected += 1;
-        }
-      },
-    );
-    await using overlayScreen = await render(
-      <div data-chat-canvas>
-        <div data-chat-composer-overlay />
-        <BridgetTaskJournal
-          environmentId={environmentId}
-          thread={makeThread()}
-          onOpenParent={null}
-        />
-      </div>,
-      { router: false },
-    );
-    screen = overlayScreen;
-    // Marge normale 0.75rem + hauteur de la barre : pas de py-3 doublé.
-    expect(bottomPadding()).toBe(normalPadding() + 40);
-    height = 72;
-    await act(async () => resize?.());
-    expect(bottomPadding()).toBe(normalPadding() + 72);
-    await act(async () => screen.unmount());
-
-    expect(disconnected).toBe(1);
-  });
-
-  it("sans barre flottante dans le canevas : marge normale seule", async () => {
-    await using emptyCanvasScreen = await render(
-      <div data-chat-canvas>
-        <BridgetTaskJournal
-          environmentId={environmentId}
-          thread={makeThread()}
-          onOpenParent={null}
-        />
-      </div>,
-      { router: false },
-    );
-    screen = emptyCanvasScreen;
-    expect(bottomPadding()).toBe(normalPadding() + 0);
-  });
-});
-
 describe("BridgetTaskJournal remote metadata (162)", () => {
   const placement = {
     machine_id: "cartae",
@@ -911,6 +863,9 @@ describe("BridgetTaskJournal remote metadata (162)", () => {
           environmentId={environmentId}
           thread={makeThread({ task: { placement: { ...placement, contact_state: "stale" } } })}
           onOpenParent={null}
+          renderTimeline={(projection, _thread, result) =>
+            result === null ? <CaptureJournal {...projection} /> : <div>{result}</div>
+          }
         />,
       ),
     );
@@ -938,6 +893,9 @@ describe("BridgetTaskJournal remote metadata (162)", () => {
           environmentId={environmentId}
           thread={makeThread({ task: { placement: null } })}
           onOpenParent={null}
+          renderTimeline={(projection, _thread, result) =>
+            result === null ? <CaptureJournal {...projection} /> : <div>{result}</div>
+          }
         />,
       ),
     );
@@ -958,6 +916,9 @@ describe("BridgetTaskJournal remote metadata (162)", () => {
             },
           })}
           onOpenParent={null}
+          renderTimeline={(projection, _thread, result) =>
+            result === null ? <CaptureJournal {...projection} /> : <div>{result}</div>
+          }
         />,
       ),
     );

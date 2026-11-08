@@ -542,6 +542,10 @@
     "./speech": {
       "types": "./src/speech.ts",
       "import": "./src/speech.ts"
+    },
+    "./subagentTitle": {
+      "types": "./src/subagentTitle.ts",
+      "import": "./src/subagentTitle.ts"
     }
   },
   "scripts": {

@@ -664,6 +664,10 @@ export function workEntryIsVisibleInGroup(
   expandedToolGroupEntry = false,
 ): boolean {
   if (entry.itemType === "reasoning") return Boolean(entry.detail?.trim());
+  // An imported invocation can be observed without a recorded outcome.
+  // Keep it visible and neutral; do not turn an unknown result into success.
+  if (entry.toolLifecycleStatus === "idle" && entry.projectedItem?.item.startedAt != null)
+    return true;
   return (
     (expandedToolGroupEntry &&
       (entry.toolLifecycleStatus === "inProgress" ||
@@ -1396,6 +1400,9 @@ function deriveTurnFolds(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   terminalAssistantMessageIds: ReadonlySet<string>;
   latestRun: TimelineLatestRun | null;
+  turnTimingByRunId?:
+    | ReadonlyMap<RunId, { startedAt: string | null; completedAt: string | null }>
+    | undefined;
   unfoldedRunIds: ReadonlySet<RunId>;
   runlessWorkActive: boolean;
   liveSubagentEntryIds: ReadonlySet<string>;
@@ -1558,14 +1565,21 @@ function deriveTurnFolds(input: {
     // A turn cut short by a steer leaves trailing work entries behind its
     // terminal message — take whichever ended last.
     const lastEntryEnd = timelineEntryEnd(lastEntry);
+    const timing = input.turnTimingByRunId?.get(runId);
     const elapsedMs =
-      input.latestRun?.runId === runId && input.latestRun.startedAt && input.latestRun.completedAt
-        ? computeElapsedMs(input.latestRun.startedAt, input.latestRun.completedAt)
-        : computeElapsedMs(
-            group.startBoundary ?? firstEntry.createdAt,
-            maxIsoTimestamp(group.terminalEntry?.message.updatedAt ?? null, lastEntryEnd) ??
-              lastEntryEnd,
-          );
+      timing !== undefined
+        ? timing.startedAt !== null && timing.completedAt !== null
+          ? computeElapsedMs(timing.startedAt, timing.completedAt)
+          : null
+        : input.latestRun?.runId === runId &&
+            input.latestRun.startedAt &&
+            input.latestRun.completedAt
+          ? computeElapsedMs(input.latestRun.startedAt, input.latestRun.completedAt)
+          : computeElapsedMs(
+              group.startBoundary ?? firstEntry.createdAt,
+              maxIsoTimestamp(group.terminalEntry?.message.updatedAt ?? null, lastEntryEnd) ??
+                lastEntryEnd,
+            );
     const duration = elapsedMs !== null ? formatDuration(elapsedMs) : null;
     const label = isLatestInterruptedTurn
       ? duration
@@ -1863,6 +1877,7 @@ function deriveTimelineTurnFolds(
     MessagesTimelineRowsInput,
     | "timelineEntries"
     | "latestRun"
+    | "turnTimingByRunId"
     | "isWorking"
     | "runlessWorkActive"
     | "runningRunId"
@@ -1883,6 +1898,7 @@ function deriveTimelineTurnFolds(
     timelineEntries,
     terminalAssistantMessageIds: deriveTerminalAssistantMessageIds(timelineEntries),
     latestRun: input.latestRun ?? null,
+    turnTimingByRunId: input.turnTimingByRunId,
     unfoldedRunIds: new Set([...activeVisualResponseRunIds, ...failedRunIds]),
     runlessWorkActive: input.isWorking && input.runlessWorkActive === true,
     liveSubagentEntryIds: liveSubagentCardEntryIds(timelineEntries),
@@ -1894,6 +1910,10 @@ export function deriveMessagesTimelineRows(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   pendingApprovalRequestIds?: ReadonlySet<RuntimeRequestId>;
   latestRun?: TimelineLatestRun | null;
+  /** Authoritative timing for imported turns. Null means timing is not known. */
+  turnTimingByRunId?:
+    | ReadonlyMap<RunId, { startedAt: string | null; completedAt: string | null }>
+    | undefined;
   runningRunId?: RunId | null;
   expandedRunIds?: ReadonlySet<RunId>;
   expandedAttemptIds?: ReadonlySet<RunAttemptId>;
@@ -1962,6 +1982,7 @@ export function deriveMessagesTimelineRows(input: {
           timelineEntries: timelineEntries,
           terminalAssistantMessageIds,
           latestRun: input.latestRun ?? null,
+          turnTimingByRunId: input.turnTimingByRunId,
           unfoldedRunIds: new Set([...activeVisualResponseRunIds, ...failedRunIds]),
           runlessWorkActive,
           liveSubagentEntryIds,
@@ -2759,6 +2780,7 @@ export function timelineTurnFoldRunIdsByEntryId(
     MessagesTimelineRowsInput,
     | "timelineEntries"
     | "latestRun"
+    | "turnTimingByRunId"
     | "isWorking"
     | "runlessWorkActive"
     | "runningRunId"

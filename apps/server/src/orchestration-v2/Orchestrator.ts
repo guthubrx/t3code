@@ -13477,7 +13477,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const now = yield* DateTime.now;
     const available = { generation: snapshot.generation, seq: snapshot.seq, available: true };
     const emitEvent = emit(events, command);
-    for (const task of tasks.values()) {
+    for (const [taskIndex, task] of [...tasks.values()].entries()) {
       const childThreadId = ThreadId.make(`thread:bridget-task:${task.task_id}`);
       const parentThreadId =
         task.parent_task_id === null
@@ -13496,6 +13496,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           commandType: command.type,
           cause: "Native task belongs to a different root.",
         });
+      const displayTitle = subagentThreadTitle({
+        parentTitle: root.title,
+        title: task.title,
+        prompt: "",
+        ordinal: taskIndex + 1,
+      });
       const taskChanged =
         previous?.bridgetTask === undefined ||
         !bridgetLineageTasksEqual(previous.bridgetTask, task);
@@ -13504,6 +13510,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (
         !taskChanged &&
         previous?.bridgetTaskRef?.generation === snapshot.generation &&
+        previous.title === displayTitle &&
         previous.bridgetLineage?.available === true
       )
         continue;
@@ -13527,7 +13534,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         createdBy: "agent",
         creationSource: "server",
         id: childThreadId,
-        title: task.title.trim() || task.agent_type,
+        title: displayTitle,
         providerInstanceId,
         modelSelection,
         activeProviderThreadId: null,
@@ -13610,7 +13617,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           childThreadId,
           nativeTaskRef: null,
           prompt: "",
-          title: task.title,
+          title: displayTitle,
           model: task.model,
           modelSelection,
           status,
@@ -14230,6 +14237,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           command.type === "thread.interrupt.unresponsive" ||
           command.type === "thread.stop" ||
           command.type === "subagent.stop" ||
+          // A verified native snapshot can already be current after reconnect.
+          command.type === "bridget.lineage.sync" ||
+          command.type === "bridget.lineage.unavailable" ||
           // Closing a share again, or after it ended, is not an error.
           command.type === "thread.guest-share.close" ||
           (command.type === "thread.delete" && command.onlyIfUnused === true),

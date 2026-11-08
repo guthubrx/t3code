@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { subagentDetailPreview } from "./subagentDisplay.js";
+import { formatSubagentDisplayTitle, subagentDetailPreview } from "./subagentDisplay.js";
+
+it("applique aussi la politique de titre native aux anciens sous-agents", () => {
+  expect(
+    formatSubagentDisplayTitle("Subagent: " + "Un très long titre ".repeat(80)).length,
+  ).toBeLessThanOrEqual(72);
+  expect(formatSubagentDisplayTitle("Subagent: Revue des sources")).toBe("Revue des sources");
+});
 
 describe("subagentDetailPreview", () => {
   it("prefers progress for live work and results for settled work", () => {

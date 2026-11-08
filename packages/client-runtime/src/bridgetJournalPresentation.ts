@@ -235,6 +235,95 @@ export interface BridgetJournalProjection {
   readonly input: BridgetJournalProjectionInput;
 }
 
+/** A read-only conversation view; the source projection remains the audit trail. */
+export interface BridgetJournalTurn {
+  readonly key: string;
+  readonly blocks: ReadonlyArray<BridgetJournalBlock>;
+  readonly prompt: string | null;
+  readonly startedAt: string | null;
+  readonly endedAt: string | null;
+  readonly outcome: string | null;
+  readonly excerpt: boolean;
+}
+
+/** Never join across a missing range, another delivery, or another session. */
+export function projectBridgetConversation(
+  projection: BridgetJournalProjection,
+): BridgetJournalTurn[] {
+  const turns: BridgetJournalTurn[] = [];
+  let previous: BridgetJournalEvent | undefined;
+  let current:
+    | {
+        key: string;
+        blocks: BridgetJournalBlock[];
+        prompt: string | null;
+        startedAt: string | null;
+        endedAt: string | null;
+        outcome: string | null;
+        excerpt: boolean;
+      }
+    | undefined;
+  for (const block of projection.blocks) {
+    const first = block.events[0];
+    if (first === undefined) continue;
+    const boundary = boundaryBefore(previous, first, projection.input);
+    if (current === undefined || boundary.separates || first.event === "turn_start") {
+      current = {
+        key: `turn:${first.seq}`,
+        blocks: [],
+        prompt: null,
+        startedAt: null,
+        endedAt: null,
+        outcome: null,
+        excerpt: boundary.excerpt || block.excerpt || first.event !== "turn_start",
+      };
+      turns.push(current);
+    }
+    current.blocks.push(block);
+    current.excerpt ||= block.excerpt || block.conflicts.length > 0;
+    if (first.event === "turn_start") {
+      current.startedAt = Number.isFinite(Date.parse(first.ts)) ? first.ts : null;
+      current.prompt =
+        isPayloadRecord(first.payload) && typeof first.payload.body === "string"
+          ? first.payload.body
+          : null;
+    }
+    if (first.event === "turn_end") {
+      current.endedAt = Number.isFinite(Date.parse(first.ts)) ? first.ts : null;
+      current.outcome =
+        isPayloadRecord(first.payload) && typeof first.payload.stop_reason === "string"
+          ? first.payload.stop_reason
+          : "unknown";
+    } else if (
+      first.event === "error" &&
+      isPayloadRecord(first.payload) &&
+      first.payload.terminal_kind === "turn_failed"
+    ) {
+      current.outcome = "failed";
+      current.endedAt = Number.isFinite(Date.parse(first.ts)) ? first.ts : null;
+    }
+    previous = block.events.at(-1);
+  }
+  return turns;
+}
+
+export function bridgetTurnDurationMs(turn: BridgetJournalTurn): number | null {
+  if (turn.excerpt || turn.startedAt === null || turn.endedAt === null) return null;
+  const duration = Date.parse(turn.endedAt) - Date.parse(turn.startedAt);
+  return Number.isFinite(duration) && duration >= 0 ? duration : null;
+}
+
+export function isBridgetJournalLifecycle(block: BridgetJournalBlock): boolean {
+  return (
+    block.kind === "technical" &&
+    block.events.every((event) =>
+      ["turn_start", "turn_end", "prompt_dispatched", "reasoning", "provider_result"].includes(
+        event.event,
+      ),
+    )
+  );
+}
+
 function knownActivity(
   event: BridgetJournalEvent,
 ): Omit<

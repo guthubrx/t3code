@@ -3,7 +3,10 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   BRIDGET_JOURNAL_MAX_GAPS,
+  bridgetTurnDurationMs,
+  isBridgetJournalLifecycle,
   mergeJournalEvents,
+  projectBridgetConversation,
   projectBridgetJournal,
   retainBridgetJournalGaps,
   type BridgetJournalGapState,
@@ -21,6 +24,106 @@ const event = (
   event: "update",
   payload,
   ...overrides,
+});
+
+describe("conversation Bridget", () => {
+  const turns = (events: BridgetJournalEvent[]) =>
+    projectBridgetConversation(projectBridgetJournal({ events }));
+
+  it("présente la demande et la durée du vrai tour tout en conservant chaque événement", () => {
+    const source = [
+      event(
+        1,
+        { body: "Relire le correctif" },
+        { event: "turn_start", ts: "2026-11-08T12:00:00Z" },
+      ),
+      event(2, { kind: "text", content: "Je vérifie les sources." }),
+      event(3, { kind: "command", text: "git diff", detail: "item/started" }),
+      event(4, { kind: "text", content: "Aucun défaut confirmé." }),
+      event(5, { stop_reason: "completed" }, { event: "turn_end", ts: "2026-11-08T12:01:20Z" }),
+    ];
+    const [turn] = turns(source);
+    expect(turn?.prompt).toBe("Relire le correctif");
+    expect(turn?.outcome).toBe("completed");
+    expect(bridgetTurnDurationMs(turn!)).toBe(80_000);
+    expect(turn?.blocks.flatMap((block) => block.events)).toEqual(source);
+    expect(
+      turn?.blocks
+        .filter(isBridgetJournalLifecycle)
+        .flatMap((block) => block.events.map((entry) => entry.event)),
+    ).toEqual(["turn_start", "turn_end"]);
+  });
+
+  it("ne fusionne pas les tours ni leurs durées même dans la même livraison", () => {
+    const result = turns([
+      event(1, {}, { event: "turn_start", ts: "2026-11-08T12:00:00Z" }),
+      event(2, { stop_reason: "completed" }, { event: "turn_end", ts: "2026-11-08T12:01:00Z" }),
+      event(3, {}, { event: "turn_start", ts: "2026-11-08T12:02:00Z" }),
+      event(4, { stop_reason: "cancelled" }, { event: "turn_end", ts: "2026-11-08T12:02:10Z" }),
+    ]);
+    expect(result.map(bridgetTurnDurationMs)).toEqual([60_000, 10_000]);
+    expect(result.map((turn) => turn.outcome)).toEqual(["completed", "cancelled"]);
+  });
+
+  it("ne donne aucune durée aux extraits, horodatages invalides, conflits et lacunes", () => {
+    const start = event(1, {}, { event: "turn_start", ts: "2026-11-08T12:00:00Z" });
+    const end = event(
+      3,
+      { stop_reason: "completed" },
+      { event: "turn_end", ts: "2026-11-08T12:01:00Z" },
+    );
+    for (const projection of [
+      projectBridgetJournal({ events: [end] }),
+      projectBridgetJournal({ events: [start, end], beginsWithExcerpt: true }),
+      projectBridgetJournal({
+        events: [start, end],
+        gaps: [{ from_seq: 2, to_seq: 2, reason: "transport" }],
+      }),
+      projectBridgetJournal({
+        events: [start, end],
+        continuityCut: { fromSeq: 2, toSeq: 2, reason: "gap-pressure" },
+      }),
+      projectBridgetJournal({ events: [{ ...start, ts: "unknown" }, end] }),
+      projectBridgetJournal({ events: [start, { ...end, ts: "2026-11-08T11:59:59Z" }] }),
+      projectBridgetJournal({
+        events: [start, end],
+        conflicts: [
+          {
+            seq: 1,
+            first: start,
+            conflicting: { ...start, payload: { body: "autre" } },
+            additionalConflicts: 0,
+          },
+        ],
+      }),
+    ]) {
+      expect(
+        projectBridgetConversation(projection).every(
+          (turn) => bridgetTurnDurationMs(turn) === null,
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it("conserve les inconnus et ne termine pas un tour pour une erreur sans marqueur terminal", () => {
+    const [turn] = turns([
+      event(1, {}, { event: "turn_start" }),
+      event(2, { diagnostic: "read failed" }, { event: "error" }),
+      event(3, { kind: "future_tool", detail: "future" }),
+    ]);
+    expect(turn?.outcome).toBeNull();
+    expect(turn?.endedAt).toBeNull();
+    expect(turn?.blocks.filter((block) => !isBridgetJournalLifecycle(block))).toHaveLength(2);
+  });
+
+  it("distingue la fin en échec du succès et d'un tour toujours actif", () => {
+    const [turn] = turns([
+      event(1, {}, { event: "turn_start" }),
+      event(2, { terminal_kind: "turn_failed" }, { event: "error" }),
+    ]);
+    expect(turn?.outcome).toBe("failed");
+    expect(turn?.endedAt).not.toBeNull();
+  });
 });
 
 describe("projection du journal Bridget", () => {

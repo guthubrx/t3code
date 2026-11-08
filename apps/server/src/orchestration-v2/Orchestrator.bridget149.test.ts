@@ -295,6 +295,34 @@ const seedVirtual = (
   });
 
 describe("Orchestrator.bridget149 virtual projection", () => {
+  it.effect("bounds native titles and distinguishes untitled children", () => {
+    const h = makeHarness();
+    return Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      yield* createRoot(orchestrator, rootId);
+      yield* sync(
+        orchestrator,
+        rootId,
+        nativeSnapshot([
+          nativeTask({ title: "" }),
+          nativeTask({ task_id: uuid(2), child_agent_id: uuid(102), title: "" }),
+          nativeTask({
+            task_id: uuid(3),
+            child_agent_id: uuid(103),
+            title: "Revue des conversations sociales ".repeat(7),
+          }),
+        ]),
+        "titles",
+      );
+      expect((yield* projections.getThread(childA)).title).toBe("Root conversation subagent 1");
+      expect((yield* projections.getThread(childB)).title).toBe("Root conversation subagent 2");
+      const titled = yield* projections.getThread(ThreadId.make(`thread:bridget-task:${uuid(3)}`));
+      expect(titled.title.length).toBeLessThanOrEqual(72);
+      expect(titled.title.endsWith("...")).toBe(true);
+      expect(titled.bridgetTask?.title).toBe("Revue des conversations sociales ".repeat(7));
+    }).pipe(Effect.provide(h.layer));
+  });
   it.effect("sync writes the exact virtual threads, markers and native subagents", () => {
     const h = makeHarness();
     return Effect.gen(function* () {
@@ -1389,6 +1417,20 @@ describe("Orchestrator.bridget149 origin matrix: resume, delivery and outbox", (
     const m = makeMatrixLayer();
     return Effect.gen(function* () {
       const s = yield* seedMatrix(origin);
+      // This cell models provider work that started, not an unsent queued request.
+      // Current recovery correctly requeues work whose startedAt is still null.
+      const now = yield* DateTime.now;
+      for (const threadId of origin === "app_owned" ? [rootId, s.childThreadId] : [rootId]) {
+        const run = (yield* s.orchestrator.getThreadProjection(threadId)).runs.at(-1)!;
+        yield* s.projections.apply({
+          id: EventId.make(`bridget-149-started:${threadId}`),
+          type: "run.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...run, startedAt: now },
+        });
+      }
       const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
       const beforeSinks = yield* readSinks;
       const childBefore = yield* s.projections.getThread(s.childThreadId);
