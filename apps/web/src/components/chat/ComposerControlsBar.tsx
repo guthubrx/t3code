@@ -39,6 +39,7 @@ import { resolveComposerControlsOwnership } from "./composerControlsOwnership";
 const MODEL_TRIGGER_STATES = "data-popup-open:bg-accent data-popup-open:text-foreground";
 
 export function ComposerControlsBar(props: {
+  onModelOptionsChange?: Parameters<typeof resolveComposerTraitsInput>[0]["onModelOptionsChange"];
   environmentId: EnvironmentId;
   routeKind: ChatComposerProps["routeKind"];
   routeThreadRef: ChatComposerProps["routeThreadRef"];
@@ -56,6 +57,8 @@ export function ComposerControlsBar(props: {
   effortDisplay: EffortDisplay;
   /** The strip under a new thread names the permissions, so the row does not repeat them. */
   permissionsShownInStrip: boolean;
+  runtimeControlsAvailable: ChatComposerProps["runtimeControlsAvailable"];
+  modelSelectionAvailable: ChatComposerProps["modelSelectionAvailable"];
   interactionMode: ProviderInteractionMode;
   compatibleRuntimeMode: RuntimeMode;
   defaultRuntimeMode: RuntimeMode | undefined;
@@ -153,6 +156,7 @@ export function ComposerControlsBar(props: {
   });
   const controlSize = composerControlsCollapsed ? "xs" : "sm";
   const traitsInput = resolveComposerTraitsInput({
+    ...(props.onModelOptionsChange ? { onModelOptionsChange: props.onModelOptionsChange } : {}),
     provider: selectedProvider,
     instanceId: selectedInstanceId,
     ...(routeKind === "server" ? { threadRef: routeThreadRef } : {}),
@@ -166,27 +170,28 @@ export function ComposerControlsBar(props: {
     planModeEnabled,
   });
   const effort = describeComposerEffort(traitsInput, props.effortDisplay, controlSize);
-  const restingBlockDefs = showModeBlock
-    ? [
-        {
-          id: "mode",
-          content: (
-            <ComposerFooterModeControls
-              showInteractionModeToggle={planModeUiEnabled}
-              interactionMode={interactionMode}
-              runtimeMode={compatibleRuntimeMode}
-              runtimeModeOptions={compatibleRuntimeModeOptions}
-              size={controlSize}
-              hidden={composerControlsHidden || restingHiddenBlockCount > 0}
-              accessDisplay={accessDisplay}
-              emphasized={!accessMatchesDefault}
-              onToggleInteractionMode={toggleInteractionMode}
-              onRuntimeModeChange={handleRuntimeModeChange}
-            />
-          ),
-        },
-      ]
-    : [];
+  const restingBlockDefs =
+    showModeBlock && props.runtimeControlsAvailable !== false
+      ? [
+          {
+            id: "mode",
+            content: (
+              <ComposerFooterModeControls
+                showInteractionModeToggle={planModeUiEnabled}
+                interactionMode={interactionMode}
+                runtimeMode={compatibleRuntimeMode}
+                runtimeModeOptions={compatibleRuntimeModeOptions}
+                size={controlSize}
+                hidden={composerControlsHidden || restingHiddenBlockCount > 0}
+                accessDisplay={accessDisplay}
+                emphasized={!accessMatchesDefault}
+                onToggleInteractionMode={toggleInteractionMode}
+                onRuntimeModeChange={handleRuntimeModeChange}
+              />
+            ),
+          },
+        ]
+      : [];
   // Its own element, so typing (which rebuilds the controls around it) leaves it cached.
   const composerModelPicker = (
     <ComposerModelPicker
@@ -195,7 +200,7 @@ export function ComposerControlsBar(props: {
       isComposerOwned
       // The trigger grows away from this edge when its model or effort label changes.
       popupAlign={composerControlsCollapsed ? "start" : "end"}
-      disabled={providerCatalogPending || isSendBusy}
+      disabled={providerCatalogPending || isSendBusy || props.modelSelectionAvailable === false}
       multipleModelsEnabled={multipleModelsEnabled}
       multipleModelSelections={multipleModelSelections}
       onMultipleModelSelectionsChange={onMultipleModelSelectionsChange}
@@ -229,12 +234,14 @@ export function ComposerControlsBar(props: {
       }
       effortColumn={<ComposerEffortColumn traits={traitsInput} />}
       footer={
-        <ComposerPickerFooter
-          traits={traitsInput}
-          runtimeMode={compatibleRuntimeMode}
-          runtimeModeOptions={compatibleRuntimeModeOptions}
-          onRuntimeModeChange={handleRuntimeModeChange}
-        />
+        props.runtimeControlsAvailable === false ? undefined : (
+          <ComposerPickerFooter
+            traits={traitsInput}
+            runtimeMode={compatibleRuntimeMode}
+            runtimeModeOptions={compatibleRuntimeModeOptions}
+            onRuntimeModeChange={handleRuntimeModeChange}
+          />
+        )
       }
       terminalOpen={terminalOpen}
       open={modelPickerOpen}
@@ -310,7 +317,7 @@ export function ComposerControlsBar(props: {
             hidden={composerControlsHidden || hiddenRestingBlockIds.length === 0}
             showInteractionModeToggle={planModeUiEnabled && hiddenRestingBlockIds.length > 0}
             // Permissions join the overflow only when their normal home is in it.
-            showPermissions={overflowShowsPermissions}
+            showPermissions={overflowShowsPermissions && props.runtimeControlsAvailable !== false}
             onToggleInteractionMode={toggleInteractionMode}
             onRuntimeModeChange={handleRuntimeModeChange}
           />

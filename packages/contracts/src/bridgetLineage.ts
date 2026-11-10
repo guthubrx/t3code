@@ -285,6 +285,61 @@ export const BridgetLineageCancelResult = Schema.Struct({
 });
 export type BridgetLineageCancelResult = typeof BridgetLineageCancelResult.Type;
 
+/** Human commands address the native task, never its projected T3 thread. */
+export const BridgetComposerOperation = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("read") }),
+  Schema.Struct({
+    kind: Schema.Literal("send"),
+    body: Schema.String.check(
+      Schema.isMinLength(1),
+      Schema.makeFilter((value: string) => new TextEncoder().encode(value).length <= 65536),
+    ),
+    intent: Schema.Literals(["queue", "steer"]),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("select_runtime"),
+    model: bounded(512).check(Schema.isMinLength(1)),
+    effort: Schema.NullOr(bounded(256).check(Schema.isMinLength(1))),
+  }),
+  Schema.Struct({ kind: Schema.Literal("interrupt") }),
+]);
+export type BridgetComposerOperation = typeof BridgetComposerOperation.Type;
+
+export const BridgetLineageComposeInput = Schema.Struct({
+  ...context,
+  taskId: Uuid,
+  requestId: Uuid,
+  expectedRound: NonNegativeInt,
+  operation: BridgetComposerOperation,
+}).check(Schema.makeFilter((value) => value.operation.kind === "read" || value.expectedRound > 0));
+export type BridgetLineageComposeInput = typeof BridgetLineageComposeInput.Type;
+
+export const BridgetComposerState = Schema.Struct({
+  version: Schema.Literal(1),
+  status: Schema.Literal("ok"),
+  task_id: Uuid,
+  request_id: Uuid,
+  round: PositiveInt,
+  state: BridgetNativeTaskStatus,
+  outcome: Schema.Literals(["observed", "accepted", "selected", "refused", "outcome_unknown"]),
+  code: Schema.NullOr(bounded(256)),
+  message: Schema.String,
+  selection: Schema.NullOr(
+    Schema.Struct({ model: bounded(512), effort: Schema.NullOr(bounded(256)) }),
+  ),
+  models: Schema.Array(
+    Schema.Struct({ id: bounded(512), name: bounded(512), efforts: Schema.Array(bounded(256)) }),
+  ),
+  capabilities: Schema.Struct({
+    send: Schema.Boolean,
+    steer: Schema.Boolean,
+    interrupt: Schema.Boolean,
+    select_runtime: Schema.Boolean,
+    attachments: Schema.Boolean,
+  }),
+});
+export type BridgetComposerState = typeof BridgetComposerState.Type;
+
 export const BridgetLineageErrorCode = Schema.Literals([
   "unsupported_version",
   "invalid_request",

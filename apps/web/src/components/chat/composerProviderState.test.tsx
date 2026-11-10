@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   ProviderDriverKind,
   ProviderInstanceId,
+  EnvironmentId,
+  ThreadId,
   type ProviderOptionDescriptor,
   type ProviderOptionSelection,
   type ServerProviderModel,
@@ -9,12 +12,34 @@ import {
 import {
   getComposerProviderState,
   getComposerReasoningStep,
+  resolveComposerTraitsInput,
   withImplicitFastModeDefault,
 } from "./composerProviderState";
 import { readPromptUltrathink } from "./TraitsPicker";
 
 const PROVIDER: ProviderDriverKind = ProviderDriverKind.make("codex");
 const MODEL = "test-model";
+
+describe("spec258 native composer option writer", () => {
+  it("uses the native writer instead of a thread draft writer", () => {
+    const onModelOptionsChange = () => {};
+    const input = resolveComposerTraitsInput({
+      provider: PROVIDER,
+      instanceId: ProviderInstanceId.make("native-child"),
+      threadRef: scopeThreadRef(EnvironmentId.make("native-host"), ThreadId.make("native-view")),
+      model: MODEL,
+      models: [],
+      modelOptions: undefined,
+      promptUltrathink: "none",
+      onPromptEdit: () => {},
+      planModeEnabled: false,
+      onModelOptionsChange,
+    });
+    expect(input?.onModelOptionsChange).toBe(onModelOptionsChange);
+    expect(input).not.toHaveProperty("threadRef");
+    expect(input).not.toHaveProperty("draftId");
+  });
+});
 
 function selectDescriptor(
   id: string,

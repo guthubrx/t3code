@@ -328,13 +328,15 @@ describe("S149-16 lineage RPC namespace and scopes", () => {
     "bridgetLineageWatch",
     "bridgetLineageJournal",
     "bridgetLineageCancel",
+    "bridgetLineageCompose",
   ] as const;
-  it("exposes exactly the four bridget.lineage methods in WS_METHODS", () => {
+  it("exposes the read, cancel and native composer lineage methods in WS_METHODS", () => {
     const expected = {
       bridgetLineageRead: "bridget.lineage.read",
       bridgetLineageWatch: "bridget.lineage.watch",
       bridgetLineageJournal: "bridget.lineage.journal",
       bridgetLineageCancel: "bridget.lineage.cancel",
+      bridgetLineageCompose: "bridget.lineage.compose",
     };
     for (const key of lineageMethods) expect(WS_METHODS[key]).toBe(expected[key]);
     expect(Object.keys(WS_METHODS).filter((key) => key.startsWith("bridgetLineage"))).toEqual([
@@ -345,9 +347,12 @@ describe("S149-16 lineage RPC namespace and scopes", () => {
     );
     expect(existingBridgetKeys).toEqual(["bridgetRead", "bridgetWatch"]);
   });
-  it("guards only cancel with the orchestration operate scope on the client", () => {
+  it("guards cancel and composer with the orchestration operate scope on the client", () => {
     expect(AuthOrchestrationOperateScope).toBe("orchestration:operate");
     expect(CLIENT_GUARDED_RPC_SCOPES[WS_METHODS.bridgetLineageCancel]).toBe(
+      AuthOrchestrationOperateScope,
+    );
+    expect(CLIENT_GUARDED_RPC_SCOPES[WS_METHODS.bridgetLineageCompose]).toBe(
       AuthOrchestrationOperateScope,
     );
     for (const key of [

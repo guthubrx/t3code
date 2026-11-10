@@ -351,6 +351,8 @@ export interface ChatComposerHandle {
 }
 
 export interface ChatComposerProps {
+  /** Native option changes are confirmed externally; the shared picker stays unchanged. */
+  onModelOptionsChange?: Parameters<typeof ComposerControlsBar>[0]["onModelOptionsChange"];
   composerDraftTarget: ScopedThreadRef | DraftId;
   environmentId: EnvironmentId;
   canOperateThread: boolean;
@@ -376,6 +378,7 @@ export interface ChatComposerProps {
 
   phase: SessionPhase;
   canInterrupt: boolean;
+  canSteer?: boolean;
   isSendBusy: boolean;
   canResume: boolean;
   isRevertingCheckpoint?: boolean;
@@ -453,6 +456,9 @@ export interface ChatComposerProps {
   onComposerOverlayHeightChange: (height: number) => void;
   /** The new-thread strip names the permissions, so the controls row hides its chip. */
   permissionsShownInStrip: boolean;
+  /** Some native sessions expose model selection without permission or plan controls. */
+  runtimeControlsAvailable?: boolean;
+  modelSelectionAvailable?: boolean;
 
   promptRef: React.RefObject<string>;
   composerImagesRef: React.RefObject<ComposerImageAttachment[]>;
@@ -898,6 +904,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     activeProjectId,
     threadRef: composerDraftTarget,
     threadModelSelection: activeThreadModelSelection,
+    ...(props.onModelOptionsChange !== undefined
+      ? { confirmedSelection: activeThreadModelSelection ?? null }
+      : {}),
     projectModelSelection: activeProjectDefaultModelSelection,
     promptInjectionState: getComposerPromptInjectionState(prompt),
     candidateInstanceIds: [
@@ -970,11 +979,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const selectedPromptEffort = composerProviderState.promptEffort;
   const selectedModelOptionsForDispatch = composerProviderState.modelOptionsForDispatch;
-  const { enabled: planModeUiEnabled, interactionMode } = resolveComposerInteractionMode({
+  const { enabled: providerPlanModeUiEnabled, interactionMode } = resolveComposerInteractionMode({
     planModeEnabled: settings.planModeEnabled,
     provider: selectedProviderStatus,
     interactionMode: requestedInteractionMode,
   });
+  const planModeUiEnabled = props.runtimeControlsAvailable !== false && providerPlanModeUiEnabled;
   const selectedModelSelection: ModelSelection = createModelSelection(
     selectedInstanceId,
     selectedModel,
@@ -989,6 +999,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         settings,
         entry,
         entry.instanceId === selectedInstanceId ? selectedModelForPicker : null,
+      ).filter(
+        (model) =>
+          props.onModelOptionsChange === undefined ||
+          entry.models.some((available) => available.slug === model.slug),
       ),
     );
   }
@@ -2188,7 +2202,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               running: phase === "running",
               alternateModifier: false,
               activeTurnDefault: followUpBehavior,
-              canSteer: !isCompacting,
+              canSteer: !isCompacting && props.canSteer !== false,
             }),
           submissionIntent,
         );
@@ -2228,7 +2242,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         resolveComposerDispatchMode({
           running: phase === "running",
           alternateModifier: intent === "alternate",
-          canSteer: !isCompacting,
+          canSteer: !isCompacting && props.canSteer !== false,
           activeTurnDefault: followUpBehavior,
         }),
         intent,
@@ -2243,7 +2257,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         running: phase === "running",
         alternateModifier: event.metaKey || event.ctrlKey,
         activeTurnDefault: followUpBehavior,
-        canSteer: !isCompacting,
+        canSteer: !isCompacting && props.canSteer !== false,
       }),
     );
   };
@@ -2255,7 +2269,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         running: phase === "running",
         alternateModifier: false,
         activeTurnDefault: followUpBehavior,
-        canSteer: !isCompacting,
+        canSteer: !isCompacting && props.canSteer !== false,
       }),
     );
   };
@@ -2433,6 +2447,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       selectedProviderModels={selectedProviderModels}
       composerModelOptions={composerModelOptions}
       reportedModelSelection={reportedModelSelection}
+      onModelOptionsChange={props.onModelOptionsChange}
       promptUltrathink={promptUltrathink}
       onPromptEdit={editPromptFromTraitsStable}
       planModeEnabled={settings.planModeEnabled}
@@ -2446,6 +2461,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       composerControlsCollapsed={composerControlsCollapsed}
       effortDisplay={settings.effortDisplay}
       permissionsShownInStrip={props.permissionsShownInStrip}
+      runtimeControlsAvailable={props.runtimeControlsAvailable}
+      modelSelectionAvailable={props.modelSelectionAvailable}
       composerControlsHidden={composerControlsHidden}
       restingHiddenBlockCount={restingHiddenBlockCount}
       iconOnlyBlockCount={iconOnlyBlockCount}
@@ -2990,13 +3007,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           direction,
         });
         if (!change) return;
-        useComposerDraftStore
-          .getState()
-          .setProviderModelOptions(composerDraftTarget, selectedProvider, change.modelOptions, {
-            instanceId: selectedInstanceId,
-            model: selectedModel,
-            persistSticky: true,
-          });
+        if (props.onModelOptionsChange) props.onModelOptionsChange(change.modelOptions);
+        else
+          useComposerDraftStore
+            .getState()
+            .setProviderModelOptions(composerDraftTarget, selectedProvider, change.modelOptions, {
+              instanceId: selectedInstanceId,
+              model: selectedModel,
+              persistSticky: true,
+            });
         if (change.prompt !== promptRef.current) {
           applyPromptReplacementStable(0, promptRef.current.length, change.prompt, {
             expandedCursorAfterReplace: change.cursor,
@@ -3632,7 +3651,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     isRunning={phase === "running"}
                     canInterrupt={canInterrupt}
                     followUpBehavior={followUpBehavior}
-                    canSteer={!isCompacting}
+                    canSteer={!isCompacting && props.canSteer !== false}
                     alternateShortcutLabel={shortcutLabelForCommand(
                       keybindings,
                       "composer.sendAlternate",

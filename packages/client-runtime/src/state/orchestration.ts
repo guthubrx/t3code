@@ -206,6 +206,10 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
       label: "environment-data:orchestration:bridget-lineage-cancel",
       tag: WS_METHODS.bridgetLineageCancel,
     }),
+    bridgetLineageCompose: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:orchestration:bridget-lineage-compose",
+      tag: WS_METHODS.bridgetLineageCompose,
+    }),
     bridgetRead: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:orchestration:bridget-read",
       tag: WS_METHODS.bridgetRead,

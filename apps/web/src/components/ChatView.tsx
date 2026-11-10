@@ -184,6 +184,8 @@ import { threadPullRequestPanelTarget } from "./pullRequest/pullRequestDetail.lo
 import { LinkPullRequestDialogHost } from "./pullRequest/LinkPullRequestDialog";
 import { BridgetPanel } from "./BridgetPanel";
 import { BridgetLineageSubscription, BridgetTaskJournal } from "./BridgetTaskJournal";
+import { useBridgetComposer } from "./chat/useBridgetComposer";
+import { Button } from "./ui/button";
 import { GuestPendingMessages } from "./chat/GuestShareControls";
 import { useDeviceState } from "~/state/device";
 import { BranchToolbar, type BranchToolbarHandle } from "./BranchToolbar";
@@ -267,7 +269,7 @@ import {
   useThreadCheckpointSummaries,
 } from "../state/entities";
 import { useEnvironmentShellHasSnapshot } from "../state/shell";
-import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
+import { ChatComposer, type ChatComposerHandle, type ChatComposerProps } from "./chat/ChatComposer";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
 import { ExpandedImageDialogHost, openExpandedImagePreview } from "./chat/ExpandedImageDialog";
 import {
@@ -817,6 +819,34 @@ export default function ChatView(props: ChatViewProps) {
   const providerSubagentStatus =
     serverProjection === null ? null : deriveProviderSubagentStatus(serverProjection);
   const isBridgetSubagent = serverThread?.source.bridgetTaskRef !== undefined;
+  const bridgetComposer = useBridgetComposer({
+    environmentId,
+    threadRef: routeThreadRef,
+    thread: serverProjection?.thread ?? null,
+  });
+  const [bridgetPresentation, setBridgetPresentation] = useState<{
+    threadId: ThreadId;
+    timeline: BridgetTimelinePresentation;
+  } | null>(null);
+  const visibleBridgetTimeline =
+    isBridgetSubagent &&
+    bridgetPresentation !== null &&
+    bridgetPresentation.threadId === activeThread?.id
+      ? bridgetPresentation.timeline
+      : null;
+  const publishBridgetTimeline = useStableCallback(
+    (
+      projection: Parameters<typeof projectBridgetTimeline>[0],
+      sourceThread: Parameters<typeof projectBridgetTimeline>[1],
+      result: string | null,
+    ) => {
+      if (sourceThread.id !== activeThread?.id) return;
+      setBridgetPresentation({
+        threadId: sourceThread.id,
+        timeline: projectBridgetTimeline(projection, sourceThread, result),
+      });
+    },
+  );
   const isProviderSubagent =
     serverThread !== null && isProviderNativeSubagentThread(serverThread.source);
   const supportsProviderSwitchingViaHandoff = threadSupportsProviderHandoff(serverProjection);
@@ -1549,7 +1579,9 @@ export default function ChatView(props: ChatViewProps) {
   // The structure has no assistant or reasoning text, so those rows stay out of
   // ChatView's own entries (anchoring, rewind, prompt history); ThreadTimeline
   // renders every row from the live turn items.
-  const serverTimelineRows = serverVisibleTurnItems.filter(isCompleteTurnItemRow);
+  const serverTimelineRows = (
+    visibleBridgetTimeline?.importedTurnItems ?? serverVisibleTurnItems
+  ).filter(isCompleteTurnItemRow);
   const hasStreamedTimelineRows =
     isServerThread && serverTimelineRows.length !== serverVisibleTurnItems.length;
   const serverTimelineEntries = useIncrementalTimelineEntries(activeThreadKey, {
@@ -1733,7 +1765,7 @@ export default function ChatView(props: ChatViewProps) {
   const isGitRepo = liveIsGitRepo ?? recallCheckoutIsRepo(environmentId, gitStatusCwd) ?? true;
   // Provider-native subagents cannot take messages; approvals and questions go to the top-level parent.
   const showProviderSubagentBar = isProviderSubagent || isBridgetSubagent;
-  const composerMounted = !showProviderSubagentBar;
+  const composerMounted = isBridgetSubagent || !showProviderSubagentBar;
   const providerSubagentModels = selectedProviderEntry?.models ?? EMPTY_PROVIDER_MODELS;
   // Providers can report dated model ids or aliases.
   const providerSubagentModelSlug = selectedProviderEntry
@@ -2129,10 +2161,14 @@ export default function ChatView(props: ChatViewProps) {
     routeThreadKey,
     activeThreadKey,
     isServerThread,
-    serverProjection,
+    importedContent: visibleBridgetTimeline?.importedTurnItems,
+    serverProjection:
+      visibleBridgetTimeline && serverProjection
+        ? { ...serverProjection, visibleTurnItems: visibleBridgetTimeline.importedTurnItems ?? [] }
+        : serverProjection,
     threadStatus,
-    activeActivityRun,
-    activeRunningTurnId,
+    activeActivityRun: visibleBridgetTimeline?.latestRun ?? activeActivityRun,
+    activeRunningTurnId: visibleBridgetTimeline?.runningRunId ?? activeRunningTurnId,
     timelineEntries,
     timelineAnchorMessageId,
     setTimelineAnchor,
@@ -3451,6 +3487,116 @@ export default function ChatView(props: ChatViewProps) {
     </WorkspaceMutationIdContext>
   );
 
+  const nativeComposerOverrides: Partial<ChatComposerProps> = isBridgetSubagent
+    ? {
+        canOperateThread: hasOperateThreadScope,
+        providerStatuses: bridgetComposer.providers,
+        providerCatalogKnown: bridgetComposer.state !== null,
+        activeProjectDefaultModelSelection: null,
+        activeThreadModelSelection: bridgetComposer.selection,
+        reportedModelSelection: bridgetComposer.selection,
+        lockedProvider: bridgetComposer.provider?.driver ?? lockedProvider,
+        supportsMultipleModels: false,
+        multipleModelSelections: null,
+        supportsAttachmentUploads: false,
+        supportsQuestionAttachments: false,
+        attachmentUploadsCapabilityKnown: true,
+        phase:
+          bridgetComposer.state?.state === "working" ||
+          bridgetComposer.state?.state === "waiting_for_children"
+            ? "running"
+            : bridgetComposer.state?.capabilities.send
+              ? "ready"
+              : "disconnected",
+        canInterrupt: bridgetComposer.state?.capabilities.interrupt === true,
+        canSteer: bridgetComposer.state?.capabilities.steer === true,
+        canResume: false,
+        isSendBusy: bridgetComposer.busy || bridgetComposer.pending !== undefined,
+        isCompacting: false,
+        isPreparingWorktree: false,
+        compactThreadUnavailable: true,
+        compactDisabled: true,
+        compactDisabledReason: "Ce contrôle n’est pas exposé par la tâche Bridget.",
+        onFreshSession: undefined,
+        onUsageLimitsCommand: undefined,
+        sideChatAvailable: false,
+        permissionsShownInStrip: true,
+        runtimeControlsAvailable: false,
+        modelSelectionAvailable: bridgetComposer.state?.capabilities.select_runtime === true,
+        showPlanFollowUpPrompt: false,
+        activeProposedPlan: null,
+        sendDisabledReason: !hasOperateThreadScope
+          ? "Cette connexion ne permet pas de piloter l’agent."
+          : activeEnvironmentUnavailable
+            ? activeEnvironmentUnavailableLabel
+            : bridgetComposer.pending
+              ? "La commande précédente reste à vérifier avec sa même clé."
+              : !bridgetComposer.state
+                ? "Chargement des commandes de cet agent Bridget…"
+                : !bridgetComposer.state.capabilities.send
+                  ? bridgetComposer.state.message ||
+                    "Cet agent ne peut pas recevoir de message dans son état actuel."
+                  : null,
+        onSend: (event, dispatchMode) => {
+          event?.preventDefault();
+          if (!hasOperateThreadScope || !bridgetComposer.state?.capabilities.send) return;
+          const draft = useComposerDraftStore.getState().getComposerDraft(composerDraftTarget);
+          if (
+            composerImagesRef.current.length ||
+            composerFilesRef.current.length ||
+            composerTerminalContextsRef.current.length ||
+            draft?.threadContexts.length ||
+            draft?.environmentContexts.length ||
+            draft?.reviewComments.length ||
+            draft?.previewAnnotations.length
+          ) {
+            setThreadError(
+              activeThread.id,
+              "Cette tâche reçoit du texte. Ses capacités actuelles ne permettent pas de remettre ces pièces jointes ou contextes ; le brouillon est conservé.",
+            );
+            return;
+          }
+          if (dispatchMode === "restart") {
+            setThreadError(
+              activeThread.id,
+              "Le redémarrage de tour n’est pas exposé par cette tâche. Choisissez l’envoi en file ou le guidage disponible ; aucun message n’a été remis.",
+            );
+            return;
+          }
+          const body = promptRef.current;
+          if (!body.trim()) return;
+          if (new TextEncoder().encode(body).length > 65536) {
+            setThreadError(
+              activeThread.id,
+              "Le texte dépasse la limite native de 64 Kio. Le brouillon est conservé.",
+            );
+            return;
+          }
+          bridgetComposer.send(
+            body,
+            dispatchMode === "steer" ||
+              (dispatchMode === "auto" && bridgetComposer.state.capabilities.steer),
+          );
+        },
+        onInterrupt: bridgetComposer.interrupt,
+        onModelOptionsChange: bridgetComposer.selectOptions,
+        onProviderModelSelect: (instanceId, model) => {
+          if (instanceId === bridgetComposer.provider?.instanceId)
+            bridgetComposer.selectModel(model);
+        },
+        getModelDisabledReason: (instanceId, model) =>
+          !bridgetComposer.state?.capabilities.select_runtime
+            ? "Le réglage de modèle n’est pas disponible pour cet agent."
+            : instanceId !== bridgetComposer.provider?.instanceId ||
+                !bridgetComposer.state.models.some((entry) => entry.id === model)
+              ? "Ce modèle n’est pas proposé par cet agent."
+              : null,
+        handleRuntimeModeChange: () => {},
+        handleInteractionModeChange: () => {},
+        toggleInteractionMode: () => {},
+      }
+    : {};
+
   const content = (
     <div
       ref={setWorkspaceLayoutElement}
@@ -3577,6 +3723,7 @@ export default function ChatView(props: ChatViewProps) {
                   environmentId={environmentId}
                   thread={serverProjection.thread}
                   onOpenParent={parentThreadLink?.open ?? null}
+                  onProjection={publishBridgetTimeline}
                   renderTimeline={(projection, sourceThread, result) =>
                     renderConversation(projectBridgetTimeline(projection, sourceThread, result))
                   }
@@ -3648,9 +3795,38 @@ export default function ChatView(props: ChatViewProps) {
                       >
                         <div className="relative z-10">
                           {isBridgetSubagent ? (
-                            <p className="px-3 py-2 text-xs text-muted-foreground">
-                              Tâche Bridget · lecture seule
-                            </p>
+                            <div
+                              className="flex flex-wrap items-center gap-2 px-3 py-2 text-xs text-muted-foreground"
+                              role="status"
+                            >
+                              <span>
+                                Agent Bridget ·{" "}
+                                {bridgetComposer.error ??
+                                  (bridgetComposer.pending
+                                    ? "commande à vérifier"
+                                    : (bridgetComposer.state?.message ??
+                                      "chargement des commandes…"))}
+                              </span>
+                              {bridgetComposer.pending ? (
+                                <Button
+                                  size="xs"
+                                  variant="ghost"
+                                  disabled={bridgetComposer.busy}
+                                  onClick={bridgetComposer.retry}
+                                >
+                                  Vérifier la commande
+                                </Button>
+                              ) : bridgetComposer.error ? (
+                                <Button
+                                  size="xs"
+                                  variant="ghost"
+                                  disabled={bridgetComposer.busy}
+                                  onClick={bridgetComposer.refresh}
+                                >
+                                  Recharger les commandes
+                                </Button>
+                              ) : null}
+                            </div>
                           ) : showProviderSubagentBar ? (
                             <ProviderSubagentBar
                               provider={selectedProviderEntry ?? null}
@@ -3837,6 +4013,7 @@ export default function ChatView(props: ChatViewProps) {
                               setThreadError={setThreadError}
                               onExpandImage={onExpandTimelineImageStable}
                               onFileOpen={openFileAttachmentStable}
+                              {...nativeComposerOverrides}
                               editingQueuedAttachments={queuedRunEdit.editingAttachments}
                               onRemoveEditingQueuedAttachment={
                                 queuedRunEdit.removeEditingAttachment

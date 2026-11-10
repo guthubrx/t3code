@@ -4,6 +4,7 @@ import { elementContextToPreviewAnnotation } from "./lib/elementContext";
 import {
   ElementContextDetails,
   DEFAULT_MODEL,
+  BridgetLineageComposeInput,
   DEFAULT_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
   EnvironmentId,
@@ -101,6 +102,7 @@ import {
 import { UnifiedSettings } from "@t3tools/contracts/settings";
 
 const isElementContextDetails = Schema.is(ElementContextDetails);
+const isNativeComposerCommand = Schema.is(BridgetLineageComposeInput);
 import { ReviewCommentContextSchema, type ReviewCommentContext } from "./reviewCommentContext";
 const isRuntimeMode = Schema.is(RuntimeMode);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
@@ -240,6 +242,7 @@ const PersistedTerminalContextDraft = Schema.Struct({
 type PersistedTerminalContextDraft = typeof PersistedTerminalContextDraft.Type;
 
 const PersistedComposerThreadDraftState = Schema.Struct({
+  nativeCommand: Schema.optionalKey(BridgetLineageComposeInput),
   prompt: Schema.String,
   attachments: Schema.Array(PersistedComposerImageAttachment),
   files: Schema.optionalKey(Schema.Array(PersistedComposerDraftFileAttachment)),
@@ -362,6 +365,8 @@ export type ComposerContextInsertionHandler = (
 const contextInsertionHandlers = new Map<string, ComposerContextInsertionHandler>();
 
 export interface ComposerThreadDraftState {
+  /** Keep an uncertain native command's exact identity across navigation and reload. */
+  nativeCommand?: BridgetLineageComposeInput;
   prompt: string;
   images: ComposerImageAttachment[];
   files: ComposerFileAttachment[];
@@ -386,6 +391,7 @@ export function composerDraftHasUserContent(
     return false;
   }
   return (
+    draft.nativeCommand !== undefined ||
     draft.prompt.trim().length > 0 ||
     draft.images.length > 0 ||
     draft.files.length > 0 ||
@@ -509,6 +515,10 @@ interface ComposerDraftStoreState {
   clearDraftThread: (threadRef: ComposerThreadTarget) => void;
   setStickyModelSelection: (modelSelection: ModelSelection | null | undefined) => void;
   setPrompt: (threadRef: ComposerThreadTarget, prompt: string) => void;
+  setNativeCommand: (
+    threadRef: ComposerThreadTarget,
+    command: BridgetLineageComposeInput | null,
+  ) => void;
   setTerminalContexts: (threadRef: ComposerThreadTarget, contexts: TerminalContextDraft[]) => void;
   setModelSelection: (
     threadRef: ComposerThreadTarget,
@@ -870,6 +880,7 @@ function normalizeTerminalContextsForThread(
 
 function shouldRemoveDraft(draft: ComposerThreadDraftState): boolean {
   return (
+    draft.nativeCommand === undefined &&
     draft.prompt.length === 0 &&
     draft.images.length === 0 &&
     draft.files.length === 0 &&
@@ -1839,6 +1850,9 @@ function normalizePersistedDraftsByThreadId(
       continue;
     }
     const draftCandidate = draftValue as PersistedComposerThreadDraftState;
+    const nativeCommand = isNativeComposerCommand(draftCandidate.nativeCommand)
+      ? draftCandidate.nativeCommand
+      : undefined;
     const promptCandidate = typeof draftCandidate.prompt === "string" ? draftCandidate.prompt : "";
     const attachments = Array.isArray(draftCandidate.attachments)
       ? draftCandidate.attachments.flatMap((entry) => {
@@ -1983,7 +1997,8 @@ function normalizePersistedDraftsByThreadId(
       environmentContexts.length === 0 &&
       !hasModelData &&
       !runtimeMode &&
-      !interactionMode
+      !interactionMode &&
+      nativeCommand === undefined
     ) {
       continue;
     }
@@ -2000,6 +2015,7 @@ function normalizePersistedDraftsByThreadId(
                 : threadKeyOrId;
             })();
     nextDraftsByThreadKey[normalizedThreadKey] = {
+      ...(nativeCommand ? { nativeCommand } : {}),
       prompt,
       attachments,
       ...(files.length > 0 ? { files } : {}),
@@ -2025,6 +2041,7 @@ function normalizePersistedDraftsByThreadId(
 
 function persistedComposerDraftHasUserContent(draft: PersistedComposerThreadDraftState): boolean {
   return (
+    draft.nativeCommand !== undefined ||
     draft.prompt.trim().length > 0 ||
     draft.attachments.length > 0 ||
     (draft.files?.length ?? 0) > 0 ||
@@ -2114,11 +2131,13 @@ export function partializeComposerDraftStoreState(
       draft.environmentContexts.length === 0 &&
       !hasModelData &&
       draft.runtimeMode === null &&
-      draft.interactionMode === null
+      draft.interactionMode === null &&
+      draft.nativeCommand === undefined
     ) {
       continue;
     }
     const persistedDraft: DeepMutable<PersistedComposerThreadDraftState> = {
+      ...(draft.nativeCommand ? { nativeCommand: structuredClone(draft.nativeCommand) } : {}),
       prompt: draft.prompt,
       attachments: draft.persistedAttachments,
       ...(draft.files.length > 0
@@ -2450,6 +2469,7 @@ function toHydratedThreadDraft(
     ...(persistedDraft.modelSelectionExplicit ? { modelSelectionExplicit: true } : {}),
     runtimeMode: persistedDraft.runtimeMode ?? null,
     interactionMode: persistedDraft.interactionMode ?? null,
+    ...(persistedDraft.nativeCommand ? { nativeCommand: persistedDraft.nativeCommand } : {}),
   };
 }
 
@@ -2954,6 +2974,20 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               nextDraftsByThreadKey[threadKey] = nextDraft;
             }
             return { draftsByThreadKey: nextDraftsByThreadKey };
+          });
+        },
+        setNativeCommand: (threadRef, command) => {
+          const threadKey = resolveComposerDraftKey(get(), threadRef);
+          if (!threadKey) return;
+          set((state) => {
+            const existing = state.draftsByThreadKey[threadKey] ?? createEmptyThreadDraft();
+            const next = { ...existing };
+            if (command === null) delete next.nativeCommand;
+            else next.nativeCommand = command;
+            const draftsByThreadKey = { ...state.draftsByThreadKey };
+            if (shouldRemoveDraft(next)) delete draftsByThreadKey[threadKey];
+            else draftsByThreadKey[threadKey] = next;
+            return { draftsByThreadKey };
           });
         },
         setPrompt: (threadRef, prompt) => {

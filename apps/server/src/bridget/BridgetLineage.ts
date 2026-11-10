@@ -7,6 +7,8 @@ import {
   type BridgetLineageCancelInput,
   type BridgetLineageView,
   type BridgetLineageCancelResult,
+  type BridgetLineageComposeInput,
+  type BridgetComposerState,
   type BridgetLineageJournal,
   type BridgetWatchEvent,
   type BridgetLineageSnapshot,
@@ -35,6 +37,9 @@ export class BridgetLineage extends Context.Service<
     readonly cancel: (
       input: BridgetLineageCancelInput,
     ) => Effect.Effect<BridgetLineageCancelResult, BridgetLineageError>;
+    readonly compose: (
+      input: BridgetLineageComposeInput,
+    ) => Effect.Effect<BridgetComposerState, BridgetLineageError>;
   }
 >()("t3/bridget/BridgetLineage") {}
 
@@ -145,6 +150,7 @@ const make = Effect.gen(function* () {
           ),
         ),
     cancel: reader.lineageCancel,
+    compose: reader.lineageCompose,
   });
 });
 

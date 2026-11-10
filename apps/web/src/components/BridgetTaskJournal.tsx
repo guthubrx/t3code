@@ -164,38 +164,37 @@ function JournalFollow({
 }
 
 /** Native transcript and result remain owned by Bridget after Fleet cleanup. */
+type BridgetJournalThread = Pick<
+  OrchestrationV2AppThread,
+  | "id"
+  | "bridgetTaskRef"
+  | "bridgetTask"
+  | "projectId"
+  | "title"
+  | "modelSelection"
+  | "bridgetLineage"
+>;
+
 export function BridgetTaskJournal({
   environmentId,
   thread,
   onOpenParent,
   renderTimeline,
+  onProjection,
 }: {
   environmentId: EnvironmentId;
-  thread: Pick<
-    OrchestrationV2AppThread,
-    | "id"
-    | "bridgetTaskRef"
-    | "bridgetTask"
-    | "projectId"
-    | "title"
-    | "modelSelection"
-    | "bridgetLineage"
-  >;
+  thread: BridgetJournalThread;
   onOpenParent: (() => void) | null;
   renderTimeline: (
     projection: BridgetJournalProjection,
-    thread: Pick<
-      OrchestrationV2AppThread,
-      | "id"
-      | "bridgetTaskRef"
-      | "bridgetTask"
-      | "projectId"
-      | "title"
-      | "modelSelection"
-      | "bridgetLineage"
-    >,
+    thread: BridgetJournalThread,
     result: string | null,
   ) => ReactNode;
+  onProjection?: (
+    projection: BridgetJournalProjection,
+    thread: BridgetJournalThread,
+    result: string | null,
+  ) => void;
 }) {
   const ref = thread.bridgetTaskRef!;
   const task = thread.bridgetTask;
@@ -389,6 +388,10 @@ export function BridgetTaskJournal({
     });
   })();
   const projection = projectedHistory ?? projectedLiveJournal;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- forwards the external journal to the shared viewport and composer prompt-history controller
+  useEffect(() => {
+    onProjection?.(projection, thread, result || null);
+  }, [onProjection, projection, thread, result]);
   return (
     <section
       className="flex min-h-0 min-w-0 flex-1 flex-col"

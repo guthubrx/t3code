@@ -1,5 +1,9 @@
 import { useStableCallback } from "../../hooks/useStableCallback";
-import { type MessageId, type RunId } from "@t3tools/contracts";
+import {
+  type MessageId,
+  type RunId,
+  type OrchestrationV2ProjectedTurnItem,
+} from "@t3tools/contracts";
 import { CHAT_LIST_ANCHOR_OFFSET } from "@t3tools/shared/chatList";
 import { Debouncer } from "@tanstack/react-pacer";
 import {
@@ -151,8 +155,12 @@ interface TimelineFollowInput {
   readonly activeThreadKey: string | null;
   readonly isServerThread: boolean;
   readonly serverProjection: ThreadStructure | null;
+  readonly importedContent?: ReadonlyArray<OrchestrationV2ProjectedTurnItem> | undefined;
   readonly threadStatus: EnvironmentThreadStatus;
-  readonly activeActivityRun: ReturnType<typeof deriveThreadActivityRun>;
+  readonly activeActivityRun: Pick<
+    NonNullable<ReturnType<typeof deriveThreadActivityRun>>,
+    "runId" | "status"
+  > | null;
   readonly activeRunningTurnId: RunId | null;
   readonly timelineEntries: ReadonlyArray<TimelineEntry>;
   readonly timelineAnchorMessageId: MessageId | null;
@@ -173,6 +181,7 @@ export function useTimelineFollow(input: TimelineFollowInput) {
     activeThreadKey,
     isServerThread,
     serverProjection,
+    importedContent,
     threadStatus,
     activeActivityRun,
     activeRunningTurnId,
@@ -348,6 +357,19 @@ export function useTimelineFollow(input: TimelineFollowInput) {
     });
   };
   const scrollToEndStable = useStableCallback(scrollToEnd);
+  // Imported journals arrive outside the ordinary live-item store. Their row
+  // regrouping can replace the list's estimated end; reconcile through the same
+  // follow controller after that commit, respecting manual navigation and anchors.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- follows committed external journal data only while the reader follows its end
+  useLayoutEffect(() => {
+    if (
+      importedContent !== undefined &&
+      timelineAnchorMessageId === null &&
+      readCurrentFollow().mode === "following"
+    ) {
+      scrollToEndStable();
+    }
+  }, [importedContent, timelineAnchorMessageId, readCurrentFollow, scrollToEndStable]);
   // The list does not follow footer layout, so the resting composer cannot scroll it. Growth
   // above the composer (a new notice) would cover the last rows instead.
   const followedInsetRef = useRef(composerTimelineInset);

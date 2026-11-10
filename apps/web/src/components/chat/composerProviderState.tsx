@@ -48,6 +48,8 @@ type ComposerTraitsTarget = {
   instanceId: ProviderInstanceId;
   threadRef?: ScopedThreadRef | undefined;
   draftId?: DraftId | undefined;
+  /** A native conversation confirms option changes through its own transport. */
+  onModelOptionsChange?: TraitsSelectionInput["onModelOptionsChange"];
   model: string;
   models: ReadonlyArray<ServerProviderModel>;
   modelOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
@@ -203,7 +205,7 @@ export function getComposerReasoningStep(input: {
 export function resolveComposerTraitsInput(
   input: ComposerTraitsTarget,
 ): TraitsSelectionInput | null {
-  const { threadRef, draftId, ...rest } = input;
+  const { threadRef, draftId, onModelOptionsChange, ...rest } = input;
   const { selections } = resolveComposerOptionSelections(
     input.models,
     input.model,
@@ -211,7 +213,13 @@ export function resolveComposerTraitsInput(
     input.modelOptions,
     input.planModeEnabled,
   );
-  const persistence = threadRef ? { threadRef } : draftId ? { draftId } : null;
+  const persistence = onModelOptionsChange
+    ? { onModelOptionsChange }
+    : threadRef
+      ? { threadRef }
+      : draftId
+        ? { draftId }
+        : null;
   if (!persistence) return null;
   return { ...rest, ...persistence, modelOptions: selections };
 }

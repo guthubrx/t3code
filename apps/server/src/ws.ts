@@ -2050,6 +2050,7 @@ export const layerWsRpc = (
         [WS_METHODS.bridgetLineageWatch]: (input) => bridgetLineage.watch(input),
         [WS_METHODS.bridgetLineageJournal]: (input) => bridgetLineage.journal(input),
         [WS_METHODS.bridgetLineageCancel]: (input) => bridgetLineage.cancel(input),
+        [WS_METHODS.bridgetLineageCompose]: (input) => bridgetLineage.compose(input),
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
           Effect.annotateCurrentSpan({
             "orchestration_v2.command_id": command.commandId,

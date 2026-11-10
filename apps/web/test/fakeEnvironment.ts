@@ -183,6 +183,10 @@ function run(threadId: ThreadId, id: RunId, ordinal: number, userMessageId: stri
 }
 
 export interface FakeThread {
+  readonly native?: Pick<
+    OrchestrationV2ThreadShell,
+    "bridgetTaskRef" | "bridgetTask" | "bridgetLineage"
+  >;
   /** Makes this a side chat of that thread. */
   readonly sideChatOf?: ThreadId;
   readonly id: ThreadId;
@@ -217,6 +221,7 @@ export function threadWithHistory(name: string, turns: number): FakeThread {
 function shellOf(thread: FakeThread): OrchestrationV2ThreadShell {
   const latest = thread.runs.at(-1);
   return {
+    ...thread.native,
     id: thread.id,
     projectId: PROJECT_ID,
     title: thread.title,
@@ -269,6 +274,7 @@ function projectionOf(thread: FakeThread): OrchestrationV2ThreadProjection {
   );
   return {
     thread: {
+      ...thread.native,
       id: shell.id,
       projectId: shell.projectId,
       title: shell.title,
@@ -384,10 +390,12 @@ const handlers: Record<string, (input: never) => unknown> = {
   [WS_METHODS.subscribeServerConfig]: () =>
     subscribe([{ version: 1 as const, type: "snapshot" as const, config: serverConfig }]),
 };
+let scenarioHandlers: Record<string, (input: never) => unknown> = {};
 
 // Unanswered calls stay pending, like a server that has not replied yet.
 const client = new Proxy(handlers, {
   get: (target, method: string) =>
+    scenarioHandlers[method] ??
     target[method] ??
     (() => {
       const rpc = WsRpcGroup.requests.get(method);
@@ -433,8 +441,12 @@ const encodedDescriptor = Schema.encodeSync(ExecutionEnvironmentDescriptor)(
 );
 
 /** Serves the environment's HTTP API and these threads until disposed. */
-export function installFakeEnvironment(fixtures: ReadonlyArray<FakeThread>): Disposable {
+export function installFakeEnvironment(
+  fixtures: ReadonlyArray<FakeThread>,
+  rpcHandlers: Record<string, (input: never) => unknown> = {},
+): Disposable {
   threads = fixtures;
+  scenarioHandlers = rpcHandlers;
   globalThis.fetch = async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input), window.location.href);
     if (url.origin !== window.location.origin) return realFetch(input, init);
@@ -456,6 +468,7 @@ export function installFakeEnvironment(fixtures: ReadonlyArray<FakeThread>): Dis
     [Symbol.dispose]: () => {
       globalThis.fetch = realFetch;
       threads = [];
+      scenarioHandlers = {};
     },
   };
 }

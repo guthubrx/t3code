@@ -228,6 +228,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.bridgetLineageWatch]: "bridget",
   [WS_METHODS.bridgetLineageJournal]: "bridget",
   [WS_METHODS.bridgetLineageCancel]: "bridget",
+  [WS_METHODS.bridgetLineageCompose]: "bridget",
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 
 const RPC_SPAN_PREFIX = "ws.rpc";

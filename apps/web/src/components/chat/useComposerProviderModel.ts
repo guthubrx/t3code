@@ -13,6 +13,7 @@ import {
 import {
   NO_PROVIDER_MODEL_SELECTION,
   providerInstanceEntriesFor,
+  deriveProviderInstanceEntries,
   type ProviderInstanceEntry,
 } from "../../providerInstances";
 import { type UnifiedSettings } from "@t3tools/contracts/settings";
@@ -35,6 +36,8 @@ export function useComposerProviderModel(
     readonly threadModelSelection: ModelSelection | null | undefined;
     readonly projectModelSelection: ModelSelection | null | undefined;
     readonly promptInjectionState: ReturnType<typeof getComposerPromptInjectionState>;
+    /** A native target confirms its own selection; draft preferences must not replace it. */
+    readonly confirmedSelection?: ModelSelection | null;
   },
 ) {
   const {
@@ -50,31 +53,44 @@ export function useComposerProviderModel(
     lockedInstanceId,
   } = input;
   const draftModelState = useComposerDraftModelState(threadRef);
-  const providerInstanceEntries: ReadonlyArray<ProviderInstanceEntry> = providerInstanceEntriesFor(
-    providerStatuses,
-    settings,
-    activeProjectId,
-  );
+  const providerInstanceEntries: ReadonlyArray<ProviderInstanceEntry> =
+    input.confirmedSelection !== undefined
+      ? deriveProviderInstanceEntries(providerStatuses)
+      : providerInstanceEntriesFor(providerStatuses, settings, activeProjectId);
   const selection = resolveComposerProviderSelection({
     entries: providerInstanceEntries,
-    candidateInstanceIds,
+    candidateInstanceIds:
+      input.confirmedSelection !== undefined
+        ? [input.confirmedSelection?.instanceId]
+        : candidateInstanceIds,
     lockedProvider,
-    lockedInstanceId,
+    lockedInstanceId:
+      input.confirmedSelection !== undefined
+        ? input.confirmedSelection?.instanceId
+        : lockedInstanceId,
   });
   const selectedInstanceId =
     selection.selectedProviderEntry?.instanceId ?? NO_PROVIDER_MODEL_SELECTION.instanceId;
   const selectedProvider: ProviderDriverKind =
     selection.selectedProviderEntry?.driverKind ?? selection.requestedDriverKind;
-  const modelState = deriveEffectiveComposerModelState({
-    draft: draftModelState,
-    providers: providerStatuses,
-    selectedProvider,
-    selectedInstanceId,
-    requestedInstanceId: selection.requestedInstanceId,
-    threadModelSelection,
-    projectModelSelection,
-    settings,
-  });
+  const modelState =
+    input.confirmedSelection !== undefined
+      ? {
+          selectedModel: input.confirmedSelection?.model ?? "",
+          modelOptions: input.confirmedSelection?.options
+            ? { [input.confirmedSelection.instanceId]: input.confirmedSelection.options }
+            : null,
+        }
+      : deriveEffectiveComposerModelState({
+          draft: draftModelState,
+          providers: providerStatuses,
+          selectedProvider,
+          selectedInstanceId,
+          requestedInstanceId: selection.requestedInstanceId,
+          threadModelSelection,
+          projectModelSelection,
+          settings,
+        });
   const selectedProviderModels = selection.selectedProviderEntry?.models ?? NO_PROVIDER_MODELS;
   const composerProviderState = getComposerProviderState({
     provider: selectedProvider,

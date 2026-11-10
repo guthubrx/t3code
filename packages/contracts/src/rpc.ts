@@ -52,6 +52,8 @@ import {
   BridgetLineageJournal,
   BridgetLineageCancelInput,
   BridgetLineageCancelResult,
+  BridgetLineageComposeInput,
+  BridgetComposerState,
   BridgetLineageError,
 } from "./bridgetLineage.ts";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
@@ -430,6 +432,7 @@ export const WS_METHODS = {
   bridgetLineageWatch: "bridget.lineage.watch",
   bridgetLineageJournal: "bridget.lineage.journal",
   bridgetLineageCancel: "bridget.lineage.cancel",
+  bridgetLineageCompose: "bridget.lineage.compose",
   projectsListEntries: "projects.listEntries",
   projectsListIgnoredFiles: "projects.listIgnoredFiles",
   projectsReadFile: "projects.readFile",
@@ -1389,6 +1392,12 @@ const WsBridgetLineageCancelRpc = Rpc.make(WS_METHODS.bridgetLineageCancel, {
   error: Schema.Union([BridgetLineageError, EnvironmentAuthorizationError]),
 });
 
+const WsBridgetLineageComposeRpc = Rpc.make(WS_METHODS.bridgetLineageCompose, {
+  payload: BridgetLineageComposeInput,
+  success: BridgetComposerState,
+  error: Schema.Union([BridgetLineageError, EnvironmentAuthorizationError]),
+});
+
 const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   payload: ProjectWriteFileInput,
   success: ProjectWriteFileResult,
@@ -2065,6 +2074,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsBridgetLineageWatchRpc,
   WsBridgetLineageJournalRpc,
   WsBridgetLineageCancelRpc,
+  WsBridgetLineageComposeRpc,
   WsGuestShareCreateRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,

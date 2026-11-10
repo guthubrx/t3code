@@ -10,6 +10,8 @@ import {
   BridgetLineageError,
   BridgetLineageErrorCode,
   BridgetLineageCancelResult,
+  BridgetComposerState,
+  BridgetLineageComposeInput,
   type BridgetLineageWatchInput,
   type BridgetLineageReadInput,
   type BridgetLineageCancelInput,
@@ -42,6 +44,12 @@ const decodeBridgetWatch = Schema.decodeUnknownEffect(BridgetWatchEvent, {
   onExcessProperty: "error",
 });
 const decodeLineageCancel = Schema.decodeUnknownEffect(BridgetLineageCancelResult, {
+  onExcessProperty: "error",
+});
+const decodeComposeInput = Schema.decodeEffect(BridgetLineageComposeInput, {
+  onExcessProperty: "error",
+});
+const decodeComposerState = Schema.decodeUnknownEffect(BridgetComposerState, {
   onExcessProperty: "error",
 });
 const decodeLineageSnapshot = Schema.decodeUnknownEffect(BridgetLineageSnapshot, {
@@ -103,6 +111,9 @@ export class BridgetReader extends Context.Service<
     readonly lineageCancel: (
       input: BridgetLineageCancelInput,
     ) => Effect.Effect<BridgetLineageCancelResult, BridgetLineageError>;
+    readonly lineageCompose: (
+      input: BridgetLineageComposeInput,
+    ) => Effect.Effect<BridgetComposerState, BridgetLineageError>;
     readonly watch: (
       input: BridgetWatchInput,
     ) => Stream.Stream<BridgetWatchEvent, BridgetReadError>;
@@ -405,7 +416,7 @@ const make = Effect.gen(function* () {
   });
   const decodeRefusal = Schema.decodeUnknownEffect(refusal, { onExcessProperty: "error" });
   const decodeLineageJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
-  const encodeJournalEvent = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+  const encodeNativeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
   const resolveLineageContext = (input: BridgetLineageWatchInput) =>
     resolveContext(input, true).pipe(
       Effect.mapError(
@@ -441,6 +452,8 @@ const make = Effect.gen(function* () {
   const runLineage = Effect.fn("BridgetReader.runLineage")(function* (
     args: string[],
     maxBytes: number,
+    stdin?: string,
+    composeCommand = false,
   ) {
     const command = yield* resolveExecutable.pipe(
       Effect.mapError(() => new BridgetLineageError({ code: "unavailable" })),
@@ -449,7 +462,8 @@ const make = Effect.gen(function* () {
       .run({
         command,
         args,
-        timeout: "6 seconds",
+        ...(stdin === undefined ? {} : { stdin }),
+        timeout: composeCommand ? "10 seconds" : "6 seconds",
         maxOutputBytes: maxBytes + 1024,
         outputMode: "error",
       })
@@ -580,7 +594,7 @@ const make = Effect.gen(function* () {
     for (const event of journal.events) {
       if (event.seq <= previous || event.seq > journal.next_seq)
         return yield* new BridgetLineageError({ code: "invalid_output" });
-      const encoded = yield* encodeJournalEvent(event).pipe(
+      const encoded = yield* encodeNativeJson(event).pipe(
         Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
       );
       contentBytes += Buffer.byteLength(encoded, "utf8");
@@ -661,6 +675,46 @@ const make = Effect.gen(function* () {
     if (receipt.task_id !== input.taskId)
       return yield* new BridgetLineageError({ code: "invalid_output" });
     return receipt;
+  });
+
+  const lineageCompose = Effect.fn("BridgetReader.lineageCompose")(function* (
+    raw: BridgetLineageComposeInput,
+  ) {
+    const input = yield* decodeComposeInput(raw).pipe(
+      Effect.mapError(() => new BridgetLineageError({ code: "invalid_request" })),
+    );
+    const project = yield* resolveLineageContext(input);
+    const stdin = yield* encodeNativeJson({
+      request_id: input.requestId,
+      expected_round: input.expectedRound,
+      operation: input.operation,
+    }).pipe(Effect.mapError(() => new BridgetLineageError({ code: "invalid_request" })));
+    const rawState = yield* runLineage(
+      [
+        "lineage",
+        "compose",
+        ...lineageArgs(input, project.workspaceRoot),
+        "--task",
+        input.taskId,
+        "--input-stdin",
+        "--json",
+      ],
+      256 * 1024,
+      stdin,
+      true,
+    );
+    const observed = yield* decodeComposerState(rawState).pipe(
+      Effect.mapError(() => new BridgetLineageError({ code: "invalid_output" })),
+    );
+    if (
+      observed.task_id !== input.taskId ||
+      observed.request_id !== input.requestId ||
+      (input.expectedRound !== 0 &&
+        observed.outcome !== "refused" &&
+        observed.round !== input.expectedRound)
+    )
+      return yield* new BridgetLineageError({ code: "invalid_output" });
+    return observed;
   });
 
   // This private framing helper shares only CLI NDJSON handling, not state or authority.
@@ -814,6 +868,7 @@ const make = Effect.gen(function* () {
     lineageWatch,
     lineageJournal,
     lineageCancel,
+    lineageCompose,
   });
 });
 

@@ -115,6 +115,28 @@ const refusal = (code: string, retryable = false) => ({
 });
 
 const encode = (value: unknown) => JSON.stringify(value);
+
+const composerState258 = (overrides: Record<string, unknown> = {}) => ({
+  version: 1,
+  status: "ok",
+  task_id: uuid(1),
+  request_id: uuid(2),
+  round: 3,
+  state: "working",
+  outcome: "observed",
+  code: null,
+  message: "",
+  selection: { model: "native-model", effort: "high" },
+  models: [{ id: "native-model", name: "Native model", efforts: ["high"] }],
+  capabilities: {
+    send: true,
+    steer: true,
+    interrupt: true,
+    select_runtime: true,
+    attachments: false,
+  },
+  ...overrides,
+});
 const output = (stdout: unknown, code = 0): ProcessRunner.ProcessRunOutput => ({
   stdout: typeof stdout === "string" ? stdout : encode(stdout),
   stderr: "private diagnostic secret",
@@ -142,6 +164,7 @@ const harness = Effect.fn("BridgetReader149.harness")(function* (options: Harnes
   const calls: Array<{
     readonly args: ReadonlyArray<string>;
     readonly maxOutputBytes: number | undefined;
+    readonly stdin?: string;
   }> = [];
   const spawner = ChildProcessSpawner.make((command) =>
     Effect.acquireRelease(
@@ -203,7 +226,11 @@ const harness = Effect.fn("BridgetReader149.harness")(function* (options: Harnes
   const runner = ProcessRunner.ProcessRunner.of({
     run: (request) => {
       const next = queued.length === 0 ? output(snapshot([])) : (queued.shift() ?? queued[0]!);
-      calls.push({ args: request.args, maxOutputBytes: request.maxOutputBytes });
+      calls.push({
+        args: request.args,
+        maxOutputBytes: request.maxOutputBytes,
+        ...(request.stdin === undefined ? {} : { stdin: request.stdin }),
+      });
       return options.error ? Effect.fail(options.error) : Effect.succeed(next);
     },
   });
@@ -226,6 +253,78 @@ const harness = Effect.fn("BridgetReader149.harness")(function* (options: Harnes
     ),
   );
   return { reader, calls };
+});
+
+describe("spec258 native composer binding", () => {
+  const composeInput = {
+    ...input,
+    taskId: uuid(1),
+    requestId: uuid(2),
+    expectedRound: 3,
+    operation: { kind: "read" as const },
+  };
+  it.effect("sends text as stdin and preserves the native task and command correlation", () =>
+    Effect.gen(function* () {
+      const { reader, calls } = yield* harness({
+        results: [output(composerState258({ outcome: "accepted" }))],
+      });
+      const body = "texte multiligne\n$(commande non exécutée) ; `texte`";
+      const observed = yield* reader.lineageCompose({
+        ...composeInput,
+        operation: { kind: "send", body, intent: "queue" },
+      });
+      expect(observed.outcome).toBe("accepted");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.args).toEqual([
+        "lineage",
+        "compose",
+        "--t3-thread",
+        threadId,
+        "--project-root",
+        workspaceRoot,
+        "--task",
+        uuid(1),
+        "--input-stdin",
+        "--json",
+      ]);
+      expect(JSON.parse(calls[0]!.stdin!)).toEqual({
+        request_id: uuid(2),
+        expected_round: 3,
+        operation: { kind: "send", body, intent: "queue" },
+      });
+      expect(calls[0]!.args).not.toContain(body);
+    }),
+  );
+  it.effect.each([
+    { task_id: uuid(9) },
+    { request_id: uuid(9) },
+    { round: 4 },
+    { extra_authority: true },
+  ])("rejects a foreign or uncontracted response (%j)", (change) =>
+    Effect.gen(function* () {
+      const { reader } = yield* harness({ results: [output(composerState258(change))] });
+      const error = yield* Effect.flip(reader.lineageCompose(composeInput));
+      expect(error.code).toBe("invalid_output");
+    }),
+  );
+  it.effect.each([{ missingThread: true }, { virtualThread: true }, { differentProject: true }])(
+    "refuses an invalid root before invoking the CLI (%j)",
+    (options) =>
+      Effect.gen(function* () {
+        const { reader, calls } = yield* harness(options);
+        yield* Effect.flip(reader.lineageCompose(composeInput));
+        expect(calls).toHaveLength(0);
+      }),
+  );
+  it.effect("preserves an uncertain native outcome without issuing another command", () =>
+    Effect.gen(function* () {
+      const { reader, calls } = yield* harness({
+        results: [output(composerState258({ outcome: "outcome_unknown" }))],
+      });
+      expect((yield* reader.lineageCompose(composeInput)).outcome).toBe("outcome_unknown");
+      expect(calls).toHaveLength(1);
+    }),
+  );
 });
 
 describe("BridgetReader149 lineage context", () => {

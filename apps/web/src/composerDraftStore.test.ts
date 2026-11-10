@@ -34,6 +34,7 @@ import {
   type PreviewAnnotationPayload,
   type ProviderOptionSelection,
   type ScopedThreadRef,
+  type BridgetLineageComposeInput,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 
@@ -720,6 +721,56 @@ describe("composerDraftStore context persistence", () => {
       expect(draft?.terminalContexts).toEqual([terminal]);
       expect(draft?.previewAnnotations).toEqual([annotation]);
     }
+  });
+});
+
+describe("native composer command recovery", () => {
+  const threadRef = scopeThreadRef(TEST_ENVIRONMENT_ID, ThreadId.make("native-command"));
+  const request: BridgetLineageComposeInput = {
+    projectId: ProjectId.make("native-project"),
+    threadId: ThreadId.make("parent"),
+    taskId: "25000000-0000-4000-8000-000000000001",
+    requestId: "25000000-0000-4000-8000-000000000002",
+    expectedRound: 3,
+    operation: { kind: "send", body: "Continuer", intent: "queue" },
+  };
+  beforeEach(resetComposerDraftStore);
+
+  it("retains the exact unknown command and the newer draft across reloads", () => {
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, "Texte suivant");
+    store.setNativeCommand(threadRef, request);
+    const merge = useComposerDraftStore.persist.getOptions().merge!;
+    let state = useComposerDraftStore.getState();
+    for (let reload = 0; reload < 3; reload++) {
+      state = merge(
+        JSON.parse(JSON.stringify(partializeComposerDraftStoreState(state))),
+        useComposerDraftStore.getInitialState(),
+      );
+      expect(state.draftsByThreadKey[scopedThreadKey(threadRef)]?.nativeCommand).toEqual(request);
+      expect(state.draftsByThreadKey[scopedThreadKey(threadRef)]?.prompt).toBe("Texte suivant");
+    }
+    store.setNativeCommand(threadRef, null);
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe(
+      "Texte suivant",
+    );
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)).not.toHaveProperty(
+      "nativeCommand",
+    );
+  });
+
+  it("retains an unknown interrupt even with an empty prompt", () => {
+    const command: BridgetLineageComposeInput = { ...request, operation: { kind: "interrupt" } };
+    useComposerDraftStore.getState().setNativeCommand(threadRef, command);
+    const persisted = partializeComposerDraftStoreState(useComposerDraftStore.getState());
+    const merge = useComposerDraftStore.persist.getOptions().merge!;
+    const restored = merge(
+      JSON.parse(JSON.stringify(persisted)),
+      useComposerDraftStore.getInitialState(),
+    );
+    expect(restored.draftsByThreadKey[scopedThreadKey(threadRef)]?.nativeCommand).toEqual(command);
+    useComposerDraftStore.getState().setNativeCommand(threadRef, null);
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)).toBeNull();
   });
 });
 
