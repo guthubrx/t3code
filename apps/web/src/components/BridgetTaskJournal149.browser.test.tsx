@@ -13,6 +13,7 @@ import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import { useSyncExternalStore } from "react";
 import { describe, expect, it as baseIt, vi } from "vite-plus/test";
+import { page } from "vite-plus/test/browser";
 
 import { type BridgetJournalProjection } from "@t3tools/client-runtime/bridget-journal-presentation";
 import { BridgetLineageSubscription, BridgetTaskJournal } from "./BridgetTaskJournal";
@@ -137,10 +138,6 @@ vi.mock("~/hooks/useCopyToClipboard", async (importOriginal) => ({
   ...(await importOriginal<typeof import("~/hooks/useCopyToClipboard")>()),
   writeTextToClipboard: vi.fn(async () => true),
 }));
-vi.mock("~/components/ui/button", () => ({
-  Button: "button",
-  buttonVariants: () => "",
-}));
 vi.mock("./ChatMarkdown", () => ({
   default: ({ text }: { text: string }) => <div>{text}</div>,
 }));
@@ -225,6 +222,10 @@ function button(label: string) {
     (node) => node.getAttribute("aria-label") === label || node.textContent?.includes(label),
   )!;
 }
+async function journalAction(label: string) {
+  await screen.getByRole("button", { name: "Actions du journal" }).click();
+  await page.getByRole("menuitem", { name: label }).click();
+}
 function CaptureJournal({ blocks }: BridgetJournalProjection) {
   return (
     <ol>
@@ -243,12 +244,11 @@ function CaptureJournal({ blocks }: BridgetJournalProjection) {
     </ol>
   );
 }
-async function mount(thread: OrchestrationV2AppThread, onOpenParent?: () => void) {
+async function mount(thread: OrchestrationV2AppThread) {
   screen = await render(
     <BridgetTaskJournal
       environmentId={environmentId}
       thread={thread}
-      onOpenParent={onOpenParent ?? null}
       renderTimeline={(projection, _thread, result) =>
         result === null ? <CaptureJournal {...projection} /> : <div>{result}</div>
       }
@@ -322,6 +322,28 @@ const it = baseIt.extend<{ fixture: void }>({
 });
 
 describe("BridgetTaskJournal (web, session 149)", () => {
+  it("replie les métadonnées sans doublon de navigation ni chemin disque", async () => {
+    await using _screen = await mount(makeThread());
+    const toggle = screen.getByRole("button", { name: "Déplier les détails" });
+    await expect.element(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(button("Ouvrir le parent")).toBeUndefined();
+    expect(button("Reconnecter")).toBeUndefined();
+    expect(text()).not.toContain("/tmp/bridget");
+    await expect.element(screen.getByText("general · test-model · high")).not.toBeVisible();
+    await toggle.click();
+    await expect.element(screen.getByText("general · test-model · high")).toBeVisible();
+    await expect
+      .element(screen.getByRole("button", { name: "Replier les détails" }))
+      .toHaveAttribute("aria-expanded", "true");
+    await screen.getByRole("button", { name: "Replier les détails" }).click();
+    await deliverJournalFailure("journal_unavailable");
+    await expect.element(screen.getByRole("status")).toBeVisible();
+    await expect.element(screen.getByRole("button", { name: "Reconnecter" })).toBeVisible();
+    expect(activeJournals).toBe(1);
+    expect(pendingReads).toEqual([]);
+    expect(cancelCalls).toEqual([]);
+  });
+
   it("présente les fragments exacts et les activités sans fabriquer un tour fournisseur", async () => {
     await using _screen1 = await mount(makeThread());
     await deliverJournal({
@@ -452,8 +474,7 @@ describe("BridgetTaskJournal (web, session 149)", () => {
 
   it("lit le résultat par fenêtres de 16 Kio UTF-8 et conserve le contenu sur refus", async () => {
     await using _screen4 = await mount(makeThread({ task: { result_available: true } }));
-    expect(button("Lire le résultat")).toBeTruthy();
-    await act(async () => button("Lire le résultat")!.click());
+    await journalAction("Lire le résultat");
     expect(pendingReads.length).toBe(1);
     expect(pendingReads[0]!.input).toMatchObject({
       projectId: "p-A",
@@ -487,7 +508,7 @@ describe("BridgetTaskJournal (web, session 149)", () => {
     expect(button("Suite du résultat")).toBeUndefined();
     // Refus fermé : message avec code, contenu déjà lu conservé.
     pendingReads.length = 0;
-    await act(async () => button("Lire le début")!.click());
+    await journalAction("Consulter l’historique");
     await respond(isJournalRead, {
       _tag: "Failure",
       cause: Cause.fail(new BridgetLineageError({ code: "snapshot_changed" })),
@@ -513,7 +534,7 @@ describe("BridgetTaskJournal (web, session 149)", () => {
       evicted: 0,
     });
     // Lecture en vol, puis masquage : abort immédiat de toutes les requêtes.
-    await act(async () => button("Lire le début")!.click());
+    await journalAction("Consulter l’historique");
     expect(pendingReads.length).toBe(1);
     await act(async () => {
       visibilityState = "hidden";
@@ -678,7 +699,7 @@ describe("BridgetTaskJournal (web, session 149)", () => {
       gap: null,
       evicted: 0,
     });
-    await act(async () => button("Lire le début")!.click());
+    await journalAction("Consulter l’historique");
     expect(pendingReads[0]!.input).toMatchObject({ action: "journal", afterSeq: 0 });
     // Lecture réelle refusée : seul le journal est en panne, pas le service Bridget.
     await respond(isJournalRead, {
@@ -697,21 +718,18 @@ describe("BridgetTaskJournal (web, session 149)", () => {
     expect(text()).toContain("ligne 7");
     expect(text()).toContain("Annulé");
     expect(button("Reconnecter")).toBeTruthy();
-    expect(button("Lire le début")).toBeTruthy();
+    expect(button("Actions du journal")).toBeTruthy();
     // Tâche terminale : pas de bouton d'arrêt, alors que le droit d'opérer est accordé.
     expect(canOperate).toBe(true);
     expect(button("Arrêter")).toBeUndefined();
   });
 
   it("arrête la tâche via l'annulation native Bridget, jamais un tour T3", async () => {
-    const onOpenParent = vi.fn();
-    await using _screen10 = await mount(makeThread(), onOpenParent);
+    await using _screen10 = await mount(makeThread());
     expect(one("section", screen.container).getAttribute("aria-label")).toBe(
       "Journal de la tâche Bridget",
     );
-    expect(button("Ouvrir le parent")).toBeTruthy();
-    await act(async () => button("Ouvrir le parent")!.click());
-    expect(onOpenParent).toHaveBeenCalled();
+    expect(button("Ouvrir le parent")).toBeUndefined();
     expect(one("section", screen.container).getAttribute("aria-label")).toBe(
       "Journal de la tâche Bridget",
     );
@@ -730,11 +748,12 @@ describe("BridgetTaskJournal (web, session 149)", () => {
       _tag: "Failure",
       cause: Cause.fail(new BridgetLineageError({ code: "command_failed" })),
     };
+    await act(async () => button("Arrêter")!.click());
     await act(async () => button("Reconnecter")!.click());
     await act(async () => button("Arrêter")!.click());
     expect(text()).toContain("Bridget indisponible (command_failed)");
     // Chaque action d'arrêt génère un UUID frais (helper repo, jamais un identifiant figé).
-    expect(cancelCalls.length).toBe(2);
+    expect(cancelCalls.length).toBe(3);
     expect(UUID_RE.test(requestIdOf(cancelCalls[1]!))).toBe(true);
     expect(requestIdOf(cancelCalls[1]!)).not.toBe(requestIdOf(cancelCalls[0]!));
     // Tâche terminale : plus aucun bouton d'arrêt.
@@ -760,7 +779,7 @@ describe("BridgetTaskJournal (web, session 149)", () => {
       gap: null,
       evicted: 0,
     });
-    await act(async () => button("Lire le début")!.click());
+    await journalAction("Consulter l’historique");
     expect(pendingReads[0]!.input).toMatchObject({
       action: "journal",
       taskId: TASK_ID,
@@ -845,6 +864,7 @@ describe("BridgetTaskJournal remote metadata (162)", () => {
     await using _screen14 = await mount(
       makeThread({ task: { placement, agent_type: "claude_glm" } }),
     );
+    await act(async () => button("Déplier les détails")!.click());
     expect(text()).toContain("Serveur Cartae (cartae)");
     expect(text()).toContain("claude_glm · test-model");
     expect(text()).toContain("Contact observé");
@@ -862,7 +882,6 @@ describe("BridgetTaskJournal remote metadata (162)", () => {
         <BridgetTaskJournal
           environmentId={environmentId}
           thread={makeThread({ task: { placement: { ...placement, contact_state: "stale" } } })}
-          onOpenParent={null}
           renderTimeline={(projection, _thread, result) =>
             result === null ? <CaptureJournal {...projection} /> : <div>{result}</div>
           }
@@ -892,7 +911,6 @@ describe("BridgetTaskJournal remote metadata (162)", () => {
         <BridgetTaskJournal
           environmentId={environmentId}
           thread={makeThread({ task: { placement: null } })}
-          onOpenParent={null}
           renderTimeline={(projection, _thread, result) =>
             result === null ? <CaptureJournal {...projection} /> : <div>{result}</div>
           }
@@ -915,7 +933,6 @@ describe("BridgetTaskJournal remote metadata (162)", () => {
               },
             },
           })}
-          onOpenParent={null}
           renderTimeline={(projection, _thread, result) =>
             result === null ? <CaptureJournal {...projection} /> : <div>{result}</div>
           }

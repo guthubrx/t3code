@@ -3722,7 +3722,6 @@ export default function ChatView(props: ChatViewProps) {
                   key={`${environmentId}:${serverProjection.thread.id}`}
                   environmentId={environmentId}
                   thread={serverProjection.thread}
-                  onOpenParent={parentThreadLink?.open ?? null}
                   onProjection={publishBridgetTimeline}
                   renderTimeline={(projection, sourceThread, result) =>
                     renderConversation(projectBridgetTimeline(projection, sourceThread, result))

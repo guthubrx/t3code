@@ -33,8 +33,19 @@ import { useEnvironmentScope } from "~/state/session";
 import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
 import { Button } from "~/components/ui/button";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "~/components/ui/menu";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
+import {
+  ChevronDownIcon,
+  ChevronRightIcon,
+  EllipsisIcon,
+  FileTextIcon,
+  HistoryIcon,
+  RotateCwIcon,
+  SquareIcon,
+} from "lucide-react";
 import { randomUUID } from "~/lib/utils";
-import { BridgetTaskPlacement } from "./chat/SubagentTooltipContent";
+import { BridgetTaskIcon, BridgetTaskPlacement } from "./chat/SubagentTooltipContent";
 
 type Context = { environmentId: EnvironmentId; projectId: ProjectId; threadId: ThreadId };
 
@@ -178,13 +189,11 @@ type BridgetJournalThread = Pick<
 export function BridgetTaskJournal({
   environmentId,
   thread,
-  onOpenParent,
   renderTimeline,
   onProjection,
 }: {
   environmentId: EnvironmentId;
   thread: BridgetJournalThread;
-  onOpenParent: (() => void) | null;
   renderTimeline: (
     projection: BridgetJournalProjection,
     thread: BridgetJournalThread,
@@ -229,6 +238,8 @@ export function BridgetTaskJournal({
   const lastSeq = useRef(0);
   const requests = useRef(new Set<AbortController>());
   const [showDetails, setShowDetails] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const detailsId = useId();
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- aborts native journal reads when the component unmounts
   useEffect(
     () => () => {
@@ -408,61 +419,131 @@ export function BridgetTaskJournal({
           onFailure={setFailure}
         />
       ) : null}
-      <div className="chat-composer-lane min-w-0 py-3 text-sm">
-        <div className="mx-auto flex w-full min-w-0 max-w-(--chat-content-max-width) flex-col gap-2">
-          <div className="flex min-w-0 flex-wrap items-center gap-2">
+      <div className="chat-composer-lane min-w-0 shrink-0 py-1 text-xs">
+        <div className="mx-auto w-full min-w-0 max-w-(--chat-content-max-width)">
+          <div className="flex min-w-0 items-center gap-2" aria-label="Barre de la tâche Bridget">
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    size="icon-xs"
+                    variant="ghost"
+                    aria-label={expanded ? "Replier les détails" : "Déplier les détails"}
+                    aria-expanded={expanded}
+                    aria-controls={detailsId}
+                    onClick={() => setExpanded((previous) => !previous)}
+                  />
+                }
+              >
+                {expanded ? <ChevronDownIcon /> : <ChevronRightIcon />}
+              </TooltipTrigger>
+              <TooltipPopup>
+                {expanded ? "Replier les détails" : "Déplier les détails"}
+              </TooltipPopup>
+            </Tooltip>
+            <BridgetTaskIcon task={task} />
             <strong className="min-w-0 flex-1 truncate">
               {formatSubagentDisplayTitle(task?.title ?? thread.title)}
             </strong>
-            <span className="min-w-0 break-words">
-              {task ? `${task.agent_type} · ` : null}
+            <span className="hidden max-w-36 truncate text-muted-foreground md:block">
               {task?.model ?? thread.modelSelection.model}
-              {task?.effort ? ` · ${task.effort}` : ""}
             </span>
-            <span>
+            {task?.placement ? (
+              <span className="hidden max-w-28 truncate text-muted-foreground sm:block">
+                {task.placement.display_name || task.placement.machine_id}
+              </span>
+            ) : null}
+            <span className="shrink-0 text-muted-foreground">
               {thread.bridgetLineage?.available === false
                 ? "Dernier état connu"
                 : statusLabels[nativeStatus]}
             </span>
-          </div>
-          <BridgetTaskPlacement task={task} />
-          <div className="flex min-w-0 flex-wrap items-center gap-2">
-            {onOpenParent ? (
-              <Button size="xs" variant="ghost" onClick={onOpenParent}>
-                Ouvrir le parent
-              </Button>
-            ) : null}
             {!terminal && canOperate ? (
-              <Button
-                size="xs"
-                variant="ghost"
-                disabled={stopping || thread.bridgetLineage?.available === false}
-                onClick={() => void stop()}
-              >
-                Arrêter
-              </Button>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      size="icon-xs"
+                      variant="ghost-destructive"
+                      aria-label="Arrêter"
+                      disabled={stopping || thread.bridgetLineage?.available === false}
+                      onClick={() => void stop()}
+                    />
+                  }
+                >
+                  <SquareIcon />
+                </TooltipTrigger>
+                <TooltipPopup>Arrêter la mission</TooltipPopup>
+              </Tooltip>
             ) : null}
-            <Button
-              size="xs"
-              variant="ghost"
-              onClick={() => {
-                setFailure(null);
-                setConnection((previous) => ({
-                  afterSeq: lastSeq.current,
-                  visit: previous.visit + 1,
-                }));
-              }}
-            >
-              Reconnecter
-            </Button>
+            {failure || thread.bridgetLineage?.available === false ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      size="icon-xs"
+                      variant="ghost"
+                      aria-label="Reconnecter"
+                      onClick={() => {
+                        setFailure(null);
+                        setConnection((previous) => ({
+                          afterSeq: lastSeq.current,
+                          visit: previous.visit + 1,
+                        }));
+                      }}
+                    />
+                  }
+                >
+                  <RotateCwIcon />
+                </TooltipTrigger>
+                <TooltipPopup>Reconnecter le suivi du journal</TooltipPopup>
+              </Tooltip>
+            ) : null}
+            <Menu>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <MenuTrigger
+                      render={
+                        <Button size="icon-xs" variant="ghost" aria-label="Actions du journal" />
+                      }
+                    />
+                  }
+                >
+                  <EllipsisIcon />
+                </TooltipTrigger>
+                <TooltipPopup>Actions du journal</TooltipPopup>
+              </Tooltip>
+              <MenuPopup align="end">
+                <MenuItem disabled={reading} onClick={() => void readHistory(0)}>
+                  <HistoryIcon />
+                  Consulter l’historique
+                </MenuItem>
+                {task?.result_available ? (
+                  <MenuItem disabled={reading} onClick={() => void readResult(0)}>
+                    <FileTextIcon />
+                    Lire le résultat
+                  </MenuItem>
+                ) : null}
+              </MenuPopup>
+            </Menu>
+          </div>
+          <div
+            id={detailsId}
+            hidden={!expanded}
+            className="space-y-1 px-8 py-2 text-muted-foreground"
+          >
+            <p>
+              {task ? `${task.agent_type} · ` : null}
+              {task?.model ?? thread.modelSelection.model}
+              {task?.effort ? ` · ${task.effort}` : ""}
+            </p>
+            <BridgetTaskPlacement task={task} />
           </div>
         </div>
       </div>
-      <div className="chat-composer-lane min-w-0 shrink-0 py-1">
+      <div className="chat-composer-lane min-w-0 shrink-0">
         <div className="mx-auto w-full min-w-0 max-w-(--chat-content-max-width)">
-          {task?.cwd ? (
-            <p className="mb-2 break-all text-xs text-muted-foreground">{task.cwd}</p>
-          ) : null}
           {task?.error ? <p role="alert">{task.error}</p> : null}
           {failure ? (
             <p role="status" className="mb-2 text-sm">
@@ -487,16 +568,10 @@ export function BridgetTaskJournal({
               l’historique.
             </p>
           ) : null}
-          <div className="mb-2 flex gap-2">
-            <Button
-              size="xs"
-              variant="ghost"
-              disabled={reading}
-              onClick={() => void readHistory(0)}
-            >
-              Lire le début
-            </Button>
-            {history ? (
+          {history ? (
+            <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+              <HistoryIcon className="size-3.5" aria-hidden />
+              <span>Historique</span>
               <Button
                 size="xs"
                 variant="ghost"
@@ -507,18 +582,8 @@ export function BridgetTaskJournal({
               >
                 Retour au suivi
               </Button>
-            ) : null}
-            {task?.result_available ? (
-              <Button
-                size="xs"
-                variant="ghost"
-                disabled={reading}
-                onClick={() => void readResult(0)}
-              >
-                Lire le résultat
-              </Button>
-            ) : null}
-          </div>
+            </div>
+          ) : null}
           {detail ? (
             <div className="mb-4 px-1">
               <div className="mb-2 flex gap-2">
